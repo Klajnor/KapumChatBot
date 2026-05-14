@@ -5,8 +5,6 @@ import logging
 
 from aiogram import Router, F
 from aiogram.types import BufferedInputFile, Message
-from aiogram.types.content_type import ContentType
-
 from bot.database.session import async_session_factory
 from bot.services.openrouter import openrouter_client
 from bot.services.user_service import UserService
