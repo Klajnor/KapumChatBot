@@ -7,8 +7,16 @@ from bot.bot import bot, dp
 from bot.config import config
 from bot.database.session import init_db
 
-# Import all handlers to register them
-from bot.handlers import start, help, models, prompt, clear, chat, stats  # noqa: F401
+# Import all handlers and register their routers with the dispatcher
+from bot.handlers import chat, clear, help, models, prompt, start, stats  # noqa: F401
+
+dp.include_router(start.router)
+dp.include_router(help.router)
+dp.include_router(models.router)
+dp.include_router(prompt.router)
+dp.include_router(clear.router)
+dp.include_router(chat.router)
+dp.include_router(stats.router)
 
 logging.basicConfig(
     level=logging.INFO,
