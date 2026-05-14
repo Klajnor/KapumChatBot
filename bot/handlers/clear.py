@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
+
+from bot.database.session import async_session_factory
+from bot.keyboards.inline import get_clear_confirmation_keyboard
+from bot.services.user_service import UserService
+
+router = Router()
+
+
+@router.message(Command("clear"))
+async def cmd_clear(message: Message) -> None:
+    """Handle /clear command — ask for confirmation."""
+    keyboard = get_clear_confirmation_keyboard()
+    await message.answer(
+        "🧹 <b>Clear conversation history?</b>\n\n"
+        "This will delete all your messages and start a fresh conversation. "
+        "This action cannot be undone.",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "clear:confirm")
+async def cb_clear_confirm(callback: CallbackQuery) -> None:
+    """Handle clear confirmation."""
+    if callback.from_user is None:
+        return
+
+    async with async_session_factory() as session:
+        service = UserService(session)
+        await service.clear_history(callback.from_user.id)
+
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        "✅ <b>Conversation history cleared!</b>\n\n"
+        "Your chat history has been deleted. "
+        "You can start a fresh conversation now."
+    )
+    await callback.answer("History cleared")
+
+
+@router.callback_query(F.data == "clear:cancel")
+async def cb_clear_cancel(callback: CallbackQuery) -> None:
+    """Handle clear cancellation."""
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        "❌ <b>Clear cancelled.</b>\n\n"
+        "Your conversation history is preserved."
+    )
+    await callback.answer("Cancelled")
