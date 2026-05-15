@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -24,8 +26,8 @@ async def cmd_stats(message: Message) -> None:
     await message.answer(
         f"📊 <b>Your Statistics</b>\n\n"
         f"💬 <b>Messages sent:</b> {stats['message_count']}\n"
-        f"🤖 <b>Current model:</b> <code>{stats['model']}</code>\n"
+        f"🤖 <b>Current model:</b> <code>{html.escape(stats['model'])}</code>\n"
         f"📝 <b>System prompt:</b>\n"
-        f"<code>{stats['system_prompt'][:100]}</code>\n"
+        f"<code>{html.escape(stats['system_prompt'][:100])}</code>\n"
         f"{'<i>...(truncated)</i>' if len(stats['system_prompt']) > 100 else ''}"
     )

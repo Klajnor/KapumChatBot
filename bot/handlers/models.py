@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -41,7 +43,7 @@ async def cmd_model(message: Message) -> None:
         settings = await service.get_user_settings(user.id)
 
     await message.answer(
-        f"🤖 <b>Current Model:</b> <code>{settings['model']}</code>"
+        f"🤖 <b>Current Model:</b> <code>{html.escape(settings['model'])}</code>"
     )
 
 
@@ -65,7 +67,7 @@ async def cb_model_selected(callback: CallbackQuery) -> None:
         await service.set_model(callback.from_user.id, model_id)
 
     await callback.message.edit_text(  # type: ignore[union-attr]
-        f"✅ <b>Model changed to:</b> <code>{model_name}</code>\n\n"
-        f"Model ID: <code>{model_id}</code>"
+        f"✅ <b>Model changed to:</b> <code>{html.escape(model_name)}</code>\n\n"
+        f"Model ID: <code>{html.escape(model_id)}</code>"
     )
     await callback.answer(f"Selected: {model_name}")

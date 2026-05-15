@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 
 from aiogram import Router, F
@@ -117,7 +118,7 @@ async def handle_photo(message: Message) -> None:
         if not openrouter_client.is_vision_model(settings["model"]):
             await message.answer(
                 f"⚠️ <b>Current model doesn't support images.</b>\n\n"
-                f"Your model (<code>{settings['model']}</code>) cannot process images. "
+                f"Your model (<code>{html.escape(settings['model'])}</code>) cannot process images. "
                 f"Please switch to a vision-capable model using /models.\n\n"
                 f"<b>Vision models:</b> GPT-4o, GPT-4o Mini, Claude 3.5 Sonnet, "
                 f"Claude 3 Haiku, Gemini 2.0 Flash"
@@ -180,28 +181,31 @@ async def send_long_message(message: Message, text: str) -> None:
     """Send a message, splitting if it exceeds Telegram's limit."""
     MAX_LENGTH = 4000  # Leave room for formatting
 
-    if len(text) <= MAX_LENGTH:
-        await message.answer(text)
+    # Escape HTML special characters to prevent rendering issues
+    escaped_text = html.escape(text)
+
+    if len(escaped_text) <= MAX_LENGTH:
+        await message.answer(escaped_text)
     else:
         # Split into chunks
         parts = []
-        while len(text) > MAX_LENGTH:
+        while len(escaped_text) > MAX_LENGTH:
             # Try to split at a natural boundary
-            split_at = text.rfind("\n\n", 0, MAX_LENGTH)
+            split_at = escaped_text.rfind("\n\n", 0, MAX_LENGTH)
             if split_at == -1:
-                split_at = text.rfind(". ", 0, MAX_LENGTH)
+                split_at = escaped_text.rfind(". ", 0, MAX_LENGTH)
             if split_at == -1:
-                split_at = text.rfind(" ", 0, MAX_LENGTH)
+                split_at = escaped_text.rfind(" ", 0, MAX_LENGTH)
             if split_at == -1:
                 split_at = MAX_LENGTH
             else:
                 split_at += 1  # Include the delimiter
 
-            parts.append(text[:split_at].strip())
-            text = text[split_at:].strip()
+            parts.append(escaped_text[:split_at].strip())
+            escaped_text = escaped_text[split_at:].strip()
 
-        if text:
-            parts.append(text)
+        if escaped_text:
+            parts.append(escaped_text)
 
         for i, part in enumerate(parts):
             header = f"<i>(Part {i + 1}/{len(parts)})</i>\n\n" if len(parts) > 1 else ""
