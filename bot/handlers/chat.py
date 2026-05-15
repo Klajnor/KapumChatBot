@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import html
 import logging
 
@@ -15,22 +16,63 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+DAILY_LIMIT = 10  # Max questions per day for non-admin allowed users
+
 
 def _is_admin(user_id: int) -> bool:
     """Check if a user is an admin by their Telegram ID."""
     return user_id in config.admin_ids
 
 
+async def _can_use_bot(telegram_id: int) -> tuple[bool, str | None]:
+    """
+    Check if a user is allowed to use the bot, and increment daily usage for non-admins.
+    Returns (is_allowed, error_message_or_None).
+    """
+    # Admins have unlimited access
+    if _is_admin(telegram_id):
+        return True, None
+
+    async with async_session_factory() as session:
+        service = UserService(session)
+        # Check if user is in allowed list
+        if not await service.is_allowed_user(telegram_id):
+            return False, None  # Will get themed response
+
+        # Check and increment daily limit
+        today = datetime.date.today()
+        from bot.database.repository import UserRepository
+        repo = UserRepository(session)
+        usage = await repo.get_daily_usage(telegram_id, today)
+        used = usage.query_count if usage else 0
+
+        if used >= DAILY_LIMIT:
+            return False, (
+                f"⚠️ <b>Daily limit reached.</b>\n\n"
+                f"You've used all {DAILY_LIMIT} questions for today. "
+                f"Come back tomorrow!"
+            )
+
+        # Increment usage for this question (atomic with the check)
+        await repo.increment_daily_usage(telegram_id, today)
+        await session.commit()
+        return True, None
+
+
 @router.message(F.text)
 async def handle_text(message: Message) -> None:
-    """Handle text messages — chat with AI via OpenRouter (admins only)."""
+    """Handle text messages — chat with AI via OpenRouter (admins + allowed users)."""
     user = message.from_user
     if user is None or message.text is None:
         return
 
-    # Non-admins get a themed block response
-    if not _is_admin(user.id):
-        await message.answer(get_random_themed_response())
+    # Check access
+    can_use, error_msg = await _can_use_bot(user.id)
+    if not can_use:
+        if error_msg:
+            await message.answer(error_msg)
+        else:
+            await message.answer(get_random_themed_response())
         return
 
     user_text = message.text
@@ -90,17 +132,19 @@ async def handle_text(message: Message) -> None:
 
 @router.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    """Handle photo messages — analyze image with vision model (admins only)."""
+    """Handle photo messages — analyze image with vision model (admins + allowed users)."""
     user = message.from_user
     if user is None:
         return
 
-    # Non-admins get a themed block response
-    if not _is_admin(user.id):
-        caption = message.caption or "📷 <i>(image omitted)</i>"
-        await message.answer(
-            get_random_themed_response()
-        )
+    # Check access
+    can_use, error_msg = await _can_use_bot(user.id)
+    if not can_use:
+        if error_msg:
+            await message.answer(error_msg)
+        else:
+            caption = message.caption or "📷 <i>(image omitted)</i>"
+            await message.answer(get_random_themed_response())
         return
 
     # Get the largest photo

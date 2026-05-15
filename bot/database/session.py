@@ -43,7 +43,43 @@ async def _run_migrations(conn: Any) -> None:
             )
         )
     except Exception:
-        # Column might already exist in some environments
+        pass
+
+    # Create allowed_users table if it doesn't exist
+    try:
+        await conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS allowed_users ("
+                "telegram_id BIGINT NOT NULL PRIMARY KEY, "
+                "added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+                "added_by BIGINT"
+                ")"
+            )
+        )
+    except Exception:
+        pass
+
+    # Create daily_usage table if it doesn't exist
+    try:
+        await conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS daily_usage ("
+                "id SERIAL PRIMARY KEY, "
+                "telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE, "
+                "date DATE NOT NULL, "
+                "query_count INTEGER NOT NULL DEFAULT 0, "
+                "UNIQUE (telegram_id, date)"
+                ")"
+            )
+        )
+        # Create index on telegram_id for daily_usage
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_daily_usage_telegram_id "
+                "ON daily_usage (telegram_id)"
+            )
+        )
+    except Exception:
         pass
 
 

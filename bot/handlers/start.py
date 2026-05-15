@@ -11,6 +11,8 @@ from bot.services.user_service import UserService
 
 router = Router()
 
+DAILY_LIMIT = 10
+
 
 def _is_admin(user_id: int) -> bool:
     """Check if a user is an admin by their Telegram ID."""
@@ -32,6 +34,7 @@ async def cmd_start(message: Message) -> None:
             first_name=user.first_name,
             last_name=user.last_name,
         )
+        is_allowed = await service.is_allowed_user(user.id)
 
     is_admin = _is_admin(user.id)
 
@@ -41,7 +44,7 @@ async def cmd_start(message: Message) -> None:
             f"I'm an AI-powered bot connected to <b>OpenRouter</b>. "
             f"I can chat with you using various AI models, analyze images, "
             f"and adapt to your preferences.\n\n"
-            f"<b>Available commands:</b>\n"
+            f"<b>Your commands:</b>\n"
             f"💬 <b>Just send me a message</b> — I'll reply using AI\n"
             f"🖼️ <b>Send an image</b> — I'll analyze it (vision models)\n"
             f"🤖 /models — Choose an AI model\n"
@@ -50,9 +53,30 @@ async def cmd_start(message: Message) -> None:
             f"📊 /stats — Your usage statistics\n"
             f"⚙️ /settings — Current settings\n"
             f"❓ /help — All commands\n\n"
+            f"<b>👑 Admin commands:</b>\n"
+            f"➕ /add_user <id> — Allow a user to use the bot\n"
+            f"➖ /remove_user <id> — Remove a user from allowed list\n"
+            f"📋 /list_users — Show all allowed users\n"
+            f"📈 /admin_stats — Usage statistics (14 days)\n"
+            f"🔄 /reset_daily_usage <id> — Reset daily usage\n\n"
             f"<i>Let's get started! 🚀</i>"
         )
         await message.answer(welcome_text)
+    elif is_allowed:
+        await message.answer(
+            f"👋 <b>Welcome back, {user.first_name or 'there'}!</b>\n\n"
+            f"You have been granted access to use this AI bot.\n\n"
+            f"<b>Available commands:</b>\n"
+            f"💬 <b>Just send me a message</b> — I'll reply using AI\n"
+            f"🖼️ <b>Send an image</b> — I'll analyze it (vision models)\n"
+            f"🤖 /models — Choose an AI model\n"
+            f"📝 /prompt — View or set system prompt\n"
+            f"🧹 /clear — Clear conversation history\n"
+            f"📊 /stats — Your usage statistics\n"
+            f"❓ /help — All commands\n\n"
+            f"⚠️ <b>Daily limit:</b> {DAILY_LIMIT} questions per day\n\n"
+            f"<i>Happy chatting! 🚀</i>"
+        )
     else:
         await message.answer(
             f"🌌 <b>Greetings, {user.first_name or 'traveller'}.</b>\n\n"

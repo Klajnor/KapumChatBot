@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
@@ -111,3 +113,62 @@ class UserService:
             "model": settings["model"],
             "system_prompt": settings["system_prompt"],
         }
+
+    # --- Allowed Users Management ---
+
+    async def add_allowed_user(self, telegram_id: int, added_by: int | None = None) -> None:
+        """Add a user to the allowed list."""
+        await self.user_repo.add_allowed_user(telegram_id, added_by)
+        await self.session.commit()
+
+    async def remove_allowed_user(self, telegram_id: int) -> bool:
+        """Remove a user from the allowed list. Returns True if removed."""
+        result = await self.user_repo.remove_allowed_user(telegram_id)
+        await self.session.commit()
+        return result
+
+    async def get_allowed_users(self) -> list[dict]:
+        """Get all allowed users with their info."""
+        allowed_users = await self.user_repo.get_allowed_users()
+        result = []
+        for au in allowed_users:
+            user = await self.user_repo.get_user(au.telegram_id)
+            result.append({
+                "telegram_id": au.telegram_id,
+                "added_at": au.added_at,
+                "added_by": au.added_by,
+                "username": user.username if user else None,
+                "first_name": user.first_name if user else None,
+            })
+        return result
+
+    async def is_allowed_user(self, telegram_id: int) -> bool:
+        """Check if a user is in the allowed list."""
+        return await self.user_repo.is_allowed_user(telegram_id)
+
+    # --- Daily Usage Tracking ---
+
+    async def check_and_increment_daily_usage(self, telegram_id: int, daily_limit: int = 10) -> tuple[bool, int]:
+        """
+        Check if user has remaining daily queries and increment.
+        Returns (is_allowed, current_count).
+        """
+        today = datetime.date.today()
+        current_count = await self.user_repo.increment_daily_usage(telegram_id, today)
+        await self.session.commit()
+        return current_count <= daily_limit, current_count
+
+    async def get_daily_usage_remaining(self, telegram_id: int, daily_limit: int = 10) -> int:
+        """Get remaining daily queries for a user."""
+        today = datetime.date.today()
+        usage = await self.user_repo.get_daily_usage(telegram_id, today)
+        used = usage.query_count if usage else 0
+        return max(0, daily_limit - used)
+
+    async def get_usage_stats_last_14_days(self) -> list[dict]:
+        """Get usage statistics for all users over the last 14 days."""
+        return await self.user_repo.get_usage_stats_last_14_days()
+
+    async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
+        """Get total usage for a specific user over the last 14 days."""
+        return await self.user_repo.get_user_total_usage_last_14_days(telegram_id)

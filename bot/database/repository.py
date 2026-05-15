@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from sqlalchemy import select, delete
+import datetime
+
+from sqlalchemy import func, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.database.models import Message, User, UserSettings
+from bot.database.models import AllowedUser, DailyUsage, Message, User, UserSettings
 
 
 class UserRepository:
@@ -107,6 +109,96 @@ class UserRepository:
             if max_tokens is not None:
                 settings.max_tokens = max_tokens
             await self.session.flush()
+
+    # --- Allowed Users Management ---
+
+    async def add_allowed_user(self, telegram_id: int, added_by: int | None = None) -> AllowedUser:
+        """Add a user to the allowed list."""
+        existing = await self.session.get(AllowedUser, telegram_id)
+        if existing:
+            return existing
+        allowed = AllowedUser(telegram_id=telegram_id, added_by=added_by)
+        self.session.add(allowed)
+        await self.session.flush()
+        return allowed
+
+    async def remove_allowed_user(self, telegram_id: int) -> bool:
+        """Remove a user from the allowed list. Returns True if removed."""
+        existing = await self.session.get(AllowedUser, telegram_id)
+        if existing is None:
+            return False
+        await self.session.delete(existing)
+        await self.session.flush()
+        return True
+
+    async def get_allowed_users(self) -> list[AllowedUser]:
+        """Get all allowed users."""
+        result = await self.session.execute(
+            select(AllowedUser).order_by(AllowedUser.added_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def is_allowed_user(self, telegram_id: int) -> bool:
+        """Check if a user is in the allowed list."""
+        existing = await self.session.get(AllowedUser, telegram_id)
+        return existing is not None
+
+    # --- Daily Usage Tracking ---
+
+    async def get_daily_usage(self, telegram_id: int, date: datetime.date) -> DailyUsage | None:
+        """Get daily usage record for a user on a specific date."""
+        result = await self.session.execute(
+            select(DailyUsage).where(
+                DailyUsage.telegram_id == telegram_id,
+                DailyUsage.date == date,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def increment_daily_usage(self, telegram_id: int, date: datetime.date) -> int:
+        """Increment daily query count for a user. Returns the new count."""
+        usage = await self.get_daily_usage(telegram_id, date)
+        if usage is None:
+            usage = DailyUsage(telegram_id=telegram_id, date=date, query_count=1)
+            self.session.add(usage)
+        else:
+            usage.query_count += 1
+        await self.session.flush()
+        return usage.query_count
+
+    async def get_usage_stats_last_14_days(self) -> list[dict]:
+        """Get usage statistics for all users over the last 14 days."""
+        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=14)
+        result = await self.session.execute(
+            select(
+                DailyUsage.telegram_id,
+                DailyUsage.date,
+                DailyUsage.query_count,
+            )
+            .where(DailyUsage.date >= fourteen_days_ago)
+            .order_by(DailyUsage.date.desc(), DailyUsage.telegram_id)
+        )
+        rows = result.all()
+        return [
+            {
+                "telegram_id": row.telegram_id,
+                "date": row.date,
+                "query_count": row.query_count,
+            }
+            for row in rows
+        ]
+
+    async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
+        """Get total usage for a specific user over the last 14 days."""
+        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=14)
+        result = await self.session.execute(
+            select(func.coalesce(func.sum(DailyUsage.query_count), 0))
+            .where(
+                DailyUsage.telegram_id == telegram_id,
+                DailyUsage.date >= fourteen_days_ago,
+            )
+        )
+        return result.scalar() or 0
 
 
 class MessageRepository:

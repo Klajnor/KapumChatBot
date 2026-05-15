@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -69,3 +69,34 @@ class Message(Base):
 
     # Relationships
     user: Mapped[User] = relationship("User", back_populates="messages")
+
+
+class AllowedUser(Base):
+    """Users who are allowed to ask questions to the bot (managed by admin)."""
+
+    __tablename__ = "allowed_users"
+
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    added_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class DailyUsage(Base):
+    """Daily usage tracking — how many queries a user made on a given day."""
+
+    __tablename__ = "daily_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.telegram_id", ondelete="CASCADE"), index=True
+    )
+    date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    query_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("telegram_id", "date", name="uq_daily_usage_user_date"),
+    )
