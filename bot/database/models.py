@@ -21,6 +21,7 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     is_admin: Mapped[bool] = mapped_column(default=False)
+    guest_messages_used: Mapped[int] = mapped_column(Integer, default=0)
 
     # Relationships
     settings: Mapped[UserSettings | None] = relationship(

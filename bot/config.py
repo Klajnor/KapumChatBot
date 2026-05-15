@@ -51,6 +51,9 @@ class Config:
     max_history_length: int = field(
         default_factory=lambda: int(os.getenv("MAX_HISTORY_LENGTH", "30"))
     )
+    guest_message_limit: int = field(
+        default_factory=lambda: int(os.getenv("GUEST_MESSAGE_LIMIT", "5"))
+    )
 
     def __post_init__(self) -> None:
         """Parse admin IDs after initialization."""

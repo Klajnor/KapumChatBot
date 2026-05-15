@@ -88,6 +88,20 @@ class UserService:
         await self.message_repo.clear_history(telegram_id)
         await self.session.commit()
 
+    async def get_guest_messages_used(self, telegram_id: int) -> int:
+        """Get the number of messages used by a guest user."""
+        return await self.user_repo.get_guest_messages_used(telegram_id)
+
+    async def increment_guest_messages(self, telegram_id: int) -> None:
+        """Increment the guest message counter for a user."""
+        await self.user_repo.increment_guest_messages(telegram_id)
+        await self.session.commit()
+
+    async def get_guest_messages_remaining(self, telegram_id: int) -> int:
+        """Get the number of remaining messages for a guest user."""
+        used = await self.get_guest_messages_used(telegram_id)
+        return max(0, config.guest_message_limit - used)
+
     async def get_stats(self, telegram_id: int) -> dict:
         """Get usage statistics for a user."""
         settings = await self.get_user_settings(telegram_id)

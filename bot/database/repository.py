@@ -52,6 +52,20 @@ class UserRepository:
         """Get user by Telegram ID."""
         return await self.session.get(User, telegram_id)
 
+    async def get_guest_messages_used(self, telegram_id: int) -> int:
+        """Get the number of messages used by a guest user."""
+        user = await self.session.get(User, telegram_id)
+        if user is None:
+            return 0
+        return user.guest_messages_used
+
+    async def increment_guest_messages(self, telegram_id: int) -> None:
+        """Increment the guest message counter for a user."""
+        user = await self.session.get(User, telegram_id)
+        if user is not None:
+            user.guest_messages_used += 1
+            await self.session.flush()
+
     async def get_user_settings(self, telegram_id: int) -> UserSettings | None:
         """Get user settings."""
         result = await self.session.execute(
