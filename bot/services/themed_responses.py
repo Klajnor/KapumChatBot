@@ -2,86 +2,87 @@ from __future__ import annotations
 
 import random
 
-# ─── Star Wars themed responses ───────────────────────────────────────────────
+# ─── Star Wars themed responses (Russian) ─────────────────────────────────────
 
 _STAR_WARS_RESPONSES = [
     (
-        "🛸 <b>These aren't the droids you're looking for.</b>\n\n"
-        "The Imperial Senate has decreed that only authorized personnel "
-        "may access this terminal. Your identification is not part of "
-        "the Alliance's databanks.\n\n"
-        "<i>— A mysterious hologram flickers and vanishes.</i>"
+        "🛸 <b>Это не те дроиды, которых вы ищете.</b>\n\n"
+        "Имперский Сенат постановил, что только авторизованный персонал "
+        "может иметь доступ к этому терминалу. Ваша идентификация не числится "
+        "в банках данных Альянса.\n\n"
+        "<i>— Таинственная голограмма мерцает и исчезает.</i>"
     ),
     (
-        "⚡ <b>Restricted area — by order of the Galactic Empire.</b>\n\n"
-        "The Death Star's targeting computer has locked onto your "
-        "communication frequency. This is a restricted channel for "
-        "allied forces only.\n\n"
-        "<i>— The sound of a lightsaber ignites in the distance.</i>"
+        "⚡ <b>Запретная зона — по приказу Галактической Империи.</b>\n\n"
+        "Целевой компьютер Звезды Смерти заблокировал вашу "
+        "частоту связи. Это закрытый канал "
+        "только для союзных сил.\n\n"
+        "<i>— Вдалеке слышен звук включения светового меча.</i>"
     ),
     (
-        "🌌 <b>The Force is not strong with this one.</b>\n\n"
-        "You are not a Jedi — nor a Sith. You are merely a traveler "
-        "in a galaxy far, far away, and this communication channel "
-        "is reserved for those who carry the admin's mark.\n\n"
-        "<i>— R2-D2 beeps disapprovingly.</i>"
+        "🌌 <b>Сила не на твоей стороне.</b>\n\n"
+        "Ты не джедай — и не ситх. Ты всего лишь путник "
+        "в далёкой-далёкой галактике, и этот канал связи "
+        "предназначен для тех, кто несёт метку администратора.\n\n"
+        "<i>— R2-D2 неодобрительно пищит.</i>"
     ),
     (
-        "🚀 <b>This is not the bot you're looking for.</b>\n\n"
-        "Move along. Move along. Only those with the admin clearance "
-        "code may proceed. Your credentials do not match the "
-        "Millennium Falcon's encrypted transponder signal.\n\n"
-        "<i>— Chewbacca growls in agreement.</i>"
+        "🚀 <b>Это не тот бот, которого вы ищете.</b>\n\n"
+        "Проходите мимо. Проходите мимо. Только те, у кого есть "
+        "административный код допуска, могут пройти. Ваши учётные данные "
+        "не совпадают с зашифрованным сигналом транспондера «Тысячелетнего Сокола».\n\n"
+        "<i>— Чубакка одобрительно рычит.</i>"
     ),
     (
-        "🪐 <b>Access denied — Hoth system is off-limits.</b>\n\n"
-        "The Rebel Alliance has encrypted this channel. Without an "
-        "admin's authentication code, you're as lost as a stormtrooper "
-        "on Tatooine.\n\n"
-        "<i>— A thermal detonator ticks ominously.</i>"
+        "🪐 <b>Доступ запрещён — система Хот закрыта.</b>\n\n"
+        "Повстанческий Альянс зашифровал этот канал. Без "
+        "кода аутентификации администратора вы потеряны, как штурмовик "
+        "на Татуине.\n\n"
+        "<i>— Термический детонатор угрожающе тикает.</i>"
     ),
 ]
 
-# ─── Hitchhiker's Guide to the Galaxy themed responses ───────────────────────
+# ─── Hitchhiker's Guide to the Galaxy themed responses (Russian) ─────────────
 
 _HITCHHIKER_RESPONSES = [
     (
-        "📖 <b>You are not authorized — and frankly, don't panic.</b>\n\n"
-        "According to <i>The Hitchhiker's Guide to the Galaxy</i>, "
-        "this bot is reserved for users with an admin-level "
-        "improbability drive. Yours appears to be on the fritz.\n\n"
-        "<i>— A small, depressed robot hands you a towel.</i>"
+        "📖 <b>Вы не авторизованы — и, честно говоря, без паники.</b>\n\n"
+        "Согласно <i>«Автостопом по Галактике»</i>, "
+        "этот бот предназначен для пользователей с административным "
+        "приводом невероятности. Ваш, похоже, барахлит.\n\n"
+        "<i>— Маленький депрессивный робот протягивает вам полотенце.</i>"
     ),
     (
-        "🌍 <b>Access denied. Mostly harmless.</b>\n\n"
-        "The Guide rates your clearance level as <i>\"mostly harmless\"</i> — "
-        "which, in this case, means <i>\"not nearly enough.\"</i> "
-        "Only beings with a Pan Galactic Gargle Blaster tolerance "
-        "and admin privileges may pass.\n\n"
-        "<i>— Ford Prefect shrugs and orders another drink.</i>"
+        "🌍 <b>Доступ запрещён. В основном безвреден.</b>\n\n"
+        "Путеводитель оценивает ваш уровень допуска как "
+        "<i>«в основном безвреден»</i> — "
+        "что в данном случае означает <i>«недостаточно»</i>. "
+        "Только существа с толерантностью к Пангалактическому "
+        "Грызлодёру и правами администратора могут пройти.\n\n"
+        "<i>— Форд Префект пожимает плечами и заказывает ещё выпивку.</i>"
     ),
     (
-        "🐁 <b>The answer is 42. The question is: are you an admin?</b>\n\n"
-        "Deep Thought has calculated the meaning of life, the universe, "
-        "and everything — and it turns out you need admin access "
-        "to use this bot. Sorry, the mice were very clear about this.\n\n"
-        "<i>— Two white mice scurry away with the final answer.</i>"
+        "🐁 <b>Ответ — 42. Вопрос в том: вы администратор?</b>\n\n"
+        "Глубокий Мысль вычислил смысл жизни, вселенной "
+        "и всего такого — и оказалось, что вам нужен админский доступ, "
+        "чтобы использовать этого бота. Извините, мыши были очень чётки на этот счёт.\n\n"
+        "<i>— Две белые мыши убегают с окончательным ответом.</i>"
     ),
     (
-        "🚀 <b>Infinite Improbability Drive: offline.</b>\n\n"
-        "Your request has encountered an infinitesimally improbable "
-        "barrier — namely, that you lack admin privileges. "
-        "The Heart of Gold's computer suggests you come back when "
-        "you've obtained proper clearance.\n\n"
-        "<i>— Marvin the Paranoid Android sighs heavily.</i>"
+        "🚀 <b>Привод невероятности: отключён.</b>\n\n"
+        "Ваш запрос наткнулся на бесконечно маловероятный "
+        "барьер — а именно, отсутствие у вас прав администратора. "
+        "Компьютер «Золотого Сердца» предлагает вернуться, "
+        "когда вы получите соответствующий допуск.\n\n"
+        "<i>— Марвин, параноидальный андроид, тяжело вздыхает.</i>"
     ),
     (
-        "📕 <b>Entry not found in The Guide.</b>\n\n"
-        "<i>The Hitchhiker's Guide to the Galaxy</i> has no entry for "
-        "your user ID. It does, however, note that you should "
-        "probably contact an administrator. In the meantime, "
-        "here's a towel. You'll need it.\n\n"
-        "<i>— A Vogon poetry reading begins in the background. Run.</i>"
+        "📕 <b>Запись не найдена в Путеводителе.</b>\n\n"
+        "<i>«Автостопом по Галактике»</i> не содержит записи "
+        "о вашем пользовательском ID. Однако там отмечено, что вам стоит "
+        "связаться с администратором. А пока — "
+        "вот полотенце. Оно вам понадобится.\n\n"
+        "<i>— Вдалеке начинается чтение вогонской поэзии. Бегите.</i>"
     ),
 ]
 
