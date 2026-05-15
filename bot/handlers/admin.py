@@ -38,7 +38,7 @@ def _admin_required(func):
 @router.message(Command("add_user"))
 @_admin_required
 async def cmd_add_user(message: Message) -> None:
-    """Handle /add_user <id> — add a user by ID to the allowed list."""
+    """Handle /add_user &lt;id&gt; — add a user by ID to the allowed list."""
     user = message.from_user
     if user is None:
         return
@@ -80,7 +80,7 @@ async def cmd_add_user(message: Message) -> None:
 @router.message(Command("remove_user"))
 @_admin_required
 async def cmd_remove_user(message: Message) -> None:
-    """Handle /remove_user <id> — remove a user from the allowed list."""
+    """Handle /remove_user &lt;id&gt; — remove a user from the allowed list."""
     text = message.text or ""
     parts = text.split(maxsplit=1)
 
@@ -127,7 +127,7 @@ async def cmd_list_users(message: Message) -> None:
     if not allowed_users:
         await message.answer(
             "📭 <b>Allowed users list is empty.</b>\n\n"
-            "Use <code>/add_user <id></code> to add users."
+            "Use <code>/add_user &lt;id&gt;</code> to add users."
         )
         return
 
@@ -135,9 +135,9 @@ async def cmd_list_users(message: Message) -> None:
     for i, au in enumerate(allowed_users, 1):
         name_parts = []
         if au["first_name"]:
-            name_parts.append(au["first_name"])
+            name_parts.append(html.escape(au["first_name"]))
         if au["username"]:
-            name_parts.append(f"@{au['username']}")
+            name_parts.append(f"@{html.escape(au['username'])}")
         name_str = f" ({' '.join(name_parts)})" if name_parts else ""
 
         added_at_str = au["added_at"].strftime("%Y-%m-%d %H:%M") if au["added_at"] else "?"
@@ -203,7 +203,7 @@ async def cmd_admin_stats(message: Message) -> None:
 @router.message(Command("reset_daily_usage"))
 @_admin_required
 async def cmd_reset_daily_usage(message: Message) -> None:
-    """Handle /reset_daily_usage <id> — reset daily usage for a user."""
+    """Handle /reset_daily_usage &lt;id&gt; — reset daily usage for a user."""
     text = message.text or ""
     parts = text.split(maxsplit=1)
 

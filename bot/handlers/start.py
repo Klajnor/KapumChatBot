@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
@@ -37,10 +39,11 @@ async def cmd_start(message: Message) -> None:
         is_allowed = await service.is_allowed_user(user.id)
 
     is_admin = _is_admin(user.id)
+    safe_name = html.escape(user.first_name or "there")
 
     if is_admin:
         welcome_text = (
-            f"👋 <b>Hello, Admin {user.first_name or 'there'}!</b>\n\n"
+            f"👋 <b>Hello, Admin {safe_name}!</b>\n\n"
             f"I'm an AI-powered bot connected to <b>OpenRouter</b>. "
             f"I can chat with you using various AI models, analyze images, "
             f"and adapt to your preferences.\n\n"
@@ -54,17 +57,17 @@ async def cmd_start(message: Message) -> None:
             f"⚙️ /settings — Current settings\n"
             f"❓ /help — All commands\n\n"
             f"<b>👑 Admin commands:</b>\n"
-            f"➕ /add_user <id> — Allow a user to use the bot\n"
-            f"➖ /remove_user <id> — Remove a user from allowed list\n"
+            f"➕ /add_user &lt;id&gt; — Allow a user to use the bot\n"
+            f"➖ /remove_user &lt;id&gt; — Remove a user from allowed list\n"
             f"📋 /list_users — Show all allowed users\n"
             f"📈 /admin_stats — Usage statistics (14 days)\n"
-            f"🔄 /reset_daily_usage <id> — Reset daily usage\n\n"
+            f"🔄 /reset_daily_usage &lt;id&gt; — Reset daily usage\n\n"
             f"<i>Let's get started! 🚀</i>"
         )
         await message.answer(welcome_text)
     elif is_allowed:
         await message.answer(
-            f"👋 <b>Welcome back, {user.first_name or 'there'}!</b>\n\n"
+            f"👋 <b>Welcome back, {safe_name}!</b>\n\n"
             f"You have been granted access to use this AI bot.\n\n"
             f"<b>Available commands:</b>\n"
             f"💬 <b>Just send me a message</b> — I'll reply using AI\n"
@@ -79,7 +82,7 @@ async def cmd_start(message: Message) -> None:
         )
     else:
         await message.answer(
-            f"🌌 <b>Greetings, {user.first_name or 'traveller'}.</b>\n\n"
+            f"🌌 <b>Greetings, {safe_name}.</b>\n\n"
             f"This communication channel is reserved for authorized personnel only. "
             f"Your transmission has been received and logged — but unfortunately, "
             f"your ID is not on the admin manifest.\n\n"
