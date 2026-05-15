@@ -13,7 +13,11 @@ router = Router()
 async def cmd_help(message: Message) -> None:
     """Handle /help command — show all available commands."""
     user = message.from_user
-    is_admin = user is not None and user.id in config.admin_ids
+    
+    if user is None:
+        return   
+    
+    is_admin = user.id in config.admin_ids
 
     if is_admin:
         help_text = (
