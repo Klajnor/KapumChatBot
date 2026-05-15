@@ -31,7 +31,7 @@ async def cmd_help(message: Message) -> None:
             "• /models — Select an AI model from the list\n"
             "• /model — Show your current AI model\n"
             "• /prompt — View current system prompt\n"
-            "• /prompt <text> — Set a new system prompt\n"
+            "• /prompt &lt;text&gt; — Set a new system prompt\n"
             "• /clear — Clear conversation history\n"
             "• /stats — View your usage statistics\n"
             "• /settings — View your current settings\n\n"
