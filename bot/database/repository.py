@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import func, select, delete
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.config import config
 from bot.database.models import AllowedUser, DailyUsage, Message, User, UserSettings
 
 
@@ -22,7 +24,7 @@ class UserRepository:
         last_name: str | None = None,
         is_admin: bool = False,
     ) -> User:
-        """Get existing user or create a new one with default settings."""
+        """Get an existing user or create one with default settings."""
         user = await self.session.get(User, telegram_id)
         if user is None:
             user = User(
@@ -34,19 +36,28 @@ class UserRepository:
             )
             self.session.add(user)
             await self.session.flush()
-
-            # Create default settings for the new user
-            settings = UserSettings(user_id=telegram_id)
-            self.session.add(settings)
-            await self.session.flush()
         else:
-            # Update user info
+            # Refresh profile fields that may have changed.
             if username is not None:
                 user.username = username
             if first_name is not None:
                 user.first_name = first_name
             if last_name is not None:
                 user.last_name = last_name
+            if is_admin:
+                user.is_admin = True
+
+        # Guarantee that settings exist (also for legacy rows).
+        settings = await self.get_user_settings(telegram_id)
+        if settings is None:
+            self.session.add(
+                UserSettings(
+                    user_id=telegram_id,
+                    selected_model=config.default_model,
+                    system_prompt=config.default_system_prompt,
+                )
+            )
+            await self.session.flush()
 
         return user
 
@@ -55,18 +66,18 @@ class UserRepository:
         return await self.session.get(User, telegram_id)
 
     async def get_guest_messages_used(self, telegram_id: int) -> int:
-        """Get the number of messages used by a guest user."""
+        """Get the number of free-trial messages used by a guest."""
+        user = await self.session.get(User, telegram_id)
+        return user.guest_messages_used if user is not None else 0
+
+    async def increment_guest_messages(self, telegram_id: int) -> int:
+        """Atomically increment and return the guest message counter."""
         user = await self.session.get(User, telegram_id)
         if user is None:
             return 0
+        user.guest_messages_used += 1
+        await self.session.flush()
         return user.guest_messages_used
-
-    async def increment_guest_messages(self, telegram_id: int) -> None:
-        """Increment the guest message counter for a user."""
-        user = await self.session.get(User, telegram_id)
-        if user is not None:
-            user.guest_messages_used += 1
-            await self.session.flush()
 
     async def get_user_settings(self, telegram_id: int) -> UserSettings | None:
         """Get user settings."""
@@ -75,19 +86,30 @@ class UserRepository:
         )
         return result.scalar_one_or_none()
 
+    async def _ensure_settings(self, telegram_id: int) -> UserSettings:
+        """Return the user's settings row, creating it if necessary."""
+        settings = await self.get_user_settings(telegram_id)
+        if settings is None:
+            settings = UserSettings(
+                user_id=telegram_id,
+                selected_model=config.default_model,
+                system_prompt=config.default_system_prompt,
+            )
+            self.session.add(settings)
+            await self.session.flush()
+        return settings
+
     async def update_model(self, telegram_id: int, model: str) -> None:
         """Update user's selected AI model."""
-        settings = await self.get_user_settings(telegram_id)
-        if settings:
-            settings.selected_model = model
-            await self.session.flush()
+        settings = await self._ensure_settings(telegram_id)
+        settings.selected_model = model
+        await self.session.flush()
 
     async def update_system_prompt(self, telegram_id: int, prompt: str) -> None:
         """Update user's system prompt."""
-        settings = await self.get_user_settings(telegram_id)
-        if settings:
-            settings.system_prompt = prompt
-            await self.session.flush()
+        settings = await self._ensure_settings(telegram_id)
+        settings.system_prompt = prompt
+        await self.session.flush()
 
     async def update_settings(
         self,
@@ -98,21 +120,22 @@ class UserRepository:
         max_tokens: int | None = None,
     ) -> None:
         """Update user settings."""
-        settings = await self.get_user_settings(telegram_id)
-        if settings:
-            if model is not None:
-                settings.selected_model = model
-            if prompt is not None:
-                settings.system_prompt = prompt
-            if temperature is not None:
-                settings.temperature = temperature
-            if max_tokens is not None:
-                settings.max_tokens = max_tokens
-            await self.session.flush()
+        settings = await self._ensure_settings(telegram_id)
+        if model is not None:
+            settings.selected_model = model
+        if prompt is not None:
+            settings.system_prompt = prompt
+        if temperature is not None:
+            settings.temperature = temperature
+        if max_tokens is not None:
+            settings.max_tokens = max_tokens
+        await self.session.flush()
 
-    # --- Allowed Users Management ---
+    # --- Allowed users management -----------------------------------------
 
-    async def add_allowed_user(self, telegram_id: int, added_by: int | None = None) -> AllowedUser:
+    async def add_allowed_user(
+        self, telegram_id: int, added_by: int | None = None
+    ) -> AllowedUser:
         """Add a user to the allowed list."""
         existing = await self.session.get(AllowedUser, telegram_id)
         if existing:
@@ -143,9 +166,11 @@ class UserRepository:
         existing = await self.session.get(AllowedUser, telegram_id)
         return existing is not None
 
-    # --- Daily Usage Tracking ---
+    # --- Daily usage tracking ---------------------------------------------
 
-    async def get_daily_usage(self, telegram_id: int, date: datetime.date) -> DailyUsage | None:
+    async def get_daily_usage(
+        self, telegram_id: int, date: datetime.date
+    ) -> DailyUsage | None:
         """Get daily usage record for a user on a specific date."""
         result = await self.session.execute(
             select(DailyUsage).where(
@@ -156,15 +181,30 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     async def increment_daily_usage(self, telegram_id: int, date: datetime.date) -> int:
-        """Increment daily query count for a user. Returns the new count."""
+        """Atomically increment daily usage and return the new count.
+
+        Uses an UPSERT so concurrent requests cannot lose increments.
+        """
+        stmt = (
+            pg_insert(DailyUsage)
+            .values(telegram_id=telegram_id, date=date, query_count=1)
+            .on_conflict_do_update(
+                index_elements=[DailyUsage.telegram_id, DailyUsage.date],
+                set_={"query_count": DailyUsage.query_count + 1},
+            )
+            .returning(DailyUsage.query_count)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one()
+
+    async def reset_daily_usage(self, telegram_id: int, date: datetime.date) -> bool:
+        """Reset the daily usage counter. Returns True if a record existed."""
         usage = await self.get_daily_usage(telegram_id, date)
         if usage is None:
-            usage = DailyUsage(telegram_id=telegram_id, date=date, query_count=1)
-            self.session.add(usage)
-        else:
-            usage.query_count += 1
+            return False
+        usage.query_count = 0
         await self.session.flush()
-        return usage.query_count
+        return True
 
     async def get_usage_stats_last_14_days(self) -> list[dict]:
         """Get usage statistics for all users over the last 14 days."""
@@ -178,27 +218,25 @@ class UserRepository:
             .where(DailyUsage.date >= fourteen_days_ago)
             .order_by(DailyUsage.date.desc(), DailyUsage.telegram_id)
         )
-        rows = result.all()
         return [
             {
                 "telegram_id": row.telegram_id,
                 "date": row.date,
                 "query_count": row.query_count,
             }
-            for row in rows
+            for row in result.all()
         ]
 
     async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
         """Get total usage for a specific user over the last 14 days."""
         fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=14)
         result = await self.session.execute(
-            select(func.coalesce(func.sum(DailyUsage.query_count), 0))
-            .where(
+            select(func.coalesce(func.sum(DailyUsage.query_count), 0)).where(
                 DailyUsage.telegram_id == telegram_id,
                 DailyUsage.date >= fourteen_days_ago,
             )
         )
-        return result.scalar() or 0
+        return int(result.scalar() or 0)
 
 
 class MessageRepository:
@@ -209,6 +247,7 @@ class MessageRepository:
 
     async def add_message(
         self,
+        chat_id: int,
         user_id: int,
         role: str,
         content: str,
@@ -217,6 +256,7 @@ class MessageRepository:
     ) -> Message:
         """Save a message to the database."""
         message = Message(
+            chat_id=chat_id,
             user_id=user_id,
             role=role,
             content=content,
@@ -228,33 +268,26 @@ class MessageRepository:
         return message
 
     async def get_history(
-        self, user_id: int, limit: int = 30
+        self, chat_id: int, limit: int = 30
     ) -> list[dict[str, str]]:
-        """Get the last N messages for a user as a list of dicts for OpenAI format."""
+        """Return the last ``limit`` messages of a conversation in OpenAI format."""
         result = await self.session.execute(
             select(Message)
-            .where(Message.user_id == user_id)
-            .order_by(Message.created_at.desc())
+            .where(Message.chat_id == chat_id)
+            .order_by(Message.id.desc())
             .limit(limit)
         )
         messages = list(reversed(result.scalars().all()))
+        return [{"role": m.role, "content": m.content} for m in messages]
 
-        formatted = []
-        for msg in messages:
-            entry: dict[str, str] = {"role": msg.role, "content": msg.content}
-            formatted.append(entry)
-        return formatted
-
-    async def clear_history(self, user_id: int) -> None:
-        """Delete all messages for a user."""
-        await self.session.execute(
-            delete(Message).where(Message.user_id == user_id)
-        )
+    async def clear_history(self, chat_id: int) -> None:
+        """Delete all messages of a conversation."""
+        await self.session.execute(delete(Message).where(Message.chat_id == chat_id))
         await self.session.flush()
 
     async def get_message_count(self, user_id: int) -> int:
-        """Get total message count for a user."""
+        """Get the total number of messages authored by a user."""
         result = await self.session.execute(
-            select(Message).where(Message.user_id == user_id)
+            select(func.count()).select_from(Message).where(Message.user_id == user_id)
         )
-        return len(result.scalars().all())
+        return int(result.scalar() or 0)

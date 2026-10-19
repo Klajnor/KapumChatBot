@@ -8,7 +8,8 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.database.session import async_session_factory
 from bot.keyboards.inline import get_model_selection_keyboard
-from bot.services.openrouter import AVAILABLE_MODELS
+from bot.services.ai_client import ai_client, is_vision_model
+from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import UserService
 
 router = Router()
@@ -16,24 +17,22 @@ router = Router()
 
 @router.message(Command("models"))
 async def cmd_models(message: Message) -> None:
-    """Handle /models command — show model selection keyboard."""
-    keyboard = get_model_selection_keyboard()
+    """Handle /models command — show the model selection keyboard."""
+    lines = ["🤖 <b>Select an AI Model:</b>\n"]
+    for model in ai_client.available_models():
+        vision = " 🖼️" if is_vision_model(model["id"]) else ""
+        lines.append(f"• <code>{html.escape(model['id'])}</code>{vision}")
+    lines.append("\n🖼️ — supports images (vision)")
+    lines.append("<i>Tap a model to select it:</i>")
+
     await message.answer(
-        "🤖 <b>Select an AI Model:</b>\n\n"
-        "Choose a model from the list below. "
-        "Different models have different strengths:\n"
-        "• <b>GPT-4o</b> — Best all-rounder, supports vision\n"
-        "• <b>Claude 3.5 Sonnet</b> — Excellent for reasoning\n"
-        "• <b>DeepSeek</b> — Great for coding\n"
-        "• <b>Gemini</b> — Fast and capable\n\n"
-        "<i>Tap a model to select it:</i>",
-        reply_markup=keyboard,
+        "\n".join(lines), reply_markup=get_model_selection_keyboard()
     )
 
 
 @router.message(Command("model"))
 async def cmd_model(message: Message) -> None:
-    """Handle /model command — show current model."""
+    """Handle /model command — show the current model."""
     user = message.from_user
     if user is None:
         return
@@ -54,20 +53,26 @@ async def cb_model_selected(callback: CallbackQuery) -> None:
         return
 
     model_id = callback.data.replace("model:", "")
+    available = {m["id"]: m["name"] for m in ai_client.available_models()}
 
-    # Find model name
-    model_name = model_id
-    for m in AVAILABLE_MODELS:
-        if m["id"] == model_id:
-            model_name = m["name"]
-            break
+    if model_id not in available:
+        await safe_answer_callback(
+            callback,
+            "⚠️ This model is not available for your account.",
+            show_alert=True,
+        )
+        return
+
+    model_name = available[model_id]
 
     async with async_session_factory() as session:
         service = UserService(session)
         await service.set_model(callback.from_user.id, model_id)
 
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        f"✅ <b>Model changed to:</b> <code>{html.escape(model_name)}</code>\n\n"
-        f"Model ID: <code>{html.escape(model_id)}</code>"
+    vision = "\n🖼️ Supports images (vision)." if is_vision_model(model_id) else ""
+    await safe_edit_text(
+        callback.message,  # type: ignore[arg-type]
+        f"✅ <b>Model changed to:</b> <code>{html.escape(model_name)}</code>"
+        f"{vision}\n\nModel ID: <code>{html.escape(model_id)}</code>",
     )
-    await callback.answer(f"Selected: {model_name}")
+    await safe_answer_callback(callback, f"Selected: {model_name}")

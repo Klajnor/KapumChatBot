@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import html
 import logging
 
@@ -16,22 +17,20 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-DAILY_LIMIT = 10  # Max questions per day for allowed users
-
-
-def _is_admin(user_id: int) -> bool:
-    """Check if a user is an admin by their Telegram ID."""
-    return user_id in config.admin_ids
-
 
 def _admin_required(func):
     """Decorator to restrict commands to admins only."""
-    async def wrapper(message: Message) -> None:
+
+    @functools.wraps(func)
+    async def wrapper(message: Message, *args, **kwargs):
         user = message.from_user
-        if user is None or not _is_admin(user.id):
-            await message.answer("⛔ <b>Access denied.</b> This command is for admins only.")
+        if user is None or not config.is_admin(user.id):
+            await message.answer(
+                "⛔ <b>Access denied.</b> This command is for admins only."
+            )
             return
-        return await func(message)
+        return await func(message, *args, **kwargs)
+
     return wrapper
 
 
@@ -62,7 +61,7 @@ async def cmd_add_user(message: Message) -> None:
         )
         return
 
-    if target_id in config.admin_ids:
+    if config.is_admin(target_id):
         await message.answer("⚠️ <b>Admins already have access.</b> No need to add them manually.")
         return
 
@@ -73,7 +72,7 @@ async def cmd_add_user(message: Message) -> None:
     await message.answer(
         f"✅ <b>User added to allowed list.</b>\n\n"
         f"👤 <b>ID:</b> <code>{target_id}</code>\n"
-        f"📊 <b>Daily limit:</b> {DAILY_LIMIT} questions"
+        f"📊 <b>Daily limit:</b> {config.daily_limit} questions"
     )
 
 
@@ -223,17 +222,14 @@ async def cmd_reset_daily_usage(message: Message) -> None:
         return
 
     async with async_session_factory() as session:
-        from bot.database.repository import UserRepository
-        repo = UserRepository(session)
-        today = datetime.date.today()
-        usage = await repo.get_daily_usage(target_id, today)
-        if usage:
-            usage.query_count = 0
-            await session.commit()
-            await message.answer(
-                f"✅ <b>Daily usage reset for user</b> <code>{target_id}</code>."
-            )
-        else:
-            await message.answer(
-                f"ℹ️ <b>No usage data found</b> for user <code>{target_id}</code> today."
-            )
+        service = UserService(session)
+        reset = await service.reset_daily_usage(target_id)
+
+    if reset:
+        await message.answer(
+            f"✅ <b>Daily usage reset for user</b> <code>{target_id}</code>."
+        )
+    else:
+        await message.answer(
+            f"ℹ️ <b>No usage data found</b> for user <code>{target_id}</code> today."
+        )

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.services.openrouter import AVAILABLE_MODELS
+from bot.services.ai_client import ai_client
 
 
 def get_model_selection_keyboard() -> InlineKeyboardMarkup:
     """Build an inline keyboard for selecting an AI model."""
     builder = InlineKeyboardBuilder()
-    for model in AVAILABLE_MODELS:
+    for model in ai_client.available_models():
         builder.button(
             text=model["name"],
             callback_data=f"model:{model['id']}",
