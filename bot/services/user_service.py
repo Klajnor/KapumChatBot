@@ -16,6 +16,8 @@ class UserService:
         self.user_repo = UserRepository(session)
         self.message_repo = MessageRepository(session)
 
+    # --- Users -------------------------------------------------------------
+
     async def register_user(
         self,
         telegram_id: int,
@@ -24,25 +26,24 @@ class UserService:
         last_name: str | None = None,
     ) -> None:
         """Register or update a user in the database."""
-        is_admin = telegram_id in config.admin_ids
         await self.user_repo.get_or_create_user(
             telegram_id=telegram_id,
             username=username,
             first_name=first_name,
             last_name=last_name,
-            is_admin=is_admin,
+            is_admin=config.is_admin(telegram_id),
         )
         await self.session.commit()
 
     async def get_user_settings(self, telegram_id: int) -> dict:
-        """Get user settings as a dictionary."""
+        """Get user settings as a dictionary (falls back to defaults)."""
         settings = await self.user_repo.get_user_settings(telegram_id)
         if settings is None:
             return {
                 "model": config.default_model,
                 "system_prompt": config.default_system_prompt,
-                "temperature": 0.7,
-                "max_tokens": 2048,
+                "temperature": config.default_temperature,
+                "max_tokens": config.default_max_tokens,
             }
         return {
             "model": settings.selected_model,
@@ -61,15 +62,12 @@ class UserService:
         await self.user_repo.update_system_prompt(telegram_id, prompt)
         await self.session.commit()
 
-    async def get_history(self, telegram_id: int) -> list[dict[str, str]]:
-        """Get conversation history for a user."""
-        return await self.message_repo.get_history(
-            telegram_id, limit=config.max_history_length
-        )
+    # --- History -----------------------------------------------------------
 
     async def add_message(
         self,
-        telegram_id: int,
+        chat_id: int,
+        user_id: int,
         role: str,
         content: str,
         image_url: str | None = None,
@@ -77,7 +75,8 @@ class UserService:
     ) -> None:
         """Save a message to the database."""
         await self.message_repo.add_message(
-            user_id=telegram_id,
+            chat_id=chat_id,
+            user_id=user_id,
             role=role,
             content=content,
             image_url=image_url,
@@ -85,24 +84,37 @@ class UserService:
         )
         await self.session.commit()
 
-    async def clear_history(self, telegram_id: int) -> None:
-        """Clear all messages for a user."""
-        await self.message_repo.clear_history(telegram_id)
+    async def get_history(
+        self, chat_id: int, limit: int | None = None
+    ) -> list[dict[str, str]]:
+        """Get the conversation history for a chat."""
+        return await self.message_repo.get_history(
+            chat_id, limit=limit or config.max_history_length
+        )
+
+    async def clear_history(self, chat_id: int) -> None:
+        """Clear all messages of a conversation."""
+        await self.message_repo.clear_history(chat_id)
         await self.session.commit()
+
+    # --- Guest access ------------------------------------------------------
 
     async def get_guest_messages_used(self, telegram_id: int) -> int:
-        """Get the number of messages used by a guest user."""
+        """Get the number of free-trial messages used by a guest."""
         return await self.user_repo.get_guest_messages_used(telegram_id)
 
-    async def increment_guest_messages(self, telegram_id: int) -> None:
-        """Increment the guest message counter for a user."""
-        await self.user_repo.increment_guest_messages(telegram_id)
+    async def increment_guest_messages(self, telegram_id: int) -> int:
+        """Increment the guest message counter and return the new value."""
+        count = await self.user_repo.increment_guest_messages(telegram_id)
         await self.session.commit()
+        return count
 
     async def get_guest_messages_remaining(self, telegram_id: int) -> int:
-        """Get the number of remaining messages for a guest user."""
+        """Get the number of remaining free-trial messages for a guest."""
         used = await self.get_guest_messages_used(telegram_id)
         return max(0, config.guest_message_limit - used)
+
+    # --- Statistics --------------------------------------------------------
 
     async def get_stats(self, telegram_id: int) -> dict:
         """Get usage statistics for a user."""
@@ -114,9 +126,11 @@ class UserService:
             "system_prompt": settings["system_prompt"],
         }
 
-    # --- Allowed Users Management ---
+    # --- Allowed users management -----------------------------------------
 
-    async def add_allowed_user(self, telegram_id: int, added_by: int | None = None) -> None:
+    async def add_allowed_user(
+        self, telegram_id: int, added_by: int | None = None
+    ) -> None:
         """Add a user to the allowed list."""
         await self.user_repo.add_allowed_user(telegram_id, added_by)
         await self.session.commit()
@@ -128,42 +142,58 @@ class UserService:
         return result
 
     async def get_allowed_users(self) -> list[dict]:
-        """Get all allowed users with their info."""
+        """Get all allowed users with their profile info."""
         allowed_users = await self.user_repo.get_allowed_users()
         result = []
         for au in allowed_users:
             user = await self.user_repo.get_user(au.telegram_id)
-            result.append({
-                "telegram_id": au.telegram_id,
-                "added_at": au.added_at,
-                "added_by": au.added_by,
-                "username": user.username if user else None,
-                "first_name": user.first_name if user else None,
-            })
+            result.append(
+                {
+                    "telegram_id": au.telegram_id,
+                    "added_at": au.added_at,
+                    "added_by": au.added_by,
+                    "username": user.username if user else None,
+                    "first_name": user.first_name if user else None,
+                }
+            )
         return result
 
     async def is_allowed_user(self, telegram_id: int) -> bool:
         """Check if a user is in the allowed list."""
         return await self.user_repo.is_allowed_user(telegram_id)
 
-    # --- Daily Usage Tracking ---
+    # --- Daily usage -------------------------------------------------------
 
-    async def check_and_increment_daily_usage(self, telegram_id: int, daily_limit: int = 10) -> tuple[bool, int]:
-        """
-        Check if user has remaining daily queries and increment.
-        Returns (is_allowed, current_count).
-        """
-        today = datetime.date.today()
-        current_count = await self.user_repo.increment_daily_usage(telegram_id, today)
+    async def get_daily_usage_used(self, telegram_id: int) -> int:
+        """Get the number of questions asked today."""
+        usage = await self.user_repo.get_daily_usage(
+            telegram_id, datetime.date.today()
+        )
+        return usage.query_count if usage else 0
+
+    async def increment_daily_usage(self, telegram_id: int) -> int:
+        """Increment today's usage counter and return the new value."""
+        count = await self.user_repo.increment_daily_usage(
+            telegram_id, datetime.date.today()
+        )
         await self.session.commit()
-        return current_count <= daily_limit, current_count
+        return count
 
-    async def get_daily_usage_remaining(self, telegram_id: int, daily_limit: int = 10) -> int:
-        """Get remaining daily queries for a user."""
-        today = datetime.date.today()
-        usage = await self.user_repo.get_daily_usage(telegram_id, today)
-        used = usage.query_count if usage else 0
-        return max(0, daily_limit - used)
+    async def get_daily_usage_remaining(
+        self, telegram_id: int, daily_limit: int | None = None
+    ) -> int:
+        """Get the number of remaining questions for today."""
+        limit = config.daily_limit if daily_limit is None else daily_limit
+        used = await self.get_daily_usage_used(telegram_id)
+        return max(0, limit - used)
+
+    async def reset_daily_usage(self, telegram_id: int) -> bool:
+        """Reset today's usage counter. Returns True if a record existed."""
+        result = await self.user_repo.reset_daily_usage(
+            telegram_id, datetime.date.today()
+        )
+        await self.session.commit()
+        return result
 
     async def get_usage_stats_last_14_days(self) -> list[dict]:
         """Get usage statistics for all users over the last 14 days."""

@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import html
 
-from aiogram import Router, F
+from aiogram import Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 
 from bot.database.session import async_session_factory
-from bot.keyboards.inline import get_model_selection_keyboard
 from bot.services.user_service import UserService
 
 router = Router()

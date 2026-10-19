@@ -39,7 +39,7 @@ class UserSettings(Base):
         BigInteger, ForeignKey("users.telegram_id", ondelete="CASCADE"), primary_key=True
     )
     selected_model: Mapped[str] = mapped_column(
-        String(256), default="openai/gpt-4o"
+        String(256), default="qwen3.8-flash"
     )
     system_prompt: Mapped[str] = mapped_column(
         Text,
@@ -59,6 +59,9 @@ class Message(Base):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.telegram_id", ondelete="CASCADE"), index=True
     )
+    # Conversation the message belongs to (private chat or group). For private
+    # chats this equals the user's Telegram ID.
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
     role: Mapped[str] = mapped_column(String(16))  # "user" or "assistant"
     content: Mapped[str] = mapped_column(Text)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)

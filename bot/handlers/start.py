@@ -6,6 +6,7 @@ from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
+from bot.bot import get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.services.themed_responses import get_random_themed_response
@@ -13,12 +14,39 @@ from bot.services.user_service import UserService
 
 router = Router()
 
-DAILY_LIMIT = 10
+_BASE_COMMANDS = (
+    "💬 <b>Send any text</b> — chat with the AI\n"
+    "🖼️ <b>Send an image</b> — analyze it (vision models)\n"
+    "🎤 <b>Send a voice message</b> — I'll recognize it and reply\n"
+    "🤖 /models — choose an AI model\n"
+    "🎨 /image &lt;prompt&gt; — generate an image\n"
+    "📝 /prompt — view or set the system prompt\n"
+    "🧹 /clear — clear conversation history\n"
+    "📊 /stats — your usage statistics\n"
+    "⚙️ /settings — current settings\n"
+    "❓ /help — all commands"
+)
 
 
-def _is_admin(user_id: int) -> bool:
-    """Check if a user is an admin by their Telegram ID."""
-    return user_id in config.admin_ids
+def _guest_mode_hint() -> str:
+    username = get_bot_username()
+    if not config.enable_guest_mode or not username:
+        return ""
+    return (
+        f"\n\n💡 <b>Summon me in any chat:</b> mention "
+        f"<code>@{html.escape(username)}</code> in any group or private "
+        f"conversation — even one I'm not a member of — and I'll reply right "
+        f"there."
+    )
+
+
+def _guest_hint() -> str:
+    if not config.allow_guest_access:
+        return ""
+    return (
+        f"\n\n🎁 <b>Free trial:</b> you can send up to "
+        f"{config.guest_message_limit} questions for free."
+    )
 
 
 @router.message(CommandStart())
@@ -38,30 +66,23 @@ async def cmd_start(message: Message) -> None:
         )
         is_allowed = await service.is_allowed_user(user.id)
 
-    is_admin = _is_admin(user.id)
     safe_name = html.escape(user.first_name or "there")
 
-    if is_admin:
+    if config.is_admin(user.id):
         welcome_text = (
             f"👋 <b>Hello, Admin {safe_name}!</b>\n\n"
-            f"I'm an AI-powered bot connected to <b>OpenRouter</b>. "
-            f"I can chat with you using various AI models, analyze images, "
-            f"and adapt to your preferences.\n\n"
+            f"I'm an AI-powered bot connected to <b>Qwen</b> (Alibaba Cloud "
+            f"Model Studio). I can chat, analyze images and adapt to your "
+            f"preferences.\n\n"
             f"<b>Your commands:</b>\n"
-            f"💬 <b>Just send me a message</b> — I'll reply using AI\n"
-            f"🖼️ <b>Send an image</b> — I'll analyze it (vision models)\n"
-            f"🤖 /models — Choose an AI model\n"
-            f"📝 /prompt — View or set system prompt\n"
-            f"🧹 /clear — Clear conversation history\n"
-            f"📊 /stats — Your usage statistics\n"
-            f"⚙️ /settings — Current settings\n"
-            f"❓ /help — All commands\n\n"
+            f"{_BASE_COMMANDS}\n\n"
             f"<b>👑 Admin commands:</b>\n"
-            f"➕ /add_user &lt;id&gt; — Allow a user to use the bot\n"
-            f"➖ /remove_user &lt;id&gt; — Remove a user from allowed list\n"
-            f"📋 /list_users — Show all allowed users\n"
-            f"📈 /admin_stats — Usage statistics (14 days)\n"
-            f"🔄 /reset_daily_usage &lt;id&gt; — Reset daily usage\n\n"
+            f"➕ /add_user &lt;id&gt; — allow a user to use the bot\n"
+            f"➖ /remove_user &lt;id&gt; — remove a user from the allowed list\n"
+            f"📋 /list_users — show all allowed users\n"
+            f"📈 /admin_stats — usage statistics (14 days)\n"
+            f"🔄 /reset_daily_usage &lt;id&gt; — reset a user's daily usage"
+            f"{_guest_mode_hint()}\n\n"
             f"<i>Let's get started! 🚀</i>"
         )
         await message.answer(welcome_text)
@@ -70,22 +91,19 @@ async def cmd_start(message: Message) -> None:
             f"👋 <b>Welcome back, {safe_name}!</b>\n\n"
             f"You have been granted access to use this AI bot.\n\n"
             f"<b>Available commands:</b>\n"
-            f"💬 <b>Just send me a message</b> — I'll reply using AI\n"
-            f"🖼️ <b>Send an image</b> — I'll analyze it (vision models)\n"
-            f"🤖 /models — Choose an AI model\n"
-            f"📝 /prompt — View or set system prompt\n"
-            f"🧹 /clear — Clear conversation history\n"
-            f"📊 /stats — Your usage statistics\n"
-            f"❓ /help — All commands\n\n"
-            f"⚠️ <b>Daily limit:</b> {DAILY_LIMIT} questions per day\n\n"
+            f"{_BASE_COMMANDS}\n\n"
+            f"⚠️ <b>Daily limit:</b> {config.daily_limit} questions per day"
+            f"{_guest_mode_hint()}\n\n"
             f"<i>Happy chatting! 🚀</i>"
         )
     else:
         await message.answer(
             f"🌌 <b>Greetings, {safe_name}.</b>\n\n"
-            f"This communication channel is reserved for authorized personnel only. "
-            f"Your transmission has been received and logged — but unfortunately, "
-            f"your ID is not on the admin manifest.\n\n"
+            f"This communication channel is reserved for authorized personnel. "
+            f"Your transmission has been received and logged — but your ID is "
+            f"not on the admin manifest."
+            f"{_guest_hint()}"
+            f"{_guest_mode_hint()}\n\n"
             f"{get_random_themed_response()}\n\n"
             f"<i>— Transmission ends.</i>"
         )
