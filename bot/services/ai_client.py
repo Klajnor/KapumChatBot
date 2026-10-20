@@ -5,15 +5,64 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 import aiohttp
 
-from bot.config import config
+from bot.config import DEFAULT_STYLE_HINT, FORMULA_STYLE_HINT, config
 from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
+
+
+def _media_log_info(value: str) -> dict[str, Any]:
+    """Describe a media reference without logging its bytes or signed URL."""
+    if value.startswith("data:") and "," in value:
+        header, encoded = value.split(",", 1)
+        info: dict[str, Any] = {"source": "inline", "mime": header[5:].split(";")[0]}
+        if ";base64" in header:
+            info["bytes"] = max(0, len(encoded) * 3 // 4 - (len(encoded) - len(encoded.rstrip("="))))
+        return info
+    return {"source": "remote"}
+
+
+def _request_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist request details; text is complete, media is metadata only."""
+    summary = {key: payload[key] for key in (
+        "model", "temperature", "max_tokens", "stream", "asr_options", "parameters"
+    ) if key in payload}
+    messages = payload.get("messages") or (payload.get("input") or {}).get("messages") or []
+    logged_messages = []
+    for message in messages:
+        content = message.get("content")
+        entry: dict[str, Any] = {"role": message.get("role")}
+        if isinstance(content, str):
+            entry["text"] = content
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str):
+                    parts.append({"type": "text", "text": part["text"]})
+                elif "image_url" in part:
+                    ref = part["image_url"]
+                    value = ref.get("url", "") if isinstance(ref, dict) else str(ref)
+                    parts.append({"type": "image", **_media_log_info(value)})
+                elif "input_audio" in part:
+                    ref = part["input_audio"]
+                    value = ref.get("data", "") if isinstance(ref, dict) else str(ref)
+                    parts.append({"type": "audio", **_media_log_info(value)})
+            entry["content"] = parts
+        logged_messages.append(entry)
+    summary["messages"] = logged_messages
+    if payload.get("tools"):
+        summary["tools"] = [tool.get("function", {}).get("name") for tool in payload["tools"]]
+    return summary
 
 # Model catalog for the /models menu. It lives in the ``AI_MODELS`` environment
 # variable (see .env) so it can be updated without touching the code; the
@@ -85,10 +134,34 @@ class ToolCall:
 
 @dataclass(slots=True)
 class ChatResult:
-    """Assistant reply: text content and/or requested tool calls."""
+    """Assistant reply: text content and/or requested tool calls.
+
+    ``elapsed`` is the wall time of the API call in seconds (0.0 when unknown,
+    e.g. for a result built by a test double); ``usage`` is the raw ``usage``
+    object returned by the API.
+    """
 
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    elapsed: float = 0.0
+    usage: dict[str, Any] | None = None
+
+    @property
+    def total_tokens(self) -> int | None:
+        """Total tokens reported by the API, if any."""
+        if not self.usage:
+            return None
+        value = self.usage.get("total_tokens")
+        return int(value) if isinstance(value, (int, float)) else None
+
+
+@dataclass(slots=True)
+class ImageResult:
+    """Generated image: its URL, the downloaded bytes and the elapsed time."""
+
+    url: str | None = None
+    data: bytes | None = None
+    elapsed: float = 0.0
 
 
 def _guess_mime(image_bytes: bytes) -> str:
@@ -111,6 +184,12 @@ def _image_data_url(image_bytes: bytes) -> str:
     mime = _guess_mime(image_bytes)
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+def _extract_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the API ``usage`` block (token counters), when present."""
+    usage = data.get("usage")
+    return usage if isinstance(usage, dict) and usage else None
 
 
 def _derive_native_base_url(compatible_base_url: str) -> str:
@@ -192,6 +271,7 @@ class AIClient:
         ``None`` when the request fails so callers can fall back gracefully.
         """
         url = f"{self.base_url}/models"
+        logger.info("AI API request: method=GET path=/models")
         try:
             session = await self._get_session()
             async with session.get(url) as resp:
@@ -244,11 +324,28 @@ class AIClient:
         max_tokens: int | None = None,
     ) -> str | None:
         """Send a chat completion request and return the assistant text."""
+        result = await self.chat_completion_result(
+            messages, model, temperature, max_tokens
+        )
+        return result.content
+
+    async def chat_completion_result(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatResult:
+        """Chat completion returning the text plus timing and token usage."""
         payload = self._chat_payload(messages, model, temperature, max_tokens)
-        status, data = await self._post_chat(payload)
+        status, data, elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
-            return self._finalize(self._extract_content(data))
-        return None
+            return ChatResult(
+                content=self._finalize(self._extract_content(data)),
+                elapsed=elapsed,
+                usage=_extract_usage(data),
+            )
+        return ChatResult(elapsed=elapsed)
 
     async def chat_with_tools(
         self,
@@ -266,16 +363,20 @@ class AIClient:
         payload = self._chat_payload(messages, model, temperature, max_tokens)
         payload["tools"] = tools if tools is not None else [IMAGE_TOOL]
 
-        status, data = await self._post_chat(payload)
+        status, data, elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
-            return self._parse_result(data)
+            return self._parse_result(data, elapsed)
 
         # Some models do not support the tools parameter -> retry without it.
         payload.pop("tools", None)
-        status, data = await self._post_chat(payload)
+        status, data, elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
-            return ChatResult(content=self._finalize(self._extract_content(data)))
-        return ChatResult()
+            return ChatResult(
+                content=self._finalize(self._extract_content(data)),
+                elapsed=elapsed,
+                usage=_extract_usage(data),
+            )
+        return ChatResult(elapsed=elapsed)
 
     async def chat_completion_with_image(
         self,
@@ -287,6 +388,21 @@ class AIClient:
         max_tokens: int | None = None,
     ) -> str | None:
         """Send a chat completion that includes a single image."""
+        result = await self.chat_with_image_result(
+            text, image_bytes, messages, model, temperature, max_tokens
+        )
+        return result.content
+
+    async def chat_with_image_result(
+        self,
+        text: str,
+        image_bytes: bytes,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatResult:
+        """Vision completion returning the text plus timing and token usage."""
         user_content: list[dict[str, Any]] = [
             {"type": "text", "text": text},
             {"type": "image_url", "image_url": {"url": _image_data_url(image_bytes)}},
@@ -294,10 +410,14 @@ class AIClient:
         full_messages = list(messages)
         full_messages.append({"role": "user", "content": user_content})
         payload = self._chat_payload(full_messages, model, temperature, max_tokens)
-        status, data = await self._post_chat(payload)
+        status, data, elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
-            return self._finalize(self._extract_content(data))
-        return None
+            return ChatResult(
+                content=self._finalize(self._extract_content(data)),
+                elapsed=elapsed,
+                usage=_extract_usage(data),
+            )
+        return ChatResult(elapsed=elapsed)
 
     # --- Speech recognition ------------------------------------------------
 
@@ -312,8 +432,11 @@ class AIClient:
         """Transcribe audio using the OpenAI-compatible Qwen3-ASR-Flash model.
 
         Telegram voice messages are OGG/Opus, which this model accepts directly
-        (base64 data URL, up to 10 MB / 5 minutes).
+        (base64 data URL, up to 7.5 MB of source audio / 5 minutes).
         """
+        if len(audio_bytes) > config.voice_max_bytes:
+            logger.warning("Audio exceeds the configured ASR input limit")
+            return None
         data_uri = f"data:{mime};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
         asr_options: dict[str, Any] = {"enable_itn": True}
         if language:
@@ -331,7 +454,7 @@ class AIClient:
             ],
             "asr_options": asr_options,
         }
-        status, data = await self._post_chat(payload)
+        status, data, _elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
             return self._extract_content(data)
         logger.error("Speech recognition failed (status %s)", status)
@@ -352,6 +475,20 @@ class AIClient:
         can be passed straight to Telegram (e.g. ``InlineQueryResultPhoto``) or
         downloaded with :meth:`generate_image`.
         """
+        return (await self.generate_image_result(
+            prompt, model=model, size=size, download=False
+        )).url
+
+    async def generate_image_result(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        size: str | None = None,
+        download: bool = True,
+    ) -> ImageResult:
+        """Generate an image, optionally downloading it, with elapsed time."""
+        started = time.monotonic()
         url = f"{self.native_base_url}/services/aigc/multimodal-generation/generation"
         parameters: dict[str, Any] = {
             "prompt_extend": True,
@@ -371,17 +508,24 @@ class AIClient:
             "parameters": parameters,
         }
 
-        status, data = await self._post_chat(
+        status, data, elapsed = await self._post_chat(
             payload, url=url, timeout=config.image_timeout
         )
         if status != 200 or not data:
             logger.error("Image generation failed (status %s)", status)
-            return None
+            return ImageResult(elapsed=time.monotonic() - started)
 
         image_url = self._extract_image_url(data)
         if not image_url:
             logger.error("Image response has no URL: %s", str(data)[:300])
-        return image_url
+            return ImageResult(elapsed=time.monotonic() - started)
+
+        image_bytes = await self.download_image(image_url) if download else None
+        return ImageResult(
+            url=image_url,
+            data=image_bytes,
+            elapsed=time.monotonic() - started,
+        )
 
     async def generate_image(
         self,
@@ -391,10 +535,8 @@ class AIClient:
         size: str | None = None,
     ) -> bytes | None:
         """Generate an image from a prompt and return the raw image bytes."""
-        image_url = await self.generate_image_url(prompt, model=model, size=size)
-        if not image_url:
-            return None
-        return await self.download_image(image_url)
+        result = await self.generate_image_result(prompt, model=model, size=size)
+        return result.data
 
     @staticmethod
     def _extract_image_url(data: dict[str, Any]) -> str | None:
@@ -417,7 +559,7 @@ class AIClient:
 
         Tries anonymously first — presigned OSS URLs answer ``403`` when an
         ``Authorization`` header is present — then falls back to an
-        authenticated request in case the file is served by the API itself.
+        authenticated request only when the file is served by the API itself.
         The presigned query string is never logged.
         """
         if not url:
@@ -426,7 +568,16 @@ class AIClient:
         safe_url = url.split("?", 1)[0]
         timeout = aiohttp.ClientTimeout(total=config.image_timeout)
 
-        for attempt, headers in enumerate((None, self._headers), start=1):
+        # Never forward the API key to an external image/storage host.
+        source = urlsplit(url)
+        trusted_origins = {
+            (parsed.scheme, parsed.netloc)
+            for parsed in (urlsplit(self.base_url), urlsplit(self.native_base_url))
+        }
+        header_variants = [None]
+        if (source.scheme, source.netloc) in trusted_origins:
+            header_variants.append(self._headers)
+        for attempt, headers in enumerate(header_variants, start=1):
             try:
                 session = await self._get_download_session()
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
@@ -489,6 +640,8 @@ class AIClient:
         to use Unicode notation directly. The caller's list is not modified.
         """
         hint = config.style_hint if config.enable_style_hint else ""
+        if hint == DEFAULT_STYLE_HINT and config.render_formula_images:
+            hint = FORMULA_STYLE_HINT
         if not hint:
             return messages
 
@@ -505,7 +658,7 @@ class AIClient:
     @staticmethod
     def _finalize(content: str | None) -> str | None:
         """Rewrite scientific notation in the answer as Unicode for Telegram."""
-        if not content or not config.normalize_formulas:
+        if not content or config.render_formula_images or not config.normalize_formulas:
             return content
         return normalize_formulas(content)
 
@@ -516,28 +669,46 @@ class AIClient:
         url: str | None = None,
         timeout: int | None = None,
         retries: int = 3,
-    ) -> tuple[int | None, dict[str, Any] | None]:
+    ) -> tuple[int | None, dict[str, Any] | None, float]:
         """POST a JSON payload with retry on transient errors.
 
-        Returns ``(status, json)``; ``status`` is ``None`` on network failure.
+        Returns ``(status, json, elapsed)``; ``status`` is ``None`` on network
+        failure and ``elapsed`` is the wall time in seconds, retries included.
         """
         target = url or f"{self.base_url}/chat/completions"
         request_timeout = aiohttp.ClientTimeout(total=timeout or config.request_timeout)
+        started = time.monotonic()
+        request_id = uuid4().hex[:12]
+        endpoint = urlsplit(target).path
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "AI API request id=%s path=%s timeout=%ss payload=%s",
+                request_id, endpoint, request_timeout.total,
+                json.dumps(_request_log_payload(payload), ensure_ascii=False),
+            )
+
+        def _elapsed() -> float:
+            return time.monotonic() - started
 
         for attempt in range(1, retries + 1):
             try:
+                logger.info("AI API send id=%s attempt=%s/%s", request_id, attempt, retries)
                 session = await self._get_session()
                 async with session.post(
                     target, json=payload, timeout=request_timeout
                 ) as resp:
                     body = await resp.text()
+                    logger.info(
+                        "AI API response id=%s attempt=%s status=%s elapsed=%.2fs",
+                        request_id, attempt, resp.status, _elapsed(),
+                    )
 
                     if resp.status == 200:
                         try:
-                            return 200, json.loads(body)
+                            return 200, json.loads(body), _elapsed()
                         except json.JSONDecodeError:
                             logger.error("AI API returned invalid JSON: %s", body[:300])
-                            return resp.status, None
+                            return resp.status, None, _elapsed()
 
                     if resp.status in {429, 500, 502, 503, 504} and attempt < retries:
                         delay = min(2**attempt, 8)
@@ -554,22 +725,23 @@ class AIClient:
                         continue
 
                     logger.error("AI API error (status %s): %s", resp.status, body[:500])
-                    return resp.status, None
+                    return resp.status, None, _elapsed()
 
             except asyncio.TimeoutError:
                 logger.warning(
-                    "AI API request timed out (attempt %s/%s)", attempt, retries
+                    "AI API request timed out id=%s (attempt %s/%s)",
+                    request_id, attempt, retries,
                 )
                 if attempt >= retries:
-                    return None, None
+                    return None, None, _elapsed()
                 await asyncio.sleep(min(2**attempt, 8))
             except aiohttp.ClientError as exc:
-                logger.error("AI API request failed: %s", exc)
+                logger.error("AI API request failed id=%s: %s", request_id, exc)
                 if attempt >= retries:
-                    return None, None
+                    return None, None, _elapsed()
                 await asyncio.sleep(min(2**attempt, 8))
 
-        return None, None
+        return None, None, _elapsed()
 
     @classmethod
     def _extract_content(cls, data: dict[str, Any]) -> str | None:
@@ -592,7 +764,7 @@ class AIClient:
         return str(content)
 
     @classmethod
-    def _parse_result(cls, data: dict[str, Any]) -> ChatResult:
+    def _parse_result(cls, data: dict[str, Any], elapsed: float = 0.0) -> ChatResult:
         choices = data.get("choices") or []
         if not choices:
             return ChatResult()
@@ -622,6 +794,8 @@ class AIClient:
         return ChatResult(
             content=cls._finalize(cls._normalize_content(message.get("content"))),
             tool_calls=calls,
+            elapsed=elapsed,
+            usage=_extract_usage(data),
         )
 
 

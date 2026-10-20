@@ -47,7 +47,7 @@ async def cmd_add_user(message: Message) -> None:
 
     if len(parts) < 2:
         await message.answer(
-            "❌ <b>Usage:</b> <code>/add_user <telegram_id></code>\n\n"
+            "❌ <b>Usage:</b> <code>/add_user &lt;telegram_id&gt;</code>\n\n"
             "Example: <code>/add_user 123456789</code>"
         )
         return
@@ -85,7 +85,7 @@ async def cmd_remove_user(message: Message) -> None:
 
     if len(parts) < 2:
         await message.answer(
-            "❌ <b>Usage:</b> <code>/remove_user <telegram_id></code>\n\n"
+            "❌ <b>Usage:</b> <code>/remove_user &lt;telegram_id&gt;</code>\n\n"
             "Example: <code>/remove_user 123456789</code>"
         )
         return
@@ -208,7 +208,7 @@ async def cmd_reset_daily_usage(message: Message) -> None:
 
     if len(parts) < 2:
         await message.answer(
-            "❌ <b>Usage:</b> <code>/reset_daily_usage <telegram_id></code>\n\n"
+            "❌ <b>Usage:</b> <code>/reset_daily_usage &lt;telegram_id&gt;</code>\n\n"
             "Example: <code>/reset_daily_usage 123456789</code>"
         )
         return

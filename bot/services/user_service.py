@@ -49,7 +49,9 @@ class UserService:
             "model": settings.selected_model,
             "system_prompt": settings.system_prompt,
             "temperature": settings.temperature,
-            "max_tokens": settings.max_tokens,
+            # No per-user token-limit control is exposed. Apply the configured
+            # limit to existing users too, rather than freezing their signup value.
+            "max_tokens": config.default_max_tokens,
         }
 
     async def set_model(self, telegram_id: int, model: str) -> None:

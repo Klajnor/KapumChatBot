@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,7 +35,8 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or not raw.strip():
         return default
     try:
-        return float(raw.strip())
+        value = float(raw.strip())
+        return value if math.isfinite(value) else default
     except ValueError:
         return default
 
@@ -64,6 +66,10 @@ _NO_VISION_FLAGS = {"novision", "no-vision", "text", "no", "false", "0"}
 # Placeholders: {spinner} — animated frame, {seconds} — elapsed whole seconds.
 DEFAULT_PROGRESS_TEXT = "{spinner} Waiting for the AI response… {seconds} s"
 
+# Footer appended to an answer with the AI API processing time.
+# Placeholders: {seconds}, {model}, {tokens}.
+DEFAULT_TIMING_FORMAT = "⏱️ {seconds} с · {model}"
+
 # Appended to the system prompt so the model answers in a Telegram-friendly way
 # (see ENABLE_STYLE_HINT / STYLE_HINT).
 DEFAULT_STYLE_HINT = (
@@ -74,6 +80,14 @@ DEFAULT_STYLE_HINT = (
     "_{}) or mhchem \\ce{}. Format with Telegram Markdown: **bold**, *italic*, "
     "`code`, ```fenced blocks```, - lists. Do not use tables — use short lines "
     "or lists instead."
+)
+
+FORMULA_STYLE_HINT = (
+    "Your answer is displayed in Telegram. Use Markdown for text and Unicode "
+    "for short inline formulas. Put complex mathematical expressions in LaTeX "
+    "display blocks delimited by \\[ and \\] so they can be rendered as images. "
+    "Use standard fractions, roots, sums and integrals; avoid custom commands, "
+    "LaTeX environments, packages and tables. Keep code inside code fences."
 )
 
 
@@ -169,7 +183,7 @@ class Config:
         default_factory=lambda: _env_int("DEFAULT_MAX_TOKENS", 2048)
     )
     request_timeout: int = field(
-        default_factory=lambda: _env_int("REQUEST_TIMEOUT", 120)
+        default_factory=lambda: _env_int("REQUEST_TIMEOUT", 300)
     )
     # Reply formatting for AI answers: "markdown" (MarkdownV2), "html", "plain".
     parse_mode: str = field(
@@ -186,14 +200,14 @@ class Config:
     # DashScope native image-synthesis model and (optional) explicit endpoint.
     image_model: str = field(
         default_factory=lambda: os.getenv(
-            "IMAGE_MODEL", "qwen-image-2.1-turbo"
+            "IMAGE_MODEL", "qwen-image-3.0-pro"
         ).strip()
     )
     image_api_url: str = field(
         default_factory=lambda: os.getenv("IMAGE_API_URL", "").strip()
     )
     image_timeout: int = field(
-        default_factory=lambda: _env_int("IMAGE_TIMEOUT", 180)
+        default_factory=lambda: _env_int("IMAGE_TIMEOUT", 300)
     )
 
     # --- Admin ---
@@ -220,7 +234,7 @@ class Config:
     )
     # A guest query allows exactly one reply, so bound the work before answering.
     guest_timeout: int = field(
-        default_factory=lambda: _env_int("GUEST_TIMEOUT", 30)
+        default_factory=lambda: _env_int("GUEST_TIMEOUT", 300)
     )
     # Recognize voice messages and answer with text or a generated image.
     enable_voice: bool = field(
@@ -232,7 +246,7 @@ class Config:
     )
     # Maximum voice-message size accepted for transcription (bytes).
     voice_max_bytes: int = field(
-        default_factory=lambda: _env_int("VOICE_MAX_BYTES", 10 * 1024 * 1024)
+        default_factory=lambda: _env_int("VOICE_MAX_BYTES", 7_500_000)
     )
 
     # --- Slow-request feedback ---
@@ -252,6 +266,21 @@ class Config:
     progress_text: str = field(
         default_factory=lambda: _env("PROGRESS_TEXT", default=DEFAULT_PROGRESS_TEXT)
     )
+    # Minimum seconds between two outgoing messages in the same chat. Telegram
+    # allows roughly one message per second per chat; exceeding it returns 429.
+    # Set to 0 to disable the throttle.
+    send_min_interval: float = field(
+        default_factory=lambda: _env_float("SEND_MIN_INTERVAL", 1.05)
+    )
+
+    # --- Timing footer ---
+    # Append the AI API processing time to every answer.
+    show_timing: bool = field(
+        default_factory=lambda: _env_bool("SHOW_TIMING", True)
+    )
+    timing_format: str = field(
+        default_factory=lambda: _env("TIMING_FORMAT", default=DEFAULT_TIMING_FORMAT)
+    )
 
     # --- Scientific notation ---
     # Telegram cannot show LaTeX or sub/superscript formatting, so the model's
@@ -259,6 +288,9 @@ class Config:
     # 10^{23} → 10²³, \frac{s}{t} → s/t. Code blocks are left untouched.
     normalize_formulas: bool = field(
         default_factory=lambda: _env_bool("NORMALIZE_FORMULAS", True)
+    )
+    render_formula_images: bool = field(
+        default_factory=lambda: _env_bool("RENDER_FORMULA_IMAGES", True)
     )
     # Ask the model to answer in Telegram-friendly notation in the first place.
     enable_style_hint: bool = field(
@@ -289,6 +321,10 @@ class Config:
         # Telegram tolerates roughly one message edit per second per chat.
         if self.progress_interval < 0.5:
             self.progress_interval = 0.5
+        if self.send_min_interval < 0 or self.send_min_interval > 10:
+            self.send_min_interval = 0.0 if self.send_min_interval < 0 else 10.0
+        # Base64 must fit the ASR API's 10 MB input limit.
+        self.voice_max_bytes = min(max(1, self.voice_max_bytes), 7_500_000)
 
         self.ai_models = _parse_models(os.getenv("AI_MODELS", "")) or [
             dict(model) for model in DEFAULT_AI_MODELS

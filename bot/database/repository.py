@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +55,8 @@ class UserRepository:
                     user_id=telegram_id,
                     selected_model=config.default_model,
                     system_prompt=config.default_system_prompt,
+                    temperature=config.default_temperature,
+                    max_tokens=config.default_max_tokens,
                 )
             )
             await self.session.flush()
@@ -72,12 +74,13 @@ class UserRepository:
 
     async def increment_guest_messages(self, telegram_id: int) -> int:
         """Atomically increment and return the guest message counter."""
-        user = await self.session.get(User, telegram_id)
-        if user is None:
-            return 0
-        user.guest_messages_used += 1
-        await self.session.flush()
-        return user.guest_messages_used
+        result = await self.session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id)
+            .values(guest_messages_used=User.guest_messages_used + 1)
+            .returning(User.guest_messages_used)
+        )
+        return result.scalar_one_or_none() or 0
 
     async def get_user_settings(self, telegram_id: int) -> UserSettings | None:
         """Get user settings."""
@@ -90,13 +93,9 @@ class UserRepository:
         """Return the user's settings row, creating it if necessary."""
         settings = await self.get_user_settings(telegram_id)
         if settings is None:
-            settings = UserSettings(
-                user_id=telegram_id,
-                selected_model=config.default_model,
-                system_prompt=config.default_system_prompt,
-            )
-            self.session.add(settings)
-            await self.session.flush()
+            await self.get_or_create_user(telegram_id)
+            settings = await self.get_user_settings(telegram_id)
+            assert settings is not None
         return settings
 
     async def update_model(self, telegram_id: int, model: str) -> None:
@@ -208,7 +207,7 @@ class UserRepository:
 
     async def get_usage_stats_last_14_days(self) -> list[dict]:
         """Get usage statistics for all users over the last 14 days."""
-        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=14)
+        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=13)
         result = await self.session.execute(
             select(
                 DailyUsage.telegram_id,
@@ -229,7 +228,7 @@ class UserRepository:
 
     async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
         """Get total usage for a specific user over the last 14 days."""
-        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=14)
+        fourteen_days_ago = datetime.date.today() - datetime.timedelta(days=13)
         result = await self.session.execute(
             select(func.coalesce(func.sum(DailyUsage.query_count), 0)).where(
                 DailyUsage.telegram_id == telegram_id,

@@ -61,7 +61,8 @@ async def _run_migrations(conn: Any) -> None:
 
     for statement in statements:
         try:
-            await conn.execute(text(statement))
+            async with conn.begin_nested():
+                await conn.execute(text(statement))
         except Exception as exc:  # pragma: no cover - defensive, DB dependent
             # Never abort startup because of an idempotent migration.
             import logging

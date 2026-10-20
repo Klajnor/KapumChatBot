@@ -1,20 +1,120 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from bot.bot import get_bot_id, get_bot_username
-from bot.config import config
+from bot.config import DEFAULT_TIMING_FORMAT, config
 from bot.services.markdown import render, split_chunks
 from bot.services.science import normalize_formulas
+from bot.services.formulas import MAX_FORMULA_IMAGES, render_formula, split_display_math
 
 logger = logging.getLogger(__name__)
 
 # Mapping of our internal mode names to Telegram parse modes.
 PARSE_MODES = {"markdown": "MarkdownV2", "html": "HTML"}
+
+# Telegram allows roughly one message per second per chat (and ~20/min in a
+# group). Sending chunks — or a progress notice plus the answer — faster than
+# that produces 429, which used to make replies disappear. The interval is
+# configurable (SEND_MIN_INTERVAL, default 1.05 s; 0 disables the throttle).
+_MAX_429_RETRIES = 3
+
+
+class SendThrottle:
+    """Serialize outgoing messages per chat to stay under Telegram's limit."""
+
+    def __init__(self, interval: float | None = None) -> None:
+        self.interval = (
+            config.send_min_interval if interval is None else float(interval)
+        )
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._last: dict[int, float] = {}
+
+    def _lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[chat_id] = lock
+        return lock
+
+    async def wait(self, chat_id: int) -> None:
+        """Sleep until at least ``interval`` has passed since the last send."""
+        async with self._lock(chat_id):
+            delay = self._last.get(chat_id, 0.0) + self.interval - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last[chat_id] = time.monotonic()
+            if len(self._last) > 1000:
+                self._prune()
+
+    def _prune(self) -> None:
+        """Forget chats that have been idle for a while."""
+        cutoff = time.monotonic() - 600
+        stale = [chat for chat, stamp in self._last.items() if stamp < cutoff]
+        for chat in stale:
+            self._last.pop(chat, None)
+            self._locks.pop(chat, None)
+
+
+throttle = SendThrottle()
+
+
+def _retry_delay(exc: Exception) -> float:
+    """How long to wait after a 429, from Telegram's ``retry_after``."""
+    value = getattr(exc, "retry_after", 1) or 1
+    try:
+        return max(0.0, float(value)) + 0.1
+    except (TypeError, ValueError):
+        return 1.1
+
+
+# --- Timing footer ---------------------------------------------------------
+
+
+def format_timing(
+    elapsed: float | None,
+    *,
+    model: str | None = None,
+    tokens: int | None = None,
+) -> str:
+    """Footer with the AI API processing time, or "" when it should not show.
+
+    ``TIMING_FORMAT`` supports ``{seconds}``, ``{model}`` and ``{tokens}``.
+    """
+    if not config.show_timing or not elapsed or elapsed <= 0:
+        return ""
+    values = {
+        "seconds": f"{elapsed:.1f}",
+        "model": model or config.default_model,
+        "tokens": tokens if tokens is not None else "—",
+    }
+    template = config.timing_format or DEFAULT_TIMING_FORMAT
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        logger.warning("Invalid TIMING_FORMAT %r; using the default", template)
+        return DEFAULT_TIMING_FORMAT.format(**values)
+
+
+def with_timing(text: str, footer: str) -> str:
+    """Append the timing footer to an answer body."""
+    if not footer:
+        return text
+    return f"{text}\n\n{footer}" if text else footer
+
+
+# --- Safe answers ----------------------------------------------------------
 
 
 async def safe_answer_callback(
@@ -50,6 +150,18 @@ async def safe_edit_text(message: Message | None, text: str, **kwargs) -> bool:
         return False
     except Exception as exc:  # noqa: BLE001 - UI helper must never crash a handler
         logger.warning("Message edit failed: %s", exc)
+        return False
+
+
+async def safe_delete(message: Message | None) -> bool:
+    """Delete a message, tolerating 'too old' / missing-access errors."""
+    if message is None or not hasattr(message, "delete"):
+        return False
+    try:
+        await message.delete()
+        return True
+    except Exception as exc:  # noqa: BLE001 - cosmetic, must never break a reply
+        logger.debug("Message delete failed: %s", exc)
         return False
 
 
@@ -113,11 +225,60 @@ async def safe_answer_guest(message: Message, result) -> bool:
 
 
 async def send_formatted(message: Message, text: str, *, limit: int = 4000) -> bool:
+    """Send text and display formulas in their original order."""
+    if not config.render_formula_images:
+        return await _send_text_formatted(message, text, limit=limit)
+
+    delivered = True
+    sent_any = False
+    image_count = 0
+    for kind, body in split_display_math(text):
+        if not body.strip():
+            continue
+        image = None
+        if kind == "math" and image_count < MAX_FORMULA_IMAGES:
+            image_count += 1
+            image = await render_formula(body)
+        if image is not None and await _send_formula_photo(message, image):
+            sent_any = True
+            continue
+        # Unsupported math and failed uploads retain the existing text fallback.
+        if kind == "math":
+            body = normalize_formulas(body) or body
+        delivered = await _send_text_formatted(message, body, limit=limit) and delivered
+        sent_any = True
+    return delivered and sent_any
+
+
+async def _send_formula_photo(message: Message, image: bytes) -> bool:
+    for attempt in range(_MAX_429_RETRIES + 1):
+        try:
+            await throttle.wait(message.chat.id)
+            await message.answer_photo(
+                BufferedInputFile(image, filename="formula.png")
+            )
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt >= _MAX_429_RETRIES:
+                return False
+            await asyncio.sleep(_retry_delay(exc))
+        except Exception as exc:
+            logger.warning("Could not send formula image; using text: %s", exc)
+            return False
+    return False
+
+
+async def _send_text_formatted(message: Message, text: str, *, limit: int = 4000) -> bool:
     """Send an AI answer rendered from Markdown, splitting long replies.
 
-    The configured parse mode is tried first; if Telegram rejects the entities,
-    the same chunk is re-sent as HTML and finally as plain text, so a reply is
-    never lost because of formatting.
+    Delivery is retried and degraded rather than lost:
+
+    * the configured parse mode is tried first, then HTML, then plain text;
+    * ``429`` (rate limit) waits ``retry_after`` and retries the same variant;
+    * a chunk rejected as "too long" is truncated and re-sent as plain text;
+    * sending is throttled to Telegram's ~1 message/second per chat.
+
+    Returns True only when every chunk was delivered.
     """
     # Scientific notation is normalized when the answer arrives from the model;
     # doing it again here is a cheap, idempotent guarantee that nothing raw
@@ -127,6 +288,7 @@ async def send_formatted(message: Message, text: str, *, limit: int = 4000) -> b
 
     chunks = split_chunks(text, config.parse_mode, limit)
     if not chunks:
+        logger.warning("Nothing to send: the answer rendered to an empty string")
         return False
 
     modes = [config.parse_mode]
@@ -135,22 +297,104 @@ async def send_formatted(message: Message, text: str, *, limit: int = 4000) -> b
             modes.append(extra)
 
     total = len(chunks)
+    delivered_all = True
     for index, raw in enumerate(chunks, start=1):
         body = f"(Part {index}/{total})\n\n{raw}" if total > 1 else raw
-        delivered = False
-        for mode in modes:
+        if not await _send_chunk(message, body, modes, limit):
+            delivered_all = False
+            logger.error(
+                "Chunk %d/%d was NOT delivered to chat %s", index, total, message.chat.id
+            )
+    return delivered_all
+
+
+async def _send_chunk(
+    message: Message,
+    body: str,
+    modes: list[str],
+    limit: int,
+) -> bool:
+    """Try every parse mode (with rate-limit retries) to deliver one chunk."""
+    for mode in modes:
+        rendered = render(body, mode)
+        parse_mode = PARSE_MODES.get(mode)
+        retries = 0
+        while True:
             try:
-                await message.answer(
-                    render(body, mode), parse_mode=PARSE_MODES.get(mode)
-                )
-                delivered = True
-                break
+                await throttle.wait(message.chat.id)
+                await message.answer(rendered, parse_mode=parse_mode)
+                return True
+            except TelegramRetryAfter as exc:
+                retries += 1
+                if retries > _MAX_429_RETRIES:
+                    logger.error("Rate limit persists after %d retries", retries - 1)
+                    break
+                delay = _retry_delay(exc)
+                logger.warning("Telegram rate limit (429); retrying in %.1fs", delay)
+                await asyncio.sleep(delay)
             except TelegramBadRequest as exc:
                 logger.warning(
-                    "Sending with parse_mode=%s failed, trying next: %s",
-                    PARSE_MODES.get(mode) or "plain",
+                    "Sending with parse_mode=%s failed: %s",
+                    parse_mode or "plain",
                     exc,
                 )
-        if not delivered:
+                if "too long" in str(exc).lower():
+                    return await _send_truncated(message, body, limit)
+                break
+            except TelegramForbiddenError as exc:
+                # The bot was blocked or kicked: retrying cannot help.
+                logger.warning("Chat is unreachable for the bot: %s", exc)
+                return False
+            except TelegramAPIError as exc:
+                logger.error("Sending the answer failed (%s)", exc)
+                break
+            except Exception as exc:  # noqa: BLE001 - a reply must not be lost
+                logger.exception("Unexpected error while sending the answer: %s", exc)
+                break
+
+    return await _send_truncated(message, body, limit)
+
+
+async def _send_truncated(message: Message, body: str, limit: int) -> bool:
+    """Last resort: plain text, truncated to the hard limit, with 429 retries."""
+    payload = body if len(body) <= limit else body[: max(limit - 1, 1)] + "…"
+    for attempt in range(_MAX_429_RETRIES + 1):
+        try:
+            await throttle.wait(message.chat.id)
+            await message.answer(payload, parse_mode=None)
+            logger.info("Answer delivered as truncated plain text")
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt >= _MAX_429_RETRIES:
+                logger.error("Rate limit persists; the answer was lost")
+                return False
+            await asyncio.sleep(_retry_delay(exc))
+        except Exception as exc:  # noqa: BLE001 - a reply must not be lost
+            logger.error("Last-resort plain send failed: %s", exc)
             return False
-    return True
+    return False
+
+
+async def safe_answer(message: Message, text: str, **kwargs) -> bool:
+    """Send a message, retrying on a rate limit; never raises.
+
+    ``text`` is interpreted with the bot's default parse mode (HTML), so escape
+    ``<``, ``>`` and ``&`` in dynamic parts.
+    """
+    for attempt in range(_MAX_429_RETRIES + 1):
+        try:
+            await throttle.wait(message.chat.id)
+            await message.answer(text, **kwargs)
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt >= _MAX_429_RETRIES:
+                logger.error("Rate limit persists; could not send: %s", text[:80])
+                return False
+            await asyncio.sleep(_retry_delay(exc))
+        except TelegramForbiddenError as exc:
+            logger.warning("Chat is unreachable for the bot: %s", exc)
+            return False
+        except Exception as exc:  # noqa: BLE001 - a reply must not be lost
+            logger.error("Could not send the message: %s", exc)
+            return False
+    return False

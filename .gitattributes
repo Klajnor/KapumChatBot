@@ -1,0 +1,5 @@
+# Bash-скрипты всегда должны быть с LF: CRLF ломает их на Linux/macOS
+# (\r: command not found), даже при core.autocrlf=true у клонирующего.
+*.sh  text eol=lf
+# PowerShell-скрипты — родные Windows, храним CRLF.
+*.ps1 text eol=crlf

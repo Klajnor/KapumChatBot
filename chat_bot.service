@@ -1,0 +1,19 @@
+[Unit]
+Description=Chat Bot
+After=syslog.target network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/KapumChatBot
+# Перед каждым запуском убираем устаревший кэш байт-кода проекта: старые .pyc
+# после загрузки кода или смены версии Python могут заставить бота исполнять
+# прежний код. "-" в начале = ошибка очистки не блокирует запуск; /bin/bash
+# указан явно, т.к. при загрузке с Windows бит +x у скрипта теряется.
+# Без -p скрипт чистил бы весь проект, включая .venv (медленнее на каждом
+# рестарте).
+ExecStartPre=-/bin/bash /root/KapumChatBot/scripts/clean_pycache.sh -p /root/KapumChatBot/bot
+ExecStart=/root/KapumChatBot/.venv/bin/python -m bot.main --serve-in-foreground
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

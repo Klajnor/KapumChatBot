@@ -20,6 +20,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import Message, ReplyParameters
 
 from bot.config import config
+from bot.services.telegram_utils import safe_delete, throttle
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,8 @@ class ProgressNotifier:
                 message_id=self.message.message_id
             )
         try:
+            # Share the per-chat rate budget with the answer that follows.
+            await throttle.wait(self.message.chat.id)
             return await self.message.answer(text, **kwargs)
         except TelegramAPIError as exc:
             logger.warning("Sending the progress notice failed: %s", exc)
@@ -169,6 +172,7 @@ class ProgressNotifier:
         if notice is None:
             return False
         try:
+            await throttle.wait(self.message.chat.id)
             await notice.edit_text(text, parse_mode=None)
             return True
         except TelegramBadRequest as exc:
@@ -196,10 +200,7 @@ class ProgressNotifier:
         notice, self._notice = self._notice, None
         if notice is None:
             return
-        try:
-            await notice.delete()
-        except Exception as exc:  # noqa: BLE001 - cosmetic, ignore failures
-            logger.debug("Deleting the progress notice failed: %s", exc)
+        await safe_delete(notice)
 
 
 def waiting(message: Message, **kwargs: Any) -> ProgressNotifier:

@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import time
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, Message
 
+from bot.bot import get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.services.access import AccessResult, check_access, guest_hint
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
 from bot.services.progress import waiting
 from bot.services.telegram_utils import (
+    format_timing,
     is_reply_to_bot,
     mentions_bot,
+    safe_answer,
     send_formatted,
     strip_bot_mention,
+    with_timing,
 )
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import UserService
@@ -60,13 +66,30 @@ def _is_addressed(message: Message) -> bool:
 # --- Sending helpers -------------------------------------------------------
 
 
-async def send_long_message(message: Message, text: str) -> None:
+async def send_long_message(message: Message, text: str) -> bool:
     """Send an AI answer rendered from Markdown, splitting long replies.
 
-    Formatting falls back automatically (MarkdownV2 → HTML → plain text) so a
-    reply is never lost because Telegram rejected the entities.
+    Formatting falls back automatically (MarkdownV2 → HTML → plain text) and
+    rate limits are retried, so a reply is not lost because Telegram rejected
+    the entities. Returns False only if nothing at all could be delivered.
     """
-    await send_formatted(message, text, limit=MAX_MESSAGE_LENGTH)
+    delivered = await send_formatted(message, text, limit=MAX_MESSAGE_LENGTH)
+    if delivered:
+        return True
+
+    logger.error("Answer was not delivered to chat %s; trying a bare fallback", message.chat.id)
+    fallback = text.strip()[:MAX_MESSAGE_LENGTH] if text else ""
+    if fallback and await safe_answer(
+        message, fallback + ("\n…" if len(text.strip()) > MAX_MESSAGE_LENGTH else ""),
+        parse_mode=None,
+    ):
+        return True
+    await safe_answer(
+        message,
+        "⚠️ <b>The answer could not be delivered</b> — Telegram rejected the "
+        "message. Please try again in a moment.",
+    )
+    return False
 
 
 async def _send_image_by_url(message: Message, url: str, caption: str) -> bool:
@@ -95,6 +118,26 @@ async def _send_image_by_url(message: Message, url: str, caption: str) -> bool:
         return False
 
 
+async def _safe_answer_photo(message: Message, photo: Any, caption: str) -> bool:
+    """Send a photo, retrying on a rate limit. Never raises."""
+    for attempt in range(3):
+        try:
+            await message.answer_photo(photo, caption=caption)
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt >= 2:
+                logger.error("Rate limit persists; the photo was not sent")
+                break
+            await asyncio.sleep(float(exc.retry_after) + 0.1)
+        except TelegramAPIError as exc:
+            logger.error("Sending the photo failed: %s", exc)
+            break
+    await safe_answer(
+        message, "⚠️ <b>The image could not be sent.</b> Please try again in a moment."
+    )
+    return False
+
+
 async def generate_and_send_image(
     message: Message,
     prompt: str,
@@ -109,23 +152,29 @@ async def generate_and_send_image(
     )
     # Image synthesis is slow: show a live "waiting" notice after the delay.
     async with waiting(message):
-        image_url = await ai_client.generate_image_url(prompt)
-        image = await ai_client.download_image(image_url) if image_url else None
+        result = await ai_client.generate_image_result(prompt)
+    image, image_url = result.data, result.url
 
     caption = f"🎨 <i>{html.escape(prompt[:900])}</i>"
+    footer = format_timing(result.elapsed, model=config.image_model)
+    if footer:
+        caption = f"{caption}\n\n{html.escape(footer)}"
 
     if image is not None:
-        await message.answer_photo(
-            BufferedInputFile(image, filename="generated.png"),
-            caption=caption,
-        )
+        if not await _safe_answer_photo(
+            message, BufferedInputFile(image, filename="generated.png"), caption
+        ):
+            return False
     elif image_url and await _send_image_by_url(message, image_url, caption):
-        logger.warning("Image was sent without downloading it: %s", image_url.split("?", 1)[0])
+        logger.warning(
+            "Image was sent without downloading it: %s", image_url.split("?", 1)[0]
+        )
     else:
-        await message.answer(
+        await safe_answer(
+            message,
             "❌ <b>Could not generate the image.</b>\n\n"
             "The prompt may have been rejected by moderation, or the image "
-            "service / model is unavailable for your account."
+            "service / model is unavailable for your account.",
         )
         return False
 
@@ -216,13 +265,12 @@ async def _answer_with_ai(
             )
     else:
         async with waiting(message):
-            content = await ai_client.chat_completion(
+            result = await ai_client.chat_completion_result(
                 messages=messages,
                 model=settings["model"],
                 temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"],
             )
-        result = ChatResult(content=content)
 
     image_call = next(
         (call for call in result.tool_calls if call.name == "generate_image"), None
@@ -237,7 +285,12 @@ async def _answer_with_ai(
             content=result.content,
             model=settings["model"],
         )
-        await send_long_message(message, result.content)
+        footer = format_timing(
+            result.elapsed,
+            model=settings["model"],
+            tokens=result.total_tokens,
+        )
+        await send_long_message(message, with_timing(result.content, footer))
 
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
@@ -249,16 +302,17 @@ async def _answer_with_ai(
             model=settings["model"],
         )
     elif not result.content:
-        await message.answer(
+        await safe_answer(
+            message,
             "❌ <b>Error communicating with the AI.</b>\n\n"
             "Please try again later. If the problem persists, check the "
-            "API key and balance of the configured Qwen account."
+            "API key and balance of the configured Qwen account.",
         )
         return
 
     hint = guest_hint(access)
     if hint:
-        await message.answer(hint)
+        await safe_answer(message, hint)
 
 
 # --- Handlers --------------------------------------------------------------
@@ -304,6 +358,10 @@ async def handle_voice(message: Message) -> None:
     if not _is_addressed(message):
         return
 
+    if message.voice.duration > 300:
+        await safe_answer(message, "⚠️ Voice messages must be at most 5 minutes long.")
+        return
+
     if message.voice.file_size and message.voice.file_size > config.voice_max_bytes:
         await message.answer(
             "⚠️ <b>Voice message is too large.</b>\n\n"
@@ -328,21 +386,31 @@ async def handle_voice(message: Message) -> None:
         buffer = await message.bot.download_file(file.file_path)
         audio_bytes = buffer.read()
 
+        transcript = None
+        asr_started = time.monotonic()
         async with waiting(message):
             transcript = await ai_client.transcribe_audio(
                 audio_bytes,
                 mime=message.voice.mime_type or "audio/ogg",
             )
+        asr_elapsed = time.monotonic() - asr_started
 
         if not transcript or not transcript.strip():
-            await message.answer(
+            await safe_answer(
+                message,
                 "❌ <b>Could not recognize the voice message.</b>\n\n"
-                "Please speak more clearly or type your question."
+                "Please speak more clearly or type your question.",
             )
             return
 
-        await message.answer(
-            f"🎤 <b>Recognized:</b>\n<i>{html.escape(transcript)}</i>"
+        asr_timing = (
+            f" <i>({asr_elapsed:.1f} с)</i>"
+            if config.show_timing and asr_elapsed > 0
+            else ""
+        )
+        await safe_answer(
+            message,
+            f"🎤 <b>Recognized</b>{asr_timing}:\n<i>{html.escape(transcript)}</i>",
         )
 
         await message.bot.send_chat_action(
@@ -411,7 +479,7 @@ async def handle_photo(message: Message) -> None:
         )
 
         async with waiting(message):
-            response = await ai_client.chat_completion_with_image(
+            vision_result = await ai_client.chat_with_image_result(
                 text=caption,
                 image_bytes=image_bytes,
                 messages=messages,
@@ -419,10 +487,12 @@ async def handle_photo(message: Message) -> None:
                 temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"],
             )
+        response = vision_result.content
 
-        if response is None:
-            await message.answer(
-                "❌ <b>Error analyzing the image.</b>\n\nPlease try again later."
+        if not response:
+            await safe_answer(
+                message,
+                "❌ <b>Error analyzing the image.</b>\n\nPlease try again later.",
             )
             return
 
@@ -434,10 +504,41 @@ async def handle_photo(message: Message) -> None:
             model=settings["model"],
         )
 
-        await send_long_message(message, response)
+        footer = format_timing(
+            vision_result.elapsed,
+            model=settings["model"],
+            tokens=vision_result.total_tokens,
+        )
+        await send_long_message(message, with_timing(response, footer))
 
         hint = guest_hint(access)
         if hint:
-            await message.answer(hint)
+            await safe_answer(message, hint)
     finally:
         await service.session.close()
+
+
+@router.message(F.text.startswith("/"))
+async def handle_unknown_command(message: Message) -> None:
+    """Answer an unknown command instead of dropping it silently.
+
+    This router is registered last, so every real command has already been
+    matched by the time we get here. In groups the bot reacts only when the
+    command explicitly targets it (``/foo@thisbot``), to stay quiet about other
+    bots' commands.
+    """
+    if message.from_user is None or not message.text:
+        return
+
+    first = message.text.strip().split()[0] if message.text.strip() else ""
+    if message.chat.type != ChatType.PRIVATE:
+        username = get_bot_username()
+        if not username or f"@{username.lower()}" not in first.lower():
+            return
+
+    command = first.split("@")[0]
+    await safe_answer(
+        message,
+        f"🤔 <b>Unknown command</b> <code>{html.escape(command[:32])}</code>\n\n"
+        "See /help for the list of available commands.",
+    )

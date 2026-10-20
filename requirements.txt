@@ -3,3 +3,4 @@ sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
 aiohttp>=3.11.11
 python-dotenv>=1.0.1
+matplotlib>=3.9

@@ -9,8 +9,8 @@ from aiogram import Router
 from aiogram.types import (
     InlineQueryResult,
     InlineQueryResultArticle,
-    InlineQueryResultPhoto,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Message,
 )
 
@@ -18,11 +18,14 @@ from bot.config import config
 from bot.database.session import async_session_factory
 from bot.services.access import AccessResult, check_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
-from bot.services.markdown import render
+from bot.services.markdown import render, split_chunks
+from bot.services.science import normalize_formulas
 from bot.services.telegram_utils import (
     PARSE_MODES,
+    format_timing,
     safe_answer_guest,
     strip_bot_mention,
+    with_timing,
 )
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import UserService
@@ -52,20 +55,39 @@ class GuestReply:
 def _to_result(reply: GuestReply, *, mode: str | None = None) -> InlineQueryResult:
     """Convert a reply into the InlineQueryResult expected by answerGuestQuery."""
     if reply.photo_url:
-        return InlineQueryResultPhoto(
+        # Inline photo results require a Telegram-fetchable JPEG. Qwen returns
+        # signed PNG URLs, so send the complete link without a preview fetch.
+        url = reply.photo_url
+        if len(url) > MAX_TEXT_LENGTH - 100:
+            text = "Картинка создана, но ссылка слишком длинная. Используйте /image в личном чате с ботом."
+        else:
+            caption = (reply.caption or "🎨 Картинка готова.")[:MAX_CAPTION_LENGTH]
+            caption = caption[:max(0, MAX_TEXT_LENGTH - len(url) - 2)]
+            text = f"{caption}\n\n{url}"
+        return InlineQueryResultArticle(
             id="image",
-            photo_url=reply.photo_url,
-            thumbnail_url=reply.photo_url,
-            caption=(reply.caption or "")[:MAX_CAPTION_LENGTH] or None,
+            title="Открыть сгенерированное изображение",
+            input_message_content=InputTextMessageContent(
+                message_text=text,
+                parse_mode=None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            ),
         )
 
     effective = mode or reply.mode
     text = reply.text or "…"
+    # Guest replies accept one result and cannot upload a local formula PNG.
+    if config.render_formula_images or config.normalize_formulas:
+        text = normalize_formulas(text) or text
+    chunks = split_chunks(text, effective, MAX_TEXT_LENGTH - 32)
+    body = render(chunks[0], effective) if chunks else "…"
+    if len(chunks) > 1:
+        body += "\n\n…"
     return InlineQueryResultArticle(
         id="answer",
         title=" ".join(text.split())[:120] or "Answer",
         input_message_content=InputTextMessageContent(
-            message_text=render(text, effective)[:MAX_TEXT_LENGTH],
+            message_text=body,
             parse_mode=PARSE_MODES.get(effective),
         ),
     )
@@ -117,15 +139,6 @@ def _extract_text(message: Message) -> str:
     return strip_bot_mention(message.text or message.caption or "").strip()
 
 
-async def _guarded(coro, default: Any = None) -> Any:
-    """Await a coroutine with a hard timeout (a guest query allows one reply)."""
-    try:
-        return await asyncio.wait_for(coro, timeout=config.guest_timeout)
-    except asyncio.TimeoutError:
-        logger.warning("Guest request timed out after %ss", config.guest_timeout)
-        return default
-
-
 # --- Reply pipeline --------------------------------------------------------
 
 
@@ -155,6 +168,8 @@ async def _build_reply(
     # Voice message: recognize it first, then answer like a text message.
     voice = _voice_of(message)
     if voice is not None and config.enable_voice:
+        if voice.duration > 300:
+            return GuestReply(text="⚠️ Voice messages must be at most 5 minutes long.", mode="plain")
         if voice.file_size and voice.file_size > config.voice_max_bytes:
             return GuestReply(
                 text="⚠️ The voice message is too large to recognize.", mode="plain"
@@ -162,10 +177,8 @@ async def _build_reply(
         audio = await _download(message, voice.file_id)
         transcript = None
         if audio:
-            transcript = await _guarded(
-                ai_client.transcribe_audio(
-                    audio, mime=voice.mime_type or "audio/ogg"
-                )
+            transcript = await ai_client.transcribe_audio(
+                audio, mime=voice.mime_type or "audio/ogg"
             )
         if not transcript or not transcript.strip():
             return GuestReply(
@@ -217,57 +230,65 @@ async def _build_reply(
                 ),
                 mode="plain",
             )
-        response = await _guarded(
-            ai_client.chat_completion_with_image(
-                text or DEFAULT_VISION_PROMPT,
-                photo_bytes,
-                base_messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
+        vision = await ai_client.chat_with_image_result(
+            text or DEFAULT_VISION_PROMPT,
+            photo_bytes,
+            base_messages,
+            model=settings["model"],
+            temperature=settings["temperature"],
+            max_tokens=settings["max_tokens"],
         )
+        response = vision.content if vision else None
         if not response:
             return GuestReply(
                 text="❌ Error analyzing the image. Please try again later.",
                 mode="plain",
             )
         await _save(response)
-        return GuestReply(text=response + _guest_hint(access))
+        return GuestReply(
+            text=with_timing(
+                response + _guest_hint(access),
+                format_timing(
+                    vision.elapsed,
+                    model=settings["model"],
+                    tokens=vision.total_tokens,
+                ),
+            )
+        )
 
     # Text request -> the model may answer with a generated image.
     messages = [*base_messages, {"role": "user", "content": text}]
     if config.enable_image_generation:
-        result: ChatResult = await _guarded(
-            ai_client.chat_with_tools(
-                messages=messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            ),
-            default=ChatResult(),
+        result: ChatResult = await ai_client.chat_with_tools(
+            messages=messages,
+            model=settings["model"],
+            temperature=settings["temperature"],
+            max_tokens=settings["max_tokens"],
         ) or ChatResult()
     else:
-        content = await _guarded(
-            ai_client.chat_completion(
-                messages=messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
+        result = await ai_client.chat_completion_result(
+            messages=messages,
+            model=settings["model"],
+            temperature=settings["temperature"],
+            max_tokens=settings["max_tokens"],
         )
-        result = ChatResult(content=content)
+        result = result or ChatResult()
 
     image_call = next(
         (call for call in result.tool_calls if call.name == "generate_image"), None
     )
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
-        image_url = await _guarded(ai_client.generate_image_url(prompt))
+        image = await ai_client.generate_image_result(prompt, download=False)
+        image_url = image.url if image else None
         if image_url:
             await _save(f"[Generated image] {prompt}")
+            caption = result.content or f"🎨 {prompt}"
+            footer = format_timing(
+                image.elapsed if image else 0.0, model=config.image_model
+            )
             return GuestReply(
-                photo_url=image_url, caption=result.content or f"🎨 {prompt}"
+                photo_url=image_url, caption=with_timing(caption, footer)
             )
         if not result.content:
             return GuestReply(
@@ -282,7 +303,16 @@ async def _build_reply(
         )
 
     await _save(result.content)
-    return GuestReply(text=result.content + _guest_hint(access))
+    return GuestReply(
+        text=with_timing(
+            result.content + _guest_hint(access),
+            format_timing(
+                result.elapsed,
+                model=settings["model"],
+                tokens=result.total_tokens,
+            ),
+        )
+    )
 
 
 # --- Handler ---------------------------------------------------------------
@@ -310,7 +340,24 @@ async def handle_guest_message(message: Message) -> None:
     session = async_session_factory()
     service = UserService(session)
     try:
-        reply = await _build_reply(message, service, caller, chat.id)
+        reply = await asyncio.wait_for(
+            _build_reply(message, service, caller, chat.id),
+            timeout=config.guest_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Guest request exceeded the total processing budget (%ss)",
+            config.guest_timeout,
+        )
+        reply = GuestReply(
+            text=(
+                "⏳ Не удалось завершить запрос за отведённое время. "
+                "Попробуйте ещё раз. Для генерации картинок откройте личный "
+                "чат с ботом и используйте /image с описанием — там можно "
+                "дождаться более долгой генерации."
+            ),
+            mode="plain",
+        )
     except Exception as exc:  # noqa: BLE001 - always produce a single reply
         logger.exception("Guest message handling failed: %s", exc)
         reply = GuestReply(
@@ -319,8 +366,5 @@ async def handle_guest_message(message: Message) -> None:
     finally:
         await session.close()
 
-    if await safe_answer_guest(message, _to_result(reply)):
-        return
-
-    # Most likely a formatting rejection: retry without any markup.
-    await safe_answer_guest(message, _to_result(reply, mode="plain"))
+    # One attempt: a rejected/expired guest query may no longer be answerable.
+    await safe_answer_guest(message, _to_result(reply))
