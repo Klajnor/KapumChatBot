@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import math
 import re
@@ -70,6 +71,13 @@ DEFAULT_PROGRESS_TEXT = "{spinner} Waiting for the AI response… {seconds} s"
 # Placeholders: {seconds}, {model}, {tokens}.
 DEFAULT_TIMING_FORMAT = "⏱️ {seconds} с · {model}"
 
+# Sent instead of answers Telegram cannot render (Markdown tables, raw LaTeX).
+# Placeholder: {url}.
+DEFAULT_TELEGRAPH_NOTICE = (
+    "📄 This answer contains tables or formulas Telegram cannot display — "
+    "the full version is published on Telegraph: {url}"
+)
+
 # Appended to the system prompt so the model answers in a Telegram-friendly way
 # (see ENABLE_STYLE_HINT / STYLE_HINT).
 DEFAULT_STYLE_HINT = (
@@ -84,10 +92,18 @@ DEFAULT_STYLE_HINT = (
 
 FORMULA_STYLE_HINT = (
     "Your answer is displayed in Telegram. Use Markdown for text and Unicode "
-    "for short inline formulas. Put complex mathematical expressions in LaTeX "
-    "display blocks delimited by \\[ and \\] so they can be rendered as images. "
-    "Use standard fractions, roots, sums and integrals; avoid custom commands, "
-    "LaTeX environments, packages and tables. Keep code inside code fences."
+    "for short inline formulas and chemical formulas (H₂SO₄, CO₂, x², 25 °C). "
+    "Write EVERY calculation and equation as a LaTeX display block delimited by "
+    "\\[ and \\], each on its own line, so it is rendered as an image: for "
+    "example \\[ n = \\frac{m}{M} = \\frac{18.0}{208} = 0.0865\\ \\text{mol} \\]. "
+    "Never put calculations inline in a sentence, and never use $...$ or $$...$$ "
+    "delimiters. Use a decimal point or comma as a plain character (never "
+    "{,}). Use standard LaTeX only: \\frac, \\sqrt, \\sum, \\int, \\cdot, \\times, "
+    "\\approx, Greek letters and \\text{...} for words and units. For several "
+    "steps use one block per step, or one block with lines separated by \\\\ "
+    "(do not use matrices, tables or \\boxed). Do not use Markdown tables with "
+    "LaTeX inside; put plain text or Unicode formulas in table cells. Keep code "
+    "inside code fences."
 )
 
 
@@ -159,11 +175,12 @@ class Config:
     ai_models: list[dict[str, Any]] = field(default_factory=list)
 
     # --- Database ---
+    # SQLite (aiosqlite) by default — a single file, no server to maintain.
+    # A PostgreSQL URL keeps working: postgresql+asyncpg://user:pass@host/db
     database_url: str = field(
         default_factory=lambda: os.getenv(
-            "DATABASE_URL",
-            "postgresql+asyncpg://postgres:postgres@localhost:5432/chat_bot",
-        )
+            "DATABASE_URL", "sqlite+aiosqlite:///chat_bot.db"
+        ).strip()
     )
 
     # --- Defaults ---
@@ -249,6 +266,16 @@ class Config:
         default_factory=lambda: _env_int("VOICE_MAX_BYTES", 7_500_000)
     )
 
+    # Simultaneous AI requests allowed per user (protects the paid API).
+    max_concurrent_per_user: int = field(
+        default_factory=lambda: _env_int("MAX_CONCURRENT_PER_USER", 2)
+    )
+    # Telegraph pages are public: by default the page title is generic instead
+    # of the user's question.
+    telegraph_title_from_question: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAPH_TITLE_FROM_QUESTION", False)
+    )
+
     # --- Slow-request feedback ---
     # If an AI request runs longer than ``progress_delay`` seconds, a "waiting"
     # message is posted and refreshed every ``progress_interval`` seconds until
@@ -280,6 +307,71 @@ class Config:
     )
     timing_format: str = field(
         default_factory=lambda: _env("TIMING_FORMAT", default=DEFAULT_TIMING_FORMAT)
+    )
+
+    # --- Telegraph (answers Telegram cannot render) ---
+    # Markdown tables and raw LaTeX have no representation in Telegram
+    # messages. Such answers are published as Telegraph pages and the user
+    # receives a link; every failure falls back to normal delivery.
+    # The API stopped accepting anonymous createPage calls (ACCESS_TOKEN_-
+    # INVALID), so an account is required: set TELEGRAPH_SHORT_NAME +
+    # TELEGRAPH_ACCESS_TOKEN (from createAccount), or leave both empty and
+    # the bot creates an anonymous account itself and caches the token in
+    # TELEGRAPH_ACCOUNT_FILE. The file holds a secret: keep it out of git.
+    enable_telegraph: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAPH_ENABLED", True)
+    )
+    telegraph_api_url: str = field(
+        default_factory=lambda: _env(
+            "TELEGRAPH_API_URL", default="https://api.telegra.ph"
+        ).rstrip("/")
+        or "https://api.telegra.ph"
+    )
+    telegraph_author: str = field(
+        default_factory=lambda: _env("TELEGRAPH_AUTHOR", default="Kapum ChatBot")
+    )
+    telegraph_short_name: str = field(
+        default_factory=lambda: os.getenv("TELEGRAPH_SHORT_NAME", "").strip()
+    )
+    telegraph_access_token: str = field(
+        default_factory=lambda: os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip()
+    )
+    telegraph_account_file: str = field(
+        default_factory=lambda: _env(
+            "TELEGRAPH_ACCOUNT_FILE", default="telegraph_account.json"
+        )
+    )
+    telegraph_notice: str = field(
+        default_factory=lambda: _env(
+            "TELEGRAPH_NOTICE", default=DEFAULT_TELEGRAPH_NOTICE
+        )
+    )
+    telegraph_timeout: int = field(
+        default_factory=lambda: _env_int("TELEGRAPH_TIMEOUT", 20)
+    )
+
+    # --- Streaming answers ---
+    # The reply is shown progressively in one message that keeps being edited.
+    # Telegram tolerates roughly one edit per second per chat, so edits are
+    # throttled to STREAM_EDIT_INTERVAL seconds. Guest replies stay single-shot
+    # (a guest query allows exactly one result).
+    stream_responses: bool = field(
+        default_factory=lambda: _env_bool("STREAM_RESPONSES", False)
+    )
+    stream_edit_interval: float = field(
+        default_factory=lambda: _env_float("STREAM_EDIT_INTERVAL", 3.0)
+    )
+    # Abort a stalled stream (no data for this many seconds) and fall back to
+    # a regular single-shot request.
+    stream_stall_timeout: int = field(
+        default_factory=lambda: _env_int("STREAM_STALL_TIMEOUT", 60)
+    )
+
+    # --- "Ask another model" button ---
+    # After an answer in a private chat, offer a button to re-ask the last
+    # question with a different model (one-time, the default model stays).
+    enable_ask_other_model: bool = field(
+        default_factory=lambda: _env_bool("ASK_OTHER_MODEL", True)
     )
 
     # --- Scientific notation ---
@@ -323,6 +415,18 @@ class Config:
             self.progress_interval = 0.5
         if self.send_min_interval < 0 or self.send_min_interval > 10:
             self.send_min_interval = 0.0 if self.send_min_interval < 0 else 10.0
+        # Telegraph page creation is a courtesy call: bound it tightly.
+        if self.telegraph_timeout < 5:
+            self.telegraph_timeout = 5
+        elif self.telegraph_timeout > 120:
+            self.telegraph_timeout = 120
+        # Keep streamed edits away from Telegram's ~1 edit/second per chat.
+        if self.stream_edit_interval < 1.0:
+            self.stream_edit_interval = 1.0
+        elif self.stream_edit_interval > 30.0:
+            self.stream_edit_interval = 30.0
+        if self.stream_stall_timeout < 10:
+            self.stream_stall_timeout = 10
         # Base64 must fit the ASR API's 10 MB input limit.
         self.voice_max_bytes = min(max(1, self.voice_max_bytes), 7_500_000)
 
@@ -336,6 +440,10 @@ class Config:
 
     def validate(self) -> None:
         """Validate that required config values are present."""
+        if not self.admin_ids:
+            logging.getLogger(__name__).warning(
+                "ADMIN_IDS is empty or invalid: admin commands are unavailable"
+            )
         missing: list[str] = []
         if not self.bot_token:
             missing.append("BOT_TOKEN")

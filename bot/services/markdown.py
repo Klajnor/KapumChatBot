@@ -19,8 +19,16 @@ _LINK_RE = re.compile(r"!?\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
 
 def _escape_html(text: str) -> str:
     return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
+
+
+# Only these link schemes are kept; anything else (javascript:, data:, file:)
+# is rendered as plain link text.
+_SAFE_URL_RE = re.compile(r"(?i)^(https?://|tg://|mailto:)")
 
 
 def _escape_mdv2(text: str) -> str:
@@ -71,9 +79,12 @@ def _parse_inline(text: str) -> list[Any]:
             match = _LINK_RE.match(text, i)
             if match:
                 flush()
-                nodes.append(
-                    ("link", match.group(2), _parse_inline(match.group(1)))
-                )
+                if _SAFE_URL_RE.match(match.group(2)):
+                    nodes.append(
+                        ("link", match.group(2), _parse_inline(match.group(1)))
+                    )
+                else:
+                    nodes.extend(_parse_inline(match.group(1)))
                 i = match.end()
                 continue
 

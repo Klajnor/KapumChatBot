@@ -3,3 +3,11 @@
 __pycache__/
 .venv/
 venv/
+
+# Telegraph account token (secret, auto-created by the bot)
+telegraph_account.json
+
+# SQLite database files (data + WAL sidecars)
+*.db
+*.db-wal
+*.db-shm

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from aiogram import Router, F
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
@@ -18,7 +19,7 @@ async def cmd_clear(message: Message) -> None:
     keyboard = get_clear_confirmation_keyboard()
     await message.answer(
         "🧹 <b>Clear conversation history?</b>\n\n"
-        "This will delete the history of <b>this chat</b> and start a fresh "
+        "This will delete <b>your</b> history in <b>this chat</b> and start a fresh "
         "conversation. This action cannot be undone.",
         reply_markup=keyboard,
     )
@@ -30,9 +31,12 @@ async def cb_clear_confirm(callback: CallbackQuery) -> None:
     if callback.from_user is None or callback.message is None:
         return
 
+    # In a group the history is shared: a participant clears only their own part.
+    chat = callback.message.chat
+    own_only = None if chat.type == ChatType.PRIVATE else callback.from_user.id
     async with async_session_factory() as session:
         service = UserService(session)
-        await service.clear_history(callback.message.chat.id)
+        await service.clear_history(chat.id, user_id=own_only)
 
     await safe_edit_text(
         callback.message,  # type: ignore[arg-type]

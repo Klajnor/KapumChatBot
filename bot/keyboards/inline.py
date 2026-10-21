@@ -36,3 +36,20 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="📊 Statistics", callback_data="settings:stats")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def get_ask_other_model_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard shown under an answer: re-ask the question with another model."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔀 Ask another model", callback_data="askother")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_resend_model_keyboard() -> InlineKeyboardMarkup:
+    """Model picker used to re-ask the previous question once."""
+    builder = InlineKeyboardBuilder()
+    for model in ai_client.available_models():
+        builder.button(text=model["name"], callback_data=f"resend:{model['id']}")
+    builder.adjust(2)
+    return builder.as_markup()

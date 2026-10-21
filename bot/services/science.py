@@ -169,7 +169,11 @@ _SUB_BRACE_RE = re.compile(r"_\s*\{([^{}]*)\}")
 
 # ``x_1``, ``a_2`` — a *single* lowercase variable with a numeric index. The
 # lookbehind keeps ``item_1`` and ``max_value_2`` intact.
-_SUB_VAR_RE = re.compile(r"(?<![A-Za-z_])([a-z])_(\d{1,3})(?!\d)")
+_SUB_VAR_RE = re.compile(r"(?<![A-Za-z_])([a-zα-ωΑ-Ω])_(\d{1,3})(?!\d)")
+# ``[H⁺]_2``, ``(C₁)_2`` — an index right after a closing bracket.
+_SUB_AFTER_CLOSER_RE = re.compile(r"(?<=[\])])_(\d{1,3})(?!\d)")
+# ``m_(ост)`` / ``m_((ост))`` — a parenthesised subscript.
+_SUB_PAREN_RE = re.compile(r"(?<=[A-Za-zα-ωΑ-Ω\)\]])_\(\(?([^()]+?)\)?\)")
 # ``K_eq``, ``T_max`` — an uppercase base with a short lowercase subscript.
 _SUB_WORD_RE = re.compile(r"(?<![A-Za-z_])([A-Z][a-z]?)_([a-z]{1,4})(?![A-Za-z0-9_])")
 # ``x_i``, ``d_x`` — a single-letter base with a single-letter subscript. Both
@@ -209,7 +213,7 @@ _ESCAPED_PUNCT = (
 )
 
 # Cheap pre-check: nothing to do when the text has no notation markers at all.
-_NEEDS_WORK_RE = re.compile(r"[\\^_$~]|<=>|<->|-->|->|<-|=>|<=|>=|!=|\+-")
+_NEEDS_WORK_RE = re.compile(r"[\\^_$~]|\{,\}|<=>|<->|-->|->|<-|=>|<=|>=|!=|\+-")
 
 # Fenced code blocks and inline code, captured so they can be skipped.
 _CODE_RE = re.compile(r"(```.*?(?:```|\Z)|`[^`\n]+`)", re.DOTALL)
@@ -217,6 +221,7 @@ _CODE_RE = re.compile(r"(```.*?(?:```|\Z)|`[^`\n]+`)", re.DOTALL)
 # A token that may be a chemical formula: element symbols, digits, ``_``,
 # parentheses (a leading stoichiometric coefficient is allowed).
 _FORMULA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9][A-Za-z0-9_()]*)")
+_PAREN_FORMULA_RE = re.compile(r"(?<=\()([A-Z][A-Za-z0-9_]*_\d[A-Za-z0-9_]*)(?=\))")
 _FORMULA_SUB_RE = re.compile(r"_(\d{1,3})(?!\d)")
 
 
@@ -305,7 +310,15 @@ def _strip_math_delimiters(text: str) -> str:
             return match.group(0)
         stripped = body.strip()
         if match.group(1) is not None and not (
-            _MATH_MARKER_RE.search(stripped) or _VARIABLE_RE.fullmatch(stripped)
+            _MATH_MARKER_RE.search(stripped)
+            or _VARIABLE_RE.fullmatch(stripped)
+            # ``$n(HCl)$``, ``$[ion]$``: tight on both sides, with a letter and
+            # not a price range like ``$5 and $10``.
+            or (
+                body == stripped
+                and re.search(r"[A-Za-zА-Яа-я]", body)
+                and not (body[0].isdigit() and " " in body)
+            )
         ):
             return match.group(0)
         return stripped
@@ -414,6 +427,13 @@ def _apply_scripts(text: str) -> str:
 
     text = _SUB_BRACE_RE.sub(_sub_brace, text)
 
+    def _sub_paren(match: re.Match[str]) -> str:
+        body = match.group(1)
+        return _to_sub(body) or f"({body})"  # Cyrillic etc. has no subscript glyphs
+
+    text = _SUB_PAREN_RE.sub(_sub_paren, text)
+    text = _SUB_AFTER_CLOSER_RE.sub(lambda m: _to_sub(m.group(1)) or m.group(0), text)
+
     def _formula(match: re.Match[str]) -> str:
         token = match.group(1)
         if not _is_formula(token):
@@ -423,6 +443,9 @@ def _apply_scripts(text: str) -> str:
         )
 
     text = _FORMULA_TOKEN_RE.sub(_formula, text)
+    # ``m(BaCl_2)``: the whole token starts with a lowercase letter, so the
+    # formula inside the parentheses is checked on its own.
+    text = _PAREN_FORMULA_RE.sub(_formula, text)
     text = _SUB_VAR_RE.sub(
         lambda m: m.group(1) + (_to_sub(m.group(2)) or m.group(2)), text
     )
@@ -435,8 +458,30 @@ def _apply_scripts(text: str) -> str:
     return _SUB_SINGLE_RE.sub(_sub_word, text)
 
 
+_FUNCTIONS_RE = re.compile(
+    r"\\(lg|ln|log|sin|cos|tan|tg|cot|ctg|exp|min|max|lim|det|arcsin|arccos|arctan)(?![A-Za-z])"
+)
+_GLUED_OPERATOR_RE = re.compile(
+    r"\\(cdot|times|approx|pm|Rightarrow|rightarrow|to)(?=[A-Za-z0-9])"
+)
+_BOXED_RE = re.compile(r"\\boxed\s*\{([^{}]*)\}")
+
+
+def _prepare(text: str) -> str:
+    """Fix common model slips before the main conversion."""
+    text = text.replace("{,}", ",")  # Russian decimal comma: 0{,}5 -> 0,5
+    text = _BOXED_RE.sub(lambda m: f"**{m.group(1)}**", text)
+    text = _GLUED_OPERATOR_RE.sub(lambda m: "\\" + m.group(1) + " ", text)  # \cdotx
+    text = _FUNCTIONS_RE.sub(
+        lambda m: m.group(1) + (" " if text[m.end():m.end() + 1].isalnum() else ""),
+        text,
+    )
+    return text.replace("\\ ", " ")
+
+
 def _convert_segment(text: str) -> str:
     """Normalize one non-code segment."""
+    text = _prepare(text)
     text = _strip_math_delimiters(text)
     text = _expand_structures(text)
     text = _replace_symbols(text)

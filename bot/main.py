@@ -12,6 +12,7 @@ from aiogram.types import (
 from bot.bot import bot, dp, setup_bot
 from bot.config import config
 from bot.database.session import engine, init_db
+from bot.services import telegraph
 from bot.services.ai_client import ai_client
 from bot.services.telegram_utils import safe_answer_guest
 
@@ -133,6 +134,7 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await ai_client.close()
+        await telegraph.close()
         await bot.session.close()
         await engine.dispose()
         logger.info("Bot stopped")

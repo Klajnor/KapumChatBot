@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -17,6 +17,52 @@ from bot.config import DEFAULT_STYLE_HINT, FORMULA_STYLE_HINT, config
 from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for a downloaded generated image.
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+class AIStreamError(RuntimeError):
+    """A streaming request failed at some point.
+
+    The caller has not received a usable answer and should fall back to a
+    regular single-shot request.
+    """
+
+
+async def _sse_lines(chunks: Any) -> AsyncIterator[str]:
+    """Yield non-empty SSE lines from an async iterable of byte chunks."""
+    buffer = ""
+    async for raw in chunks:
+        buffer += raw.decode("utf-8", "replace")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+            if line:
+                yield line
+    tail = buffer.strip()
+    if tail:
+        yield tail
+
+
+async def _transcode_to_wav(audio: bytes) -> bytes | None:
+    """Convert audio to 16 kHz mono WAV with ffmpeg; None when unavailable."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-v", "error", "-i", "pipe:0",
+            "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(process.communicate(audio), timeout=60)
+    except (FileNotFoundError, asyncio.TimeoutError, OSError) as exc:
+        logger.warning("ffmpeg transcoding is unavailable: %s", exc)
+        return None
+    if process.returncode != 0 or not out:
+        logger.warning("ffmpeg failed: %s", err[:200])
+        return None
+    return out
 
 
 def _media_log_info(value: str) -> dict[str, Any]:
@@ -403,13 +449,12 @@ class AIClient:
         max_tokens: int | None = None,
     ) -> ChatResult:
         """Vision completion returning the text plus timing and token usage."""
-        user_content: list[dict[str, Any]] = [
-            {"type": "text", "text": text},
-            {"type": "image_url", "image_url": {"url": _image_data_url(image_bytes)}},
-        ]
-        full_messages = list(messages)
-        full_messages.append({"role": "user", "content": user_content})
-        payload = self._chat_payload(full_messages, model, temperature, max_tokens)
+        payload = self._chat_payload(
+            self.vision_messages(messages, text, image_bytes),
+            model,
+            temperature,
+            max_tokens,
+        )
         status, data, elapsed = await self._post_chat(payload)
         if status == 200 and data is not None:
             return ChatResult(
@@ -418,6 +463,170 @@ class AIClient:
                 usage=_extract_usage(data),
             )
         return ChatResult(elapsed=elapsed)
+
+    @staticmethod
+    def vision_messages(
+        messages: list[dict[str, Any]], text: str, image_bytes: bytes
+    ) -> list[dict[str, Any]]:
+        """The message list with one image appended as the latest user turn."""
+        full_messages = [dict(entry) for entry in messages]
+        full_messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url(image_bytes)},
+                    },
+                ],
+            }
+        )
+        return full_messages
+
+    # --- Streaming -----------------------------------------------------------
+
+    async def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        on_delta: Any = None,
+    ) -> ChatResult:
+        """Streaming chat completion over SSE.
+
+        ``on_delta`` is awaited with the text accumulated so far after every
+        chunk so the caller can show the answer progressively. Raises
+        :class:`AIStreamError` on any failure (HTTP status, mid-stream error,
+        stall, empty stream) — the caller should then fall back to a regular
+        single-shot request.
+        """
+        payload = self._chat_payload(messages, model, temperature, max_tokens)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        if tools:
+            payload["tools"] = list(tools)
+
+        request_id = uuid4().hex[:12]
+        started = time.monotonic()
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "AI API stream request id=%s path=/chat/completions payload=%s",
+                request_id,
+                json.dumps(_request_log_payload(payload), ensure_ascii=False),
+            )
+
+        parts: list[str] = []
+        tool_acc: dict[int, dict[str, str]] = {}
+        usage: dict[str, Any] | None = None
+        saw_done = False
+        malformed = 0
+
+        async for line in self._stream_lines(payload):
+            if not line.startswith("data:"):
+                continue  # SSE comments, heartbeats, blank lines
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                saw_done = True
+                break
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                malformed += 1
+                if malformed > 10:
+                    raise AIStreamError("too many malformed SSE chunks")
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("error"):
+                raise AIStreamError(f"API stream error: {str(event['error'])[:200]}")
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    delta = {}
+                piece = self._normalize_content(delta.get("content"))
+                if piece:
+                    parts.append(piece)
+                    if on_delta is not None:
+                        try:
+                            await on_delta("".join(parts))
+                        except Exception as exc:  # noqa: BLE001 - UI must not kill the stream
+                            logger.warning("Stream on_delta failed: %s", exc)
+                for raw in delta.get("tool_calls") or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    slot = tool_acc.setdefault(
+                        int(raw.get("index", 0) or 0),
+                        {"id": "", "name": "", "arguments": ""},
+                    )
+                    slot["id"] = slot["id"] or str(raw.get("id") or "")
+                    function = raw.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] += str(function["name"])
+                    if function.get("arguments"):
+                        slot["arguments"] += str(function["arguments"])
+
+        content = "".join(parts) or None
+        if not saw_done and content is None and not tool_acc and usage is None:
+            raise AIStreamError("the stream produced no data")
+
+        tool_calls: list[ToolCall] = []
+        for index, slot in sorted(tool_acc.items()):
+            try:
+                arguments = json.loads(slot["arguments"] or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            tool_calls.append(
+                ToolCall(
+                    id=slot["id"] or f"call_{index}",
+                    name=slot["name"],
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                )
+            )
+
+        logger.info(
+            "AI API stream finished id=%s elapsed=%.2fs chunks=%d tools=%d",
+            request_id,
+            time.monotonic() - started,
+            len(parts),
+            len(tool_calls),
+        )
+        return ChatResult(
+            content=self._finalize(content),
+            tool_calls=tool_calls,
+            elapsed=time.monotonic() - started,
+            usage=usage,
+        )
+
+    async def _stream_lines(self, payload: dict[str, Any]) -> AsyncIterator[str]:
+        """POST the streaming request and yield its raw SSE lines."""
+        target = f"{self.base_url}/chat/completions"
+        timeout = aiohttp.ClientTimeout(
+            total=config.request_timeout,
+            sock_read=max(10, config.stream_stall_timeout),
+        )
+        try:
+            session = await self._get_session()
+            async with session.post(target, json=payload, timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(
+                        "AI stream error (status %s): %s", resp.status, body[:500]
+                    )
+                    raise AIStreamError(f"HTTP {resp.status}")
+                async for line in _sse_lines(resp.content):
+                    yield line
+        except AIStreamError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            raise AIStreamError(str(exc)) from exc
 
     # --- Speech recognition ------------------------------------------------
 
@@ -437,27 +646,64 @@ class AIClient:
         if len(audio_bytes) > config.voice_max_bytes:
             logger.warning("Audio exceeds the configured ASR input limit")
             return None
-        data_uri = f"data:{mime};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
         asr_options: dict[str, Any] = {"enable_itn": True}
         if language:
             asr_options["language"] = language
 
-        payload: dict[str, Any] = {
-            "model": model or config.asr_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_audio", "input_audio": {"data": data_uri}}
+        # A 400 with an empty body gives no hint about the cause, so a few
+        # variants are tried. Qwen3-ASR-Flash is documented as
+        # ``qwen3-asr-flash`` over a ``data:<mime>;base64,`` URI; the configured
+        # model goes first, the documented one is the fallback, and when OGG is
+        # refused the clip is transcoded to WAV (needs ffmpeg on the server).
+        chosen = model or config.asr_model
+        models = [chosen]
+        if model is None and chosen != "qwen3-asr-flash":
+            models.append("qwen3-asr-flash")
+
+        variants: list[tuple[str, bytes]] = [(mime, audio_bytes)]
+        wav: bytes | None = None
+        wav_tried = False
+
+        for asr_model in models:
+            index = 0
+            while index < len(variants):
+                variant_mime, variant_bytes = variants[index]
+                index += 1
+                payload: dict[str, Any] = {
+                    "model": asr_model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": f"data:{variant_mime};base64,"
+                                        + base64.b64encode(variant_bytes).decode("ascii")
+                                    },
+                                }
+                            ],
+                        }
                     ],
+                    "stream": False,
+                    "asr_options": asr_options,
                 }
-            ],
-            "asr_options": asr_options,
-        }
-        status, data, _elapsed = await self._post_chat(payload)
-        if status == 200 and data is not None:
-            return self._extract_content(data)
-        logger.error("Speech recognition failed (status %s)", status)
+                status, data, _elapsed = await self._post_chat(payload, retries=2)
+                if status == 200 and data is not None:
+                    return self._extract_content(data)
+                logger.error(
+                    "Speech recognition failed (model=%s, status %s, mime=%s)",
+                    asr_model,
+                    status,
+                    variant_mime,
+                )
+                if status not in (400, 422):
+                    return None  # network / auth / rate-limit: variants cannot help
+                if not wav_tried:
+                    wav_tried = True
+                    wav = await _transcode_to_wav(audio_bytes)
+                    if wav is not None and len(wav) <= config.voice_max_bytes * 4:
+                        variants.append(("audio/wav", wav))
         return None
 
     # --- Image generation --------------------------------------------------
@@ -581,7 +827,14 @@ class AIClient:
             try:
                 session = await self._get_download_session()
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    declared = resp.content_length
+                    if isinstance(declared, int) and declared > MAX_DOWNLOAD_BYTES:
+                        logger.error("Image at %s is too large (%d bytes)", safe_url, declared)
+                        return None
                     body = await resp.read()
+                    if len(body) > MAX_DOWNLOAD_BYTES:
+                        logger.error("Image at %s is too large", safe_url)
+                        return None
                     if resp.status == 200 and body:
                         return body
                     logger.warning(
@@ -724,7 +977,14 @@ class AIClient:
                         await asyncio.sleep(delay)
                         continue
 
-                    logger.error("AI API error (status %s): %s", resp.status, body[:500])
+                    logger.error(
+                        "AI API error (status %s %s): %s | request-id=%s content-type=%s",
+                        resp.status,
+                        resp.reason,
+                        body[:500],
+                        resp.headers.get("x-request-id") or resp.headers.get("x-dashscope-request-id"),
+                        resp.headers.get("content-type"),
+                    )
                     return resp.status, None, _elapsed()
 
             except asyncio.TimeoutError:

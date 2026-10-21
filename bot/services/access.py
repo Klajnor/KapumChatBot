@@ -18,6 +18,7 @@ class AccessResult:
     role: str  # "admin" | "allowed" | "guest" | "denied"
     message: str | None = None
     remaining: int | None = None
+    consumed: bool = False  # a quota unit was taken and can be refunded
 
 
 def _denied_message() -> str:
@@ -26,6 +27,44 @@ def _denied_message() -> str:
         "This bot is available to authorized users only.\n\n"
         + get_random_themed_response()
     )
+
+
+def _daily_limit_result() -> AccessResult:
+    return AccessResult(
+        allowed=False,
+        role="allowed",
+        message=(
+            f"⚠️ <b>Daily limit reached.</b>\n\n"
+            f"You have used all {config.daily_limit} questions for today. "
+            f"Come back tomorrow!"
+        ),
+    )
+
+
+def _guest_limit_result() -> AccessResult:
+    return AccessResult(
+        allowed=False,
+        role="guest",
+        message=(
+            "⚠️ <b>Free trial messages used up.</b>\n\n"
+            f"You have used all {config.guest_message_limit} free "
+            "messages.\nContact an administrator to get full access."
+        ),
+    )
+
+
+async def refund_access(service: UserService, telegram_id: int, result: AccessResult) -> None:
+    """Give the quota unit back when the request failed on our side."""
+    if not result.consumed:
+        return
+    try:
+        if result.role == "allowed":
+            await service.release_daily_usage(telegram_id)
+        elif result.role == "guest":
+            await service.release_guest_message(telegram_id)
+        result.consumed = False
+    except Exception as exc:  # noqa: BLE001 - a refund must never break the reply
+        logger.warning("Could not refund the quota: %s", exc)
 
 
 async def check_access(
@@ -45,43 +84,33 @@ async def check_access(
     if await service.is_allowed_user(telegram_id):
         remaining = await service.get_daily_usage_remaining(telegram_id)
         if remaining <= 0:
-            return AccessResult(
-                allowed=False,
-                role="allowed",
-                message=(
-                    f"⚠️ <b>Daily limit reached.</b>\n\n"
-                    f"You have used all {config.daily_limit} questions for today. "
-                    f"Come back tomorrow!"
-                ),
-            )
+            return _daily_limit_result()
         if not consume:
             return AccessResult(allowed=True, role="allowed", remaining=remaining)
-        used = await service.increment_daily_usage(telegram_id)
+        used = await service.consume_daily_usage(telegram_id)
+        if used is None:  # a parallel request took the last unit
+            return _daily_limit_result()
         return AccessResult(
             allowed=True,
             role="allowed",
             remaining=max(0, config.daily_limit - used),
+            consumed=True,
         )
 
     if config.allow_guest_access:
         remaining = await service.get_guest_messages_remaining(telegram_id)
         if remaining <= 0:
-            return AccessResult(
-                allowed=False,
-                role="guest",
-                message=(
-                    "⚠️ <b>Free trial messages used up.</b>\n\n"
-                    f"You have used all {config.guest_message_limit} free "
-                    "messages.\nContact an administrator to get full access."
-                ),
-            )
+            return _guest_limit_result()
         if not consume:
             return AccessResult(allowed=True, role="guest", remaining=remaining)
-        used = await service.increment_guest_messages(telegram_id)
+        used = await service.consume_guest_message(telegram_id)
+        if used is None:  # a parallel request took the last unit
+            return _guest_limit_result()
         return AccessResult(
             allowed=True,
             role="guest",
             remaining=max(0, config.guest_message_limit - used),
+            consumed=True,
         )
 
     return AccessResult(allowed=False, role="denied", message=_denied_message())

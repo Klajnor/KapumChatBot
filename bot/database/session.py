@@ -3,19 +3,51 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from bot.config import config
 from bot.database.models import Base
 
-engine = create_async_engine(
-    config.database_url,
-    echo=False,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-)
+_IS_SQLITE = config.database_url.startswith("sqlite")
+
+
+def _build_engine() -> Any:
+    """Create the async engine for SQLite (aiosqlite) or PostgreSQL (asyncpg)."""
+    url = config.database_url
+    kwargs: dict[str, Any] = {"echo": False, "pool_pre_ping": True}
+
+    if _IS_SQLITE:
+        # The asyncio driver must not pin the connection to one thread, and an
+        # in-memory database has to share a single connection (StaticPool),
+        # otherwise every new connection starts with an empty schema.
+        kwargs["connect_args"] = {"check_same_thread": False}
+        if ":memory:" in url:
+            kwargs["poolclass"] = StaticPool
+    else:
+        kwargs["pool_size"] = 5
+        kwargs["max_overflow"] = 10
+
+    engine = create_async_engine(url, **kwargs)
+
+    if _IS_SQLITE:
+        @event.listens_for(engine.sync_engine, "connect")
+        def _sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
+            # WAL lets readers and one writer coexist; busy_timeout makes the
+            # second concurrent write wait instead of erroring with "database
+            # is locked".
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            # Enforce ON DELETE CASCADE (off by default in SQLite).
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    return engine
+
+
+engine = _build_engine()
 
 async_session_factory = async_sessionmaker(
     engine,
@@ -32,7 +64,15 @@ async def init_db() -> None:
 
 
 async def _run_migrations(conn: Any) -> None:
-    """Apply idempotent migrations for databases created by older versions."""
+    """Apply idempotent migrations for databases created by older versions.
+
+    The statements below are PostgreSQL syntax (SERIAL, TIMESTAMPTZ, ALTER …
+    ADD COLUMN IF NOT EXISTS) repairing legacy Postgres databases. A SQLite
+    file is always created by ``create_all`` with the current schema, so there
+    is nothing to migrate there.
+    """
+    if conn.dialect.name == "sqlite":
+        return
 
     statements = [
         # Guest free-trial counter on users.

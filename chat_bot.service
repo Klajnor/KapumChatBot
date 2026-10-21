@@ -12,8 +12,13 @@ WorkingDirectory=/root/KapumChatBot
 # Без -p скрипт чистил бы весь проект, включая .venv (медленнее на каждом
 # рестарте).
 ExecStartPre=-/bin/bash /root/KapumChatBot/scripts/clean_pycache.sh -p /root/KapumChatBot/bot
-ExecStart=/root/KapumChatBot/.venv/bin/python -m bot.main --serve-in-foreground
+ExecStart=/root/KapumChatBot/.venv/bin/python -m bot.main
 Restart=always
+# Hardening. Better still: create a dedicated user, move the project out of
+# /root and set User=/Group= here (then chmod 600 .env and chat_bot.db).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target

@@ -9,7 +9,8 @@ from aiogram.types import Message
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.handlers.chat import generate_and_send_image
-from bot.services.access import check_access, guest_hint
+from bot.services import limits
+from bot.services.access import check_access, guest_hint, refund_access
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import UserService
 
@@ -40,6 +41,14 @@ async def cmd_image(message: Message) -> None:
 
     prompt = parts[1].strip()
 
+    with limits.slot(user.id) as granted:
+        if not granted:
+            await message.answer(limits.BUSY_MESSAGE)
+            return
+        await _generate(message, user, prompt)
+
+
+async def _generate(message: Message, user, prompt: str) -> None:
     async with async_session_factory() as session:
         service = UserService(session)
         await service.register_user(
@@ -62,6 +71,9 @@ async def cmd_image(message: Message) -> None:
             user_id=user.id,
             model=settings["model"],
         )
+
+        if not sent:
+            await refund_access(service, user.id, access)
 
         hint = guest_hint(access)
         if sent and hint:

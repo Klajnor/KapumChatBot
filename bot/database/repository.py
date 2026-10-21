@@ -3,7 +3,9 @@ from __future__ import annotations
 import datetime
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
@@ -35,7 +37,14 @@ class UserRepository:
                 is_admin=is_admin,
             )
             self.session.add(user)
-            await self.session.flush()
+            try:
+                await self.session.flush()
+            except IntegrityError:
+                # A concurrent request registered the same user first.
+                await self.session.rollback()
+                user = await self.session.get(User, telegram_id)
+                if user is None:
+                    raise
         else:
             # Refresh profile fields that may have changed.
             if username is not None:
@@ -59,7 +68,10 @@ class UserRepository:
                     max_tokens=config.default_max_tokens,
                 )
             )
-            await self.session.flush()
+            try:
+                await self.session.flush()
+            except IntegrityError:
+                await self.session.rollback()
 
         return user
 
@@ -73,14 +85,47 @@ class UserRepository:
         return user.guest_messages_used if user is not None else 0
 
     async def increment_guest_messages(self, telegram_id: int) -> int:
-        """Atomically increment and return the guest message counter."""
-        result = await self.session.execute(
+        """Atomically increment and return the guest message counter.
+
+        UPDATE + read-back (no RETURNING): SQLite only supports RETURNING on
+        3.35+, which is not guaranteed on server distros; inside one
+        transaction the read reflects our own update.
+        """
+        await self.session.execute(
             update(User)
             .where(User.telegram_id == telegram_id)
             .values(guest_messages_used=User.guest_messages_used + 1)
-            .returning(User.guest_messages_used)
         )
-        return result.scalar_one_or_none() or 0
+        result = await self.session.execute(
+            select(User.guest_messages_used).where(
+                User.telegram_id == telegram_id
+            )
+        )
+        value = result.scalar_one_or_none()
+        return int(value) if value is not None else 0
+
+    async def try_consume_guest_message(self, telegram_id: int, limit: int) -> int | None:
+        """Atomically take one free-trial message; ``None`` when the limit is reached.
+
+        The limit check lives in the UPDATE itself, so parallel requests cannot
+        slip past it between a separate check and increment.
+        """
+        result = await self.session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id, User.guest_messages_used < limit)
+            .values(guest_messages_used=User.guest_messages_used + 1)
+        )
+        if not result.rowcount:
+            return None
+        return await self.get_guest_messages_used(telegram_id)
+
+    async def release_guest_message(self, telegram_id: int) -> None:
+        """Give back a free-trial message taken for a request that failed."""
+        await self.session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id, User.guest_messages_used > 0)
+            .values(guest_messages_used=User.guest_messages_used - 1)
+        )
 
     async def get_user_settings(self, telegram_id: int) -> UserSettings | None:
         """Get user settings."""
@@ -182,8 +227,28 @@ class UserRepository:
     async def increment_daily_usage(self, telegram_id: int, date: datetime.date) -> int:
         """Atomically increment daily usage and return the new count.
 
-        Uses an UPSERT so concurrent requests cannot lose increments.
+        Uses an UPSERT so concurrent requests cannot lose increments; the
+        dialect-correct statement is chosen at runtime (PostgreSQL keeps
+        RETURNING, SQLite upserts and re-read inside the transaction).
         """
+        if self.session.get_bind().dialect.name == "sqlite":
+            stmt = (
+                sqlite_insert(DailyUsage)
+                .values(telegram_id=telegram_id, date=date, query_count=1)
+                .on_conflict_do_update(
+                    index_elements=["telegram_id", "date"],
+                    set_={"query_count": DailyUsage.query_count + 1},
+                )
+            )
+            await self.session.execute(stmt)
+            result = await self.session.execute(
+                select(DailyUsage.query_count).where(
+                    DailyUsage.telegram_id == telegram_id,
+                    DailyUsage.date == date,
+                )
+            )
+            return int(result.scalar_one())
+
         stmt = (
             pg_insert(DailyUsage)
             .values(telegram_id=telegram_id, date=date, query_count=1)
@@ -195,6 +260,48 @@ class UserRepository:
         )
         result = await self.session.execute(stmt)
         return result.scalar_one()
+
+    async def try_consume_daily_usage(
+        self, telegram_id: int, date: datetime.date, limit: int
+    ) -> int | None:
+        """Atomically count one query; ``None`` when today's limit is reached.
+
+        Both dialects share the ``INSERT … ON CONFLICT DO UPDATE … WHERE`` form;
+        the WHERE clause stops the increment at ``limit``.
+        """
+        insert_fn = (
+            sqlite_insert
+            if self.session.get_bind().dialect.name == "sqlite"
+            else pg_insert
+        )
+        stmt = (
+            insert_fn(DailyUsage)
+            .values(telegram_id=telegram_id, date=date, query_count=1)
+            .on_conflict_do_update(
+                index_elements=["telegram_id", "date"],
+                set_={"query_count": DailyUsage.query_count + 1},
+                where=DailyUsage.query_count < limit,
+            )
+        )
+        if limit <= 0:
+            return None
+        result = await self.session.execute(stmt)
+        if not result.rowcount:
+            return None
+        usage = await self.get_daily_usage(telegram_id, date)
+        return int(usage.query_count) if usage else 1
+
+    async def release_daily_usage(self, telegram_id: int, date: datetime.date) -> None:
+        """Give back a query taken for a request that failed."""
+        await self.session.execute(
+            update(DailyUsage)
+            .where(
+                DailyUsage.telegram_id == telegram_id,
+                DailyUsage.date == date,
+                DailyUsage.query_count > 0,
+            )
+            .values(query_count=DailyUsage.query_count - 1)
+        )
 
     async def reset_daily_usage(self, telegram_id: int, date: datetime.date) -> bool:
         """Reset the daily usage counter. Returns True if a record existed."""
@@ -267,21 +374,29 @@ class MessageRepository:
         return message
 
     async def get_history(
-        self, chat_id: int, limit: int = 30
+        self, chat_id: int, limit: int = 30, user_id: int | None = None
     ) -> list[dict[str, str]]:
-        """Return the last ``limit`` messages of a conversation in OpenAI format."""
+        """Return the last ``limit`` messages of a conversation in OpenAI format.
+
+        ``user_id`` restricts the history to one participant (assistant replies
+        are stored under the asker's id), so users of a shared group chat do
+        not see each other's questions in their context.
+        """
+        query = select(Message).where(Message.chat_id == chat_id)
+        if user_id is not None:
+            query = query.where(Message.user_id == user_id)
         result = await self.session.execute(
-            select(Message)
-            .where(Message.chat_id == chat_id)
-            .order_by(Message.id.desc())
-            .limit(limit)
+            query.order_by(Message.id.desc()).limit(limit)
         )
         messages = list(reversed(result.scalars().all()))
         return [{"role": m.role, "content": m.content} for m in messages]
 
-    async def clear_history(self, chat_id: int) -> None:
-        """Delete all messages of a conversation."""
-        await self.session.execute(delete(Message).where(Message.chat_id == chat_id))
+    async def clear_history(self, chat_id: int, user_id: int | None = None) -> None:
+        """Delete the messages of a conversation (only ``user_id``'s when given)."""
+        stmt = delete(Message).where(Message.chat_id == chat_id)
+        if user_id is not None:
+            stmt = stmt.where(Message.user_id == user_id)
+        await self.session.execute(stmt)
         await self.session.flush()
 
     async def get_message_count(self, user_id: int) -> int:

@@ -87,16 +87,16 @@ class UserService:
         await self.session.commit()
 
     async def get_history(
-        self, chat_id: int, limit: int | None = None
+        self, chat_id: int, limit: int | None = None, user_id: int | None = None
     ) -> list[dict[str, str]]:
-        """Get the conversation history for a chat."""
+        """Get the conversation history for a chat (one user's part if given)."""
         return await self.message_repo.get_history(
-            chat_id, limit=limit or config.max_history_length
+            chat_id, limit=limit or config.max_history_length, user_id=user_id
         )
 
-    async def clear_history(self, chat_id: int) -> None:
-        """Clear all messages of a conversation."""
-        await self.message_repo.clear_history(chat_id)
+    async def clear_history(self, chat_id: int, user_id: int | None = None) -> None:
+        """Clear the messages of a conversation (only ``user_id``'s when given)."""
+        await self.message_repo.clear_history(chat_id, user_id=user_id)
         await self.session.commit()
 
     # --- Guest access ------------------------------------------------------
@@ -110,6 +110,19 @@ class UserService:
         count = await self.user_repo.increment_guest_messages(telegram_id)
         await self.session.commit()
         return count
+
+    async def consume_guest_message(self, telegram_id: int) -> int | None:
+        """Atomically take a free-trial message; the new count, or None at the limit."""
+        count = await self.user_repo.try_consume_guest_message(
+            telegram_id, config.guest_message_limit
+        )
+        await self.session.commit()
+        return count
+
+    async def release_guest_message(self, telegram_id: int) -> None:
+        """Return a free-trial message after a failed request."""
+        await self.user_repo.release_guest_message(telegram_id)
+        await self.session.commit()
 
     async def get_guest_messages_remaining(self, telegram_id: int) -> int:
         """Get the number of remaining free-trial messages for a guest."""
@@ -180,6 +193,19 @@ class UserService:
         )
         await self.session.commit()
         return count
+
+    async def consume_daily_usage(self, telegram_id: int) -> int | None:
+        """Atomically count a query; the new count, or None at the daily limit."""
+        count = await self.user_repo.try_consume_daily_usage(
+            telegram_id, datetime.date.today(), config.daily_limit
+        )
+        await self.session.commit()
+        return count
+
+    async def release_daily_usage(self, telegram_id: int) -> None:
+        """Return a query after a failed request."""
+        await self.user_repo.release_daily_usage(telegram_id, datetime.date.today())
+        await self.session.commit()
 
     async def get_daily_usage_remaining(
         self, telegram_id: int, daily_limit: int | None = None

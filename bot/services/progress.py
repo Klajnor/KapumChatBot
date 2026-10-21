@@ -95,6 +95,16 @@ class ProgressNotifier:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.stop()
+        # Never suppress the wrapped exception.
+        return None
+
+    async def stop(self) -> None:
+        """Cancel the loop and delete the notice. Idempotent.
+
+        Streaming handlers call this as soon as the first answer chunk
+        arrives: the live answer replaces the "waiting" notice.
+        """
         self._stopped = True
         task, self._task = self._task, None
         if task is not None:
@@ -106,8 +116,6 @@ class ProgressNotifier:
             except Exception as error:  # noqa: BLE001 - UI helper must not raise
                 logger.debug("Progress notice task failed: %s", error)
         await self._delete_notice()
-        # Never suppress the wrapped exception.
-        return None
 
     # --- Loop --------------------------------------------------------------
 

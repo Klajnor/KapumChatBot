@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from bot.config import config
 from bot.database.session import async_session_factory
+from bot.services import limits
 from bot.services.access import AccessResult, check_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
 from bot.services.markdown import render, split_chunks
@@ -27,6 +28,7 @@ from bot.services.telegram_utils import (
     strip_bot_mention,
     with_timing,
 )
+from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import UserService
 
@@ -98,6 +100,22 @@ def _guest_hint(access: AccessResult) -> str:
     if access.role == "guest" and access.remaining is not None and access.remaining <= 2:
         return f"\n\n_Free trial messages left: {access.remaining}_"
     return ""
+
+
+async def _maybe_telegraph_reply(
+    question: str, answer: str, footer: str
+) -> GuestReply | None:
+    """A guest query allows one short reply: links beat broken tables/formulas.
+
+    Returns ``None`` when Telegraph is not needed or unavailable, so the
+    caller sends the answer as a normal (truncated) text reply.
+    """
+    if not config.enable_telegraph or not needs_telegraph(answer):
+        return None
+    url = await publish_answer(question, answer)
+    if not url:
+        return None
+    return GuestReply(text=with_timing(notice_text(url), footer), mode="plain")
 
 
 # --- Media helpers ---------------------------------------------------------
@@ -196,7 +214,7 @@ async def _build_reply(
         )
 
     settings = await service.get_user_settings(caller_id)
-    history = await service.get_history(chat_id)
+    history = await service.get_history(chat_id, user_id=caller_id)
     base_messages: list[dict[str, Any]] = [
         {"role": "system", "content": settings["system_prompt"]},
         *history,
@@ -245,16 +263,13 @@ async def _build_reply(
                 mode="plain",
             )
         await _save(response)
-        return GuestReply(
-            text=with_timing(
-                response + _guest_hint(access),
-                format_timing(
-                    vision.elapsed,
-                    model=settings["model"],
-                    tokens=vision.total_tokens,
-                ),
-            )
+        footer = format_timing(
+            vision.elapsed, model=settings["model"], tokens=vision.total_tokens
         )
+        telegraph_reply = await _maybe_telegraph_reply(text, response, footer)
+        if telegraph_reply is not None:
+            return telegraph_reply
+        return GuestReply(text=with_timing(response + _guest_hint(access), footer))
 
     # Text request -> the model may answer with a generated image.
     messages = [*base_messages, {"role": "user", "content": text}]
@@ -303,16 +318,13 @@ async def _build_reply(
         )
 
     await _save(result.content)
-    return GuestReply(
-        text=with_timing(
-            result.content + _guest_hint(access),
-            format_timing(
-                result.elapsed,
-                model=settings["model"],
-                tokens=result.total_tokens,
-            ),
-        )
+    footer = format_timing(
+        result.elapsed, model=settings["model"], tokens=result.total_tokens
     )
+    telegraph_reply = await _maybe_telegraph_reply(text, result.content, footer)
+    if telegraph_reply is not None:
+        return telegraph_reply
+    return GuestReply(text=with_timing(result.content + _guest_hint(access), footer))
 
 
 # --- Handler ---------------------------------------------------------------
@@ -337,11 +349,31 @@ async def handle_guest_message(message: Message) -> None:
     if chat is None:
         return
 
+    with limits.slot(caller.id) as granted:
+        if granted:
+            reply = await _run_guest_reply(message, caller, chat.id)
+        else:
+            reply = GuestReply(
+                text="⏳ Your previous request is still being processed.",
+                mode="plain",
+            )
+
+    # Try the configured formatting; if Telegram rejects it (bad entities) the
+    # answer is retried once as plain text, so a guest reply is never lost to
+    # formatting. An expired query simply fails both attempts and is logged.
+    if await safe_answer_guest(message, _to_result(reply)):
+        return
+    if reply.mode != "plain":
+        await safe_answer_guest(message, _to_result(reply, mode="plain"))
+
+
+async def _run_guest_reply(message: Message, caller, chat_id: int) -> GuestReply:
+    """Build the single reply within the time budget; only cancellation propagates."""
     session = async_session_factory()
     service = UserService(session)
     try:
         reply = await asyncio.wait_for(
-            _build_reply(message, service, caller, chat.id),
+            _build_reply(message, service, caller, chat_id),
             timeout=config.guest_timeout,
         )
     except asyncio.TimeoutError:
@@ -365,6 +397,4 @@ async def handle_guest_message(message: Message) -> None:
         )
     finally:
         await session.close()
-
-    # One attempt: a rejected/expired guest query may no longer be answerable.
-    await safe_answer_guest(message, _to_result(reply))
+    return reply

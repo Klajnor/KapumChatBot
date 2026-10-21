@@ -3,29 +3,55 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    Message,
+    ReplyParameters,
+    User,
+)
 
 from bot.bot import get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
-from bot.services.access import AccessResult, check_access, guest_hint
-from bot.services.ai_client import ChatResult, ai_client, is_vision_model
+from bot.keyboards.inline import (
+    get_ask_other_model_keyboard,
+    get_resend_model_keyboard,
+)
+from bot.services import limits
+from bot.services.access import AccessResult, check_access, guest_hint, refund_access
+from bot.services.ai_client import (
+    IMAGE_TOOL,
+    AIStreamError,
+    AIClient,
+    ChatResult,
+    ai_client,
+    is_vision_model,
+)
+from bot.services.formulas import has_table, promote_complex_inline
 from bot.services.progress import waiting
 from bot.services.telegram_utils import (
+    edit_formatted,
     format_timing,
     is_reply_to_bot,
     mentions_bot,
     safe_answer,
+    safe_answer_callback,
+    safe_delete,
+    safe_edit_text,
     send_formatted,
     strip_bot_mention,
+    throttle,
     with_timing,
 )
+from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import UserService
 
@@ -36,7 +62,13 @@ router = Router()
 MAX_MESSAGE_LENGTH = 4000  # Telegram hard limit is 4096; keep a safety margin.
 
 DEFAULT_VISION_PROMPT = "What's in this image?"
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
 DEFAULT_VOICE_PROMPT = "Answer what the user said in this voice message."
+
+# Display math still reaches the PNG renderer, so the streamed text must not
+# be edited into a formatted message (that would skip formula images).
+_DISPLAY_MATH_RE = re.compile(r"\$\$|\\\[")
 
 
 # --- Addressing helpers ----------------------------------------------------
@@ -63,17 +95,43 @@ def _is_addressed(message: Message) -> bool:
     return text.lstrip().startswith("/")
 
 
+# --- "Ask another model" registry ------------------------------------------
+
+# Last user question per private chat, kept in memory on purpose: after a bot
+# restart the button simply asks the user to repeat the question.
+_last_questions: dict[int, str] = {}
+_LAST_QUESTIONS_CAP = 500
+
+
+def _remember_question(chat_id: int, text: str) -> None:
+    if not text:
+        return
+    _last_questions.pop(chat_id, None)
+    _last_questions[chat_id] = text
+    while len(_last_questions) > _LAST_QUESTIONS_CAP:
+        _last_questions.pop(next(iter(_last_questions)))
+
+
+def _retry_markup(message: Message) -> Any:
+    """Inline keyboard offering to re-ask, private chats only (never guests)."""
+    if config.enable_ask_other_model and _is_private(message):
+        return get_ask_other_model_keyboard()
+    return None
+
+
 # --- Sending helpers -------------------------------------------------------
 
 
-async def send_long_message(message: Message, text: str) -> bool:
+async def send_long_message(message: Message, text: str, *, reply_markup: Any = None) -> bool:
     """Send an AI answer rendered from Markdown, splitting long replies.
 
     Formatting falls back automatically (MarkdownV2 → HTML → plain text) and
     rate limits are retried, so a reply is not lost because Telegram rejected
     the entities. Returns False only if nothing at all could be delivered.
     """
-    delivered = await send_formatted(message, text, limit=MAX_MESSAGE_LENGTH)
+    delivered = await send_formatted(
+        message, text, limit=MAX_MESSAGE_LENGTH, reply_markup=reply_markup
+    )
     if delivered:
         return True
 
@@ -192,12 +250,8 @@ async def generate_and_send_image(
 # --- Access helpers --------------------------------------------------------
 
 
-async def _open_registered(message: Message) -> UserService | None:
-    """Register the sender and return a service bound to an open session."""
-    user = message.from_user
-    if user is None:
-        return None
-
+async def _open_registered_user(user: User) -> UserService:
+    """Register ``user`` and return a service bound to an open session."""
     session = async_session_factory()
     service = UserService(session)
     try:
@@ -213,6 +267,14 @@ async def _open_registered(message: Message) -> UserService | None:
     return service
 
 
+async def _open_registered(message: Message) -> UserService | None:
+    """Register the sender and return a service bound to an open session."""
+    user = message.from_user
+    if user is None:
+        return None
+    return await _open_registered_user(user)
+
+
 async def _consume_access(message: Message, service: UserService) -> AccessResult | None:
     """Run the access check, replying with the reason when denied."""
     user = message.from_user
@@ -225,7 +287,151 @@ async def _consume_access(message: Message, service: UserService) -> AccessResul
     return result
 
 
+# --- Streaming presentation ------------------------------------------------
+
+
+class _StreamPrinter:
+    """Shows streamed answer chunks in one message, edited at a throttled pace.
+
+    Intermediate edits are plain text (Markdown is incomplete mid-stream and
+    would be rejected); the finished message is replaced by the fully rendered
+    answer via :meth:`finalize`.
+    """
+
+    def __init__(self, message: Message, notifier: Any = None) -> None:
+        self.origin = message
+        self.message: Message | None = None
+        self._notifier = notifier
+        self._last_edit = 0.0
+        self._broken = False
+
+    async def on_delta(self, full: str) -> None:
+        """Client callback: awaited with the text accumulated so far."""
+        if self._broken or not full:
+            return
+        if self.message is None:
+            await self._send_initial(full)
+            self._last_edit = time.monotonic()
+            if self._notifier is not None:
+                # The live answer replaces the "waiting" notice.
+                await self._notifier.stop()
+            return
+        if time.monotonic() - self._last_edit < config.stream_edit_interval:
+            return
+        if await safe_edit_text(self.message, self._clip(full), parse_mode=None):
+            self._last_edit = time.monotonic()
+        else:
+            self._broken = True
+
+    def _clip(self, full: str) -> str:
+        if len(full) <= MAX_MESSAGE_LENGTH:
+            return full
+        return full[: MAX_MESSAGE_LENGTH - 1] + "…"
+
+    async def _send_initial(self, text: str) -> None:
+        kwargs: dict[str, Any] = {"parse_mode": None}
+        if not _is_private(self.origin):
+            kwargs["reply_parameters"] = ReplyParameters(
+                message_id=self.origin.message_id
+            )
+        try:
+            await throttle.wait(self.origin.chat.id)
+            self.message = await self.origin.answer(self._clip(text), **kwargs)
+        except Exception as exc:  # noqa: BLE001 - streaming is an optimization
+            logger.warning("Streaming placeholder could not be sent: %s", exc)
+            self.message = None
+            self._broken = True
+
+    async def finalize(self, raw_markdown: str, *, reply_markup: Any = None) -> bool:
+        """Replace the placeholder with the fully formatted answer."""
+        if self.message is None:
+            return False
+        return await edit_formatted(self.message, raw_markdown, reply_markup=reply_markup)
+
+    async def discard(self) -> None:
+        if self.message is not None:
+            await safe_delete(self.message)
+            self.message = None
+
+
+# --- Delivery --------------------------------------------------------------
+
+
+async def deliver_answer(
+    message: Message,
+    printer: _StreamPrinter | None,
+    text: str,
+    footer: str,
+    *,
+    title_source: str | None = None,
+    reply_markup: Any = None,
+) -> bool:
+    """Deliver an AI answer: a Telegraph link when Telegram cannot render the
+    content (tables, raw LaTeX), otherwise a formatted message.
+
+    With a finished stream the placeholder message is reused; every failure
+    falls back to the robust multi-message send, so the answer is never lost.
+    """
+    if config.render_formula_images:
+        text = promote_complex_inline(text)
+    if config.enable_telegraph and needs_telegraph(
+        text, tables_as_images=config.render_formula_images
+    ):
+        url = await publish_answer(title_source or text, text)
+        if url:
+            body = with_timing(notice_text(url), footer)
+            if printer is not None and printer.message is not None:
+                if await safe_edit_text(
+                    printer.message, body, parse_mode=None, reply_markup=reply_markup
+                ):
+                    return True
+                await printer.discard()
+            return await safe_answer(
+                message, body, parse_mode=None, reply_markup=reply_markup
+            )
+        logger.warning("Telegraph publishing failed; delivering the answer in Telegram as is")
+
+    body = with_timing(text, footer)
+    if (
+        printer is not None
+        and printer.message is not None
+        # Formula PNGs are produced only on the send path, so answers still
+        # containing display math must not be finalized by a plain edit.
+        and not (
+            config.render_formula_images
+            and (_DISPLAY_MATH_RE.search(body) or has_table(body))
+        )
+    ):
+        if await printer.finalize(body, reply_markup=reply_markup):
+            return True
+        await printer.discard()
+    return await send_long_message(message, body, reply_markup=reply_markup)
+
+
 # --- Core answer pipeline --------------------------------------------------
+
+
+async def _single_shot(
+    messages: list[dict[str, Any]],
+    model: str,
+    settings: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+) -> ChatResult:
+    """One non-streaming request (also the fallback when a stream fails)."""
+    if tools is not None:
+        return await ai_client.chat_with_tools(
+            messages=messages,
+            model=model,
+            temperature=settings["temperature"],
+            max_tokens=settings["max_tokens"],
+            tools=tools,
+        )
+    return await ai_client.chat_completion_result(
+        messages=messages,
+        model=model,
+        temperature=settings["temperature"],
+        max_tokens=settings["max_tokens"],
+    )
 
 
 async def _answer_with_ai(
@@ -233,44 +439,63 @@ async def _answer_with_ai(
     service: UserService,
     text: str,
     access: AccessResult,
+    *,
+    user: User | None = None,
+    model_override: str | None = None,
 ) -> None:
-    """Produce the assistant reply for ``text``: a message and/or an image."""
-    user = message.from_user
+    """Produce the assistant reply for ``text``: a message and/or an image.
+
+    ``model_override`` answers once with another model without touching the
+    user's stored setting; ``user`` lets callback handlers pass the pressing
+    user explicitly (a bot message's ``from_user`` is the bot itself).
+    """
+    user = user or message.from_user
     if user is None:
         return
 
     settings = await service.get_user_settings(user.id)
-    history = await service.get_history(message.chat.id)
+    model = model_override or settings["model"]
+    history = await service.get_history(message.chat.id, user_id=user.id)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": settings["system_prompt"]},
         *history,
         {"role": "user", "content": text},
     ]
 
+    if _is_private(message):
+        _remember_question(message.chat.id, text)
+
     await service.add_message(
         chat_id=message.chat.id,
         user_id=user.id,
         role="user",
         content=text,
-        model=settings["model"],
+        model=model,
     )
 
-    if config.enable_image_generation:
-        async with waiting(message):
-            result: ChatResult = await ai_client.chat_with_tools(
-                messages=messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
-    else:
-        async with waiting(message):
-            result = await ai_client.chat_completion_result(
-                messages=messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
+    tools = [IMAGE_TOOL] if config.enable_image_generation else None
+    printer: _StreamPrinter | None = None
+
+    async with waiting(message) as notifier:
+        if config.stream_responses:
+            printer = _StreamPrinter(message, notifier)
+            try:
+                result: ChatResult = await ai_client.stream_chat_completion(
+                    messages,
+                    model=model,
+                    temperature=settings["temperature"],
+                    max_tokens=settings["max_tokens"],
+                    tools=tools,
+                    on_delta=printer.on_delta,
+                )
+            except AIStreamError as exc:
+                logger.warning(
+                    "Streaming failed (%s); retrying as a single request", exc
+                )
+                await printer.discard()
+                result = await _single_shot(messages, model, settings, tools)
+        else:
+            result = await _single_shot(messages, model, settings, tools)
 
     image_call = next(
         (call for call in result.tool_calls if call.name == "generate_image"), None
@@ -283,25 +508,36 @@ async def _answer_with_ai(
             user_id=user.id,
             role="assistant",
             content=result.content,
-            model=settings["model"],
+            model=model,
         )
         footer = format_timing(
             result.elapsed,
-            model=settings["model"],
+            model=model,
             tokens=result.total_tokens,
         )
-        await send_long_message(message, with_timing(result.content, footer))
+        await deliver_answer(
+            message,
+            printer,
+            result.content,
+            footer,
+            title_source=text,
+            reply_markup=_retry_markup(message),
+        )
+    elif image_call is None and printer is not None:
+        await printer.discard()
 
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
-        await generate_and_send_image(
+        if not await generate_and_send_image(
             message,
             prompt,
             service=service,
             user_id=user.id,
-            model=settings["model"],
-        )
+            model=model,
+        ) and not result.content:
+            await refund_access(service, user.id, access)
     elif not result.content:
+        await refund_access(service, user.id, access)
         await safe_answer(
             message,
             "❌ <b>Error communicating with the AI.</b>\n\n"
@@ -331,24 +567,45 @@ async def handle_text(message: Message) -> None:
     if not text:
         return
 
-    service = await _open_registered(message)
-    if service is None:
-        return
-
-    try:
-        access = await _consume_access(message, service)
-        if access is None:
+    with limits.slot(user.id) as granted:
+        if not granted:
+            await safe_answer(message, limits.BUSY_MESSAGE)
             return
-        await message.bot.send_chat_action(
-            chat_id=message.chat.id, action=ChatAction.TYPING
-        )
-        await _answer_with_ai(message, service, text, access)
-    finally:
-        await service.session.close()
+        service = await _open_registered(message)
+        if service is None:
+            return
+
+        try:
+            access = await _consume_access(message, service)
+            if access is None:
+                return
+            await message.bot.send_chat_action(
+                chat_id=message.chat.id, action=ChatAction.TYPING
+            )
+            await _answer_with_ai(message, service, text, access)
+        finally:
+            await service.session.close()
+
+
+async def _guarded(message: Message, inner: Any) -> None:
+    """Run ``inner(message)`` inside the per-user concurrency cap."""
+    user = message.from_user
+    if user is None:
+        return
+    with limits.slot(user.id) as granted:
+        if not granted:
+            await safe_answer(message, limits.BUSY_MESSAGE)
+            return
+        await inner(message)
 
 
 @router.message(F.voice)
 async def handle_voice(message: Message) -> None:
+    """Voice messages, one at a time per user."""
+    await _guarded(message, _handle_voice)
+
+
+async def _handle_voice(message: Message) -> None:
     """Handle voice messages: transcribe them, then answer with text or image."""
     user = message.from_user
     if user is None or message.voice is None:
@@ -396,6 +653,7 @@ async def handle_voice(message: Message) -> None:
         asr_elapsed = time.monotonic() - asr_started
 
         if not transcript or not transcript.strip():
+            await refund_access(service, user.id, access)
             await safe_answer(
                 message,
                 "❌ <b>Could not recognize the voice message.</b>\n\n"
@@ -423,6 +681,11 @@ async def handle_voice(message: Message) -> None:
 
 @router.message(F.photo)
 async def handle_photo(message: Message) -> None:
+    """Photos, one request at a time per user."""
+    await _guarded(message, _handle_photo)
+
+
+async def _handle_photo(message: Message) -> None:
     """Handle photo messages: analyze the image with a vision model."""
     user = message.from_user
     if user is None:
@@ -459,11 +722,15 @@ async def handle_photo(message: Message) -> None:
         )
 
         photo = message.photo[-1]
+        if photo.file_size and photo.file_size > MAX_PHOTO_BYTES:
+            await refund_access(service, user.id, access)
+            await safe_answer(message, "⚠️ <b>The image is too large</b> (limit 10 MB).")
+            return
         file = await message.bot.get_file(photo.file_id)
         buffer = await message.bot.download_file(file.file_path)
         image_bytes = buffer.read()
 
-        history = await service.get_history(message.chat.id)
+        history = await service.get_history(message.chat.id, user_id=user.id)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": settings["system_prompt"]},
             *history,
@@ -478,18 +745,49 @@ async def handle_photo(message: Message) -> None:
             model=settings["model"],
         )
 
-        async with waiting(message):
-            vision_result = await ai_client.chat_with_image_result(
-                text=caption,
-                image_bytes=image_bytes,
-                messages=messages,
-                model=settings["model"],
-                temperature=settings["temperature"],
-                max_tokens=settings["max_tokens"],
-            )
+        printer: _StreamPrinter | None = None
+        async with waiting(message) as notifier:
+            if config.stream_responses:
+                printer = _StreamPrinter(message, notifier)
+                try:
+                    vision_result: ChatResult = await ai_client.stream_chat_completion(
+                        AIClient.vision_messages(
+                            messages, caption, image_bytes
+                        ),
+                        model=settings["model"],
+                        temperature=settings["temperature"],
+                        max_tokens=settings["max_tokens"],
+                        on_delta=printer.on_delta,
+                    )
+                except AIStreamError as exc:
+                    logger.warning(
+                        "Vision streaming failed (%s); retrying as a single request",
+                        exc,
+                    )
+                    await printer.discard()
+                    vision_result = await ai_client.chat_with_image_result(
+                        text=caption,
+                        image_bytes=image_bytes,
+                        messages=messages,
+                        model=settings["model"],
+                        temperature=settings["temperature"],
+                        max_tokens=settings["max_tokens"],
+                    )
+            else:
+                vision_result = await ai_client.chat_with_image_result(
+                    text=caption,
+                    image_bytes=image_bytes,
+                    messages=messages,
+                    model=settings["model"],
+                    temperature=settings["temperature"],
+                    max_tokens=settings["max_tokens"],
+                )
         response = vision_result.content
 
         if not response:
+            if printer is not None:
+                await printer.discard()
+            await refund_access(service, user.id, access)
             await safe_answer(
                 message,
                 "❌ <b>Error analyzing the image.</b>\n\nPlease try again later.",
@@ -509,13 +807,112 @@ async def handle_photo(message: Message) -> None:
             model=settings["model"],
             tokens=vision_result.total_tokens,
         )
-        await send_long_message(message, with_timing(response, footer))
+        # No "Ask another model" button: re-asking needs the image attached.
+        await deliver_answer(
+            message, printer, response, footer, title_source=caption
+        )
 
         hint = guest_hint(access)
         if hint:
             await safe_answer(message, hint)
     finally:
         await service.session.close()
+
+
+# --- "Ask another model" callbacks -----------------------------------------
+
+
+@router.callback_query(F.data == "askother")
+async def cb_ask_other_model(callback: CallbackQuery) -> None:
+    """Offer the model picker to re-ask the last question once."""
+    if callback.from_user is None or callback.message is None:
+        await safe_answer_callback(callback)
+        return
+
+    origin = callback.message
+    if not _is_private(origin):
+        await safe_answer_callback(
+            callback, "⚠️ This button works in private chats only.", show_alert=True
+        )
+        return
+
+    question = _last_questions.get(origin.chat.id)
+    if not question:
+        await safe_answer_callback(
+            callback,
+            "⚠️ I cannot find your previous question here — please ask it again.",
+            show_alert=True,
+        )
+        return
+
+    await safe_answer_callback(callback, "Choose a model")
+    preview = question if len(question) <= 200 else question[:200] + "…"
+    await origin.answer(
+        "🤖 <b>Ask the same question with another model:</b>\n\n"
+        f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+        "The question is re-asked once; your default model stays unchanged.",
+        reply_markup=get_resend_model_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("resend:"))
+async def cb_resend_with_model(callback: CallbackQuery) -> None:
+    """Re-send the stored last question to the chosen model (one-time)."""
+    if callback.data is None or callback.from_user is None or callback.message is None:
+        await safe_answer_callback(callback)
+        return
+
+    model_id = callback.data.split(":", 1)[1]
+    origin = callback.message
+    if not _is_private(origin):
+        await safe_answer_callback(
+            callback, "⚠️ This button works in private chats only.", show_alert=True
+        )
+        return
+
+    available = {m["id"]: m["name"] for m in ai_client.available_models()}
+    if model_id not in available:
+        await safe_answer_callback(
+            callback, "⚠️ This model is not available for your account.", show_alert=True
+        )
+        return
+
+    question = _last_questions.get(origin.chat.id)
+    if not question:
+        await safe_answer_callback(
+            callback,
+            "⚠️ I cannot find your previous question here — please ask it again.",
+            show_alert=True,
+        )
+        return
+
+    await safe_answer_callback(callback, f"Asking {available[model_id]}…")
+    await safe_edit_text(
+        origin,
+        "🔀 <b>Re-asking with</b> "
+        f"<code>{html.escape(available[model_id])}</code>…",
+    )
+
+    with limits.slot(callback.from_user.id) as granted:
+        if not granted:
+            await safe_answer(origin, limits.BUSY_MESSAGE)
+            return
+        service = await _open_registered_user(callback.from_user)
+        try:
+            access = await check_access(service, callback.from_user.id)
+            if not access.allowed:
+                await origin.answer(access.message or get_random_themed_response())
+                return
+            await _answer_with_ai(
+                origin,
+                service,
+                question,
+                access,
+                user=callback.from_user,
+                model_override=model_id,
+            )
+        finally:
+            await service.session.close()
 
 
 @router.message(F.text.startswith("/"))

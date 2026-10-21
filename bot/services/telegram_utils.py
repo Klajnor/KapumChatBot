@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from typing import Any
 
 from aiogram.exceptions import (
     TelegramAPIError,
@@ -17,7 +18,14 @@ from bot.bot import get_bot_id, get_bot_username
 from bot.config import DEFAULT_TIMING_FORMAT, config
 from bot.services.markdown import render, split_chunks
 from bot.services.science import normalize_formulas
-from bot.services.formulas import MAX_FORMULA_IMAGES, render_formula, split_display_math
+from bot.services.formulas import (
+    MAX_FORMULA_IMAGES,
+    MAX_TABLE_IMAGES,
+    promote_complex_inline,
+    render_formula,
+    render_table,
+    split_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +154,8 @@ async def safe_edit_text(message: Message | None, text: str, **kwargs) -> bool:
         await message.edit_text(text, **kwargs)
         return True
     except TelegramBadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return True  # the text is already exactly what we wanted
         logger.warning("Message edit failed: %s", exc)
         return False
     except Exception as exc:  # noqa: BLE001 - UI helper must never crash a handler
@@ -224,16 +234,47 @@ async def safe_answer_guest(message: Message, result) -> bool:
 # --- Formatted sending -----------------------------------------------------
 
 
-async def send_formatted(message: Message, text: str, *, limit: int = 4000) -> bool:
-    """Send text and display formulas in their original order."""
+async def send_formatted(
+    message: Message, text: str, *, limit: int = 4000, reply_markup: Any = None
+) -> bool:
+    """Send text and display formulas in their original order.
+
+    ``reply_markup`` (when given) is attached to the last text chunk only.
+    """
     if not config.render_formula_images:
-        return await _send_text_formatted(message, text, limit=limit)
+        return await _send_text_formatted(
+            message, text, limit=limit, reply_markup=reply_markup
+        )
 
     delivered = True
     sent_any = False
     image_count = 0
-    for kind, body in split_display_math(text):
+    table_count = 0
+    parts = list(split_blocks(promote_complex_inline(text)))
+    last_text_index = -1
+    for index, (kind, body) in enumerate(parts):
+        if body.strip() and kind == "text":
+            last_text_index = index
+
+    for index, (kind, body) in enumerate(parts):
         if not body.strip():
+            continue
+        if kind == "table":
+            images = None
+            if table_count < MAX_TABLE_IMAGES:
+                table_count += 1
+                images = await render_table(body)
+            if images and await _send_table_photos(message, images):
+                sent_any = True
+                continue
+            # Rendering failed: keep the table readable as a plain list.
+            body = _table_as_list(body)
+            markup = reply_markup if index == last_text_index else None
+            delivered = (
+                await _send_text_formatted(message, body, limit=limit, reply_markup=markup)
+                and delivered
+            )
+            sent_any = True
             continue
         image = None
         if kind == "math" and image_count < MAX_FORMULA_IMAGES:
@@ -245,17 +286,47 @@ async def send_formatted(message: Message, text: str, *, limit: int = 4000) -> b
         # Unsupported math and failed uploads retain the existing text fallback.
         if kind == "math":
             body = normalize_formulas(body) or body
-        delivered = await _send_text_formatted(message, body, limit=limit) and delivered
+        markup = reply_markup if index == last_text_index else None
+        delivered = (
+            await _send_text_formatted(message, body, limit=limit, reply_markup=markup)
+            and delivered
+        )
         sent_any = True
     return delivered and sent_any
 
 
-async def _send_formula_photo(message: Message, image: bytes) -> bool:
+async def _send_table_photos(message: Message, images: list[bytes]) -> bool:
+    """Send every table image; True only if all of them were delivered."""
+    for number, image in enumerate(images, start=1):
+        if not await _send_formula_photo(message, image, filename=f"table{number}.png"):
+            return False
+    return True
+
+
+def _table_as_list(table: str) -> str:
+    """Markdown table -> bullet list (fallback when the picture failed)."""
+    lines = table.splitlines()
+    header = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    out = []
+    for line in lines[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        pairs = [
+            f"{title}: {value}" if title else value
+            for title, value in zip(header[1:], cells[1:])
+            if value
+        ]
+        out.append(f"- **{cells[0]}**" + (" — " + "; ".join(pairs) if pairs else ""))
+    return "\n".join(out)
+
+
+async def _send_formula_photo(
+    message: Message, image: bytes, filename: str = "formula.png"
+) -> bool:
     for attempt in range(_MAX_429_RETRIES + 1):
         try:
             await throttle.wait(message.chat.id)
             await message.answer_photo(
-                BufferedInputFile(image, filename="formula.png")
+                BufferedInputFile(image, filename=filename)
             )
             return True
         except TelegramRetryAfter as exc:
@@ -268,7 +339,9 @@ async def _send_formula_photo(message: Message, image: bytes) -> bool:
     return False
 
 
-async def _send_text_formatted(message: Message, text: str, *, limit: int = 4000) -> bool:
+async def _send_text_formatted(
+    message: Message, text: str, *, limit: int = 4000, reply_markup: Any = None
+) -> bool:
     """Send an AI answer rendered from Markdown, splitting long replies.
 
     Delivery is retried and degraded rather than lost:
@@ -300,7 +373,8 @@ async def _send_text_formatted(message: Message, text: str, *, limit: int = 4000
     delivered_all = True
     for index, raw in enumerate(chunks, start=1):
         body = f"(Part {index}/{total})\n\n{raw}" if total > 1 else raw
-        if not await _send_chunk(message, body, modes, limit):
+        markup = reply_markup if index == total else None
+        if not await _send_chunk(message, body, modes, limit, reply_markup=markup):
             delivered_all = False
             logger.error(
                 "Chunk %d/%d was NOT delivered to chat %s", index, total, message.chat.id
@@ -313,6 +387,8 @@ async def _send_chunk(
     body: str,
     modes: list[str],
     limit: int,
+    *,
+    reply_markup: Any = None,
 ) -> bool:
     """Try every parse mode (with rate-limit retries) to deliver one chunk."""
     for mode in modes:
@@ -322,7 +398,7 @@ async def _send_chunk(
         while True:
             try:
                 await throttle.wait(message.chat.id)
-                await message.answer(rendered, parse_mode=parse_mode)
+                await message.answer(rendered, parse_mode=parse_mode, reply_markup=reply_markup)
                 return True
             except TelegramRetryAfter as exc:
                 retries += 1
@@ -339,7 +415,9 @@ async def _send_chunk(
                     exc,
                 )
                 if "too long" in str(exc).lower():
-                    return await _send_truncated(message, body, limit)
+                    return await _send_truncated(
+                        message, body, limit, reply_markup=reply_markup
+                    )
                 break
             except TelegramForbiddenError as exc:
                 # The bot was blocked or kicked: retrying cannot help.
@@ -352,16 +430,18 @@ async def _send_chunk(
                 logger.exception("Unexpected error while sending the answer: %s", exc)
                 break
 
-    return await _send_truncated(message, body, limit)
+    return await _send_truncated(message, body, limit, reply_markup=reply_markup)
 
 
-async def _send_truncated(message: Message, body: str, limit: int) -> bool:
+async def _send_truncated(
+    message: Message, body: str, limit: int, *, reply_markup: Any = None
+) -> bool:
     """Last resort: plain text, truncated to the hard limit, with 429 retries."""
     payload = body if len(body) <= limit else body[: max(limit - 1, 1)] + "…"
     for attempt in range(_MAX_429_RETRIES + 1):
         try:
             await throttle.wait(message.chat.id)
-            await message.answer(payload, parse_mode=None)
+            await message.answer(payload, parse_mode=None, reply_markup=reply_markup)
             logger.info("Answer delivered as truncated plain text")
             return True
         except TelegramRetryAfter as exc:
@@ -371,6 +451,60 @@ async def _send_truncated(message: Message, body: str, limit: int) -> bool:
             await asyncio.sleep(_retry_delay(exc))
         except Exception as exc:  # noqa: BLE001 - a reply must not be lost
             logger.error("Last-resort plain send failed: %s", exc)
+            return False
+    return False
+
+
+async def edit_formatted(
+    message: Message, raw: str, *, reply_markup: Any = None
+) -> bool:
+    """Edit one existing message into the final formatted answer.
+
+    Tries the same parse-mode fallback chain as :func:`send_formatted`, but the
+    whole text must fit one message: when it does not (or editing is rejected),
+    the caller is expected to fall back to a multi-message send.
+    """
+    if message is None or not hasattr(message, "edit_text"):
+        return False
+
+    if config.normalize_formulas:
+        raw = normalize_formulas(raw) or raw
+
+    modes = [config.parse_mode]
+    for extra in ("html", "plain"):
+        if extra not in modes:
+            modes.append(extra)
+
+    for mode in modes:
+        rendered = render(raw, mode)
+        if not rendered:
+            continue
+        if len(rendered) > 4096:
+            logger.info(
+                "Formatted answer does not fit one message (%d chars); resending",
+                len(rendered),
+            )
+            return False
+        parse_mode = PARSE_MODES.get(mode)
+        try:
+            await throttle.wait(message.chat.id)
+            await message.edit_text(
+                rendered, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+            return True
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "Editing with parse_mode=%s failed: %s", parse_mode or "plain", exc
+            )
+        except TelegramRetryAfter:
+            # The streamed edits are throttled, so this is rare: give up on
+            # the in-place edit and let the caller re-send robustly.
+            logger.warning("Telegram rate limit hit while finalizing the answer")
+            return False
+        except Exception as exc:  # noqa: BLE001 - the caller has a fallback
+            logger.warning("Could not edit the message in place: %s", exc)
             return False
     return False
 
