@@ -1,10 +1,12 @@
-aiogram>=3.28.2
-sqlalchemy[asyncio]>=2.0.36
+# Minimum versions only — pip installs the newest release; no exact pins.
+# Rich messages require Bot API 10.1 support (aiogram >= 3.29; 3.31 adds 10.3).
+aiogram>=3.29
+sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
 # Optional: only needed when DATABASE_URL points at PostgreSQL.
-asyncpg>=0.30.0
-aiohttp>=3.11.11
-python-dotenv>=1.0.1
+asyncpg>=0.30
+aiohttp>=3.11
+python-dotenv>=1.0
 matplotlib>=3.9
 # Pillow is used by bot/services/formulas.py (PNG processing of rendered
 # formulas); matplotlib pulls it in transitively, but the dependency is

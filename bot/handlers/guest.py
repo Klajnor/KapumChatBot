@@ -9,6 +9,8 @@ from aiogram import Router
 from aiogram.types import (
     InlineQueryResult,
     InlineQueryResultArticle,
+    InputRichMessage,
+    InputRichMessageContent,
     InputTextMessageContent,
     LinkPreviewOptions,
     Message,
@@ -20,6 +22,7 @@ from bot.services import limits
 from bot.services.access import AccessResult, check_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
 from bot.services.markdown import render, split_chunks
+from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.telegram_utils import (
     PARSE_MODES,
@@ -78,6 +81,19 @@ def _to_result(reply: GuestReply, *, mode: str | None = None) -> InlineQueryResu
 
     effective = mode or reply.mode
     text = reply.text or "…"
+    if effective == "rich":
+        # Native rich message: Telegram renders the model's Markdown (tables,
+        # $$LaTeX$$) itself; the 32768-character budget beats plain text.
+        body = adapt_markdown(text)
+        if len(body) > RICH_LIMIT:
+            body = body[: RICH_LIMIT - 1] + "…"
+        return InlineQueryResultArticle(
+            id="answer",
+            title=" ".join(text.split())[:120] or "Answer",
+            input_message_content=InputRichMessageContent(
+                rich_message=InputRichMessage(markdown=body)
+            ),
+        )
     # Guest replies accept one result and cannot upload a local formula PNG.
     if config.render_formula_images or config.normalize_formulas:
         text = normalize_formulas(text) or text
@@ -110,6 +126,9 @@ async def _maybe_telegraph_reply(
     Returns ``None`` when Telegraph is not needed or unavailable, so the
     caller sends the answer as a normal (truncated) text reply.
     """
+    if config.rich_messages:
+        # Rich guest answers render tables/formulas natively: no link needed.
+        return None
     if not config.enable_telegraph or not needs_telegraph(answer):
         return None
     url = await publish_answer(question, answer)
@@ -358,9 +377,17 @@ async def handle_guest_message(message: Message) -> None:
                 mode="plain",
             )
 
-    # Try the configured formatting; if Telegram rejects it (bad entities) the
-    # answer is retried once as plain text, so a guest reply is never lost to
-    # formatting. An expired query simply fails both attempts and is logged.
+    # Attempt order: rich (native Markdown) → the configured formatting →
+    # plain text, so a rejection of one form never loses the single allowed
+    # guest reply. An expired query simply fails every attempt and is logged.
+    if (
+        config.rich_messages
+        and reply.photo_url is None
+        and reply.mode == "markdown"
+        and reply.text
+    ):
+        if await safe_answer_guest(message, _to_result(reply, mode="rich")):
+            return
     if await safe_answer_guest(message, _to_result(reply)):
         return
     if reply.mode != "plain":

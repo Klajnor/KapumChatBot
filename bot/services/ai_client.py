@@ -13,7 +13,12 @@ from uuid import uuid4
 
 import aiohttp
 
-from bot.config import DEFAULT_STYLE_HINT, FORMULA_STYLE_HINT, config
+from bot.config import (
+    DEFAULT_RICH_STYLE_HINT,
+    DEFAULT_STYLE_HINT,
+    FORMULA_STYLE_HINT,
+    config,
+)
 from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
@@ -889,12 +894,18 @@ class AIClient:
     ) -> list[dict[str, Any]]:
         """Append the Telegram formatting rules to the system prompt.
 
-        Telegram cannot render LaTeX or sub/superscripts, so the model is asked
-        to use Unicode notation directly. The caller's list is not modified.
+        Which rules depend on the delivery mode: rich messages render tables
+        and LaTeX natively, the legacy path needs Unicode notation. The
+        caller's list is not modified.
         """
         hint = config.style_hint if config.enable_style_hint else ""
-        if hint == DEFAULT_STYLE_HINT and config.render_formula_images:
-            hint = FORMULA_STYLE_HINT
+        if hint == DEFAULT_STYLE_HINT:
+            # Neither PNG math nor plain Markdown fits a rich message's
+            # limitations — the model may use tables and LaTeX natively.
+            if config.rich_messages:
+                hint = DEFAULT_RICH_STYLE_HINT
+            elif config.render_formula_images:
+                hint = FORMULA_STYLE_HINT
         if not hint:
             return messages
 
@@ -910,8 +921,17 @@ class AIClient:
 
     @staticmethod
     def _finalize(content: str | None) -> str | None:
-        """Rewrite scientific notation in the answer as Unicode for Telegram."""
-        if not content or config.render_formula_images or not config.normalize_formulas:
+        """Rewrite scientific notation in the answer as Unicode for Telegram.
+
+        With rich messages the raw LaTeX survives for Telegram's native
+        renderer, so the Unicode rewrite only matters on the legacy path.
+        """
+        if (
+            not content
+            or config.rich_messages
+            or config.render_formula_images
+            or not config.normalize_formulas
+        ):
             return content
         return normalize_formulas(content)
 

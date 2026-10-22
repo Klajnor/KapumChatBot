@@ -37,6 +37,13 @@ from bot.services.ai_client import (
 )
 from bot.services.formulas import has_table, promote_complex_inline
 from bot.services.progress import waiting
+from bot.services.rich import (
+    RICH_LIMIT,
+    next_draft_id,
+    send_rich,
+    send_rich_draft,
+    send_text_draft,
+)
 from bot.services.telegram_utils import (
     edit_formatted,
     format_timing,
@@ -291,11 +298,13 @@ async def _consume_access(message: Message, service: UserService) -> AccessResul
 
 
 class _StreamPrinter:
-    """Shows streamed answer chunks in one message, edited at a throttled pace.
+    """Shows streamed answer chunks live.
 
-    Intermediate edits are plain text (Markdown is incomplete mid-stream and
-    would be rejected); the finished message is replaced by the fully rendered
-    answer via :meth:`finalize`.
+    In private chats with rich messages the preview is an ephemeral *rich
+    draft* (``sendRichMessageDraft``): Telegram animates the partial Markdown
+    itself and the draft vanishes once the final message is sent. Everywhere
+    else the older behaviour stays: one placeholder message edited as plain
+    text at a throttled pace, replaced by the rendered answer in the end.
     """
 
     def __init__(self, message: Message, notifier: Any = None) -> None:
@@ -304,10 +313,19 @@ class _StreamPrinter:
         self._notifier = notifier
         self._last_edit = 0.0
         self._broken = False
+        self.draft_mode = bool(config.rich_messages and _is_private(message))
+        self._draft_id = next_draft_id() if self.draft_mode else 0
+        self._thread_id = getattr(message, "message_thread_id", None)
+        self.drafted = False
 
     async def on_delta(self, full: str) -> None:
         """Client callback: awaited with the text accumulated so far."""
         if self._broken or not full:
+            return
+        if self.draft_mode:
+            if time.monotonic() - self._last_edit < config.stream_edit_interval:
+                return
+            await self._draft(full)
             return
         if self.message is None:
             await self._send_initial(full)
@@ -323,10 +341,37 @@ class _StreamPrinter:
         else:
             self._broken = True
 
-    def _clip(self, full: str) -> str:
-        if len(full) <= MAX_MESSAGE_LENGTH:
+    async def _draft(self, full: str) -> None:
+        """Push one draft update; degrade to plain text, then stop trying."""
+        if not self.drafted:
+            self.drafted = True
+            if self._notifier is not None:
+                await self._notifier.stop()
+        bot = getattr(self.origin, "bot", None)
+        if bot is None:  # pragma: no cover - real messages always carry a bot
+            self._broken = True
+            return
+        chat_id = self.origin.chat.id
+        if await send_rich_draft(
+            bot,
+            chat_id,
+            self._draft_id,
+            self._clip(full, RICH_LIMIT),
+            message_thread_id=self._thread_id,
+        ):
+            self._last_edit = time.monotonic()
+        elif await send_text_draft(
+            bot, chat_id, self._draft_id, self._clip(full),
+            message_thread_id=self._thread_id,
+        ):
+            self._last_edit = time.monotonic()
+        else:
+            self._broken = True
+
+    def _clip(self, full: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
+        if len(full) <= limit:
             return full
-        return full[: MAX_MESSAGE_LENGTH - 1] + "…"
+        return full[: limit - 1] + "…"
 
     async def _send_initial(self, text: str) -> None:
         kwargs: dict[str, Any] = {"parse_mode": None}
@@ -366,12 +411,25 @@ async def deliver_answer(
     title_source: str | None = None,
     reply_markup: Any = None,
 ) -> bool:
-    """Deliver an AI answer: a Telegraph link when Telegram cannot render the
-    content (tables, raw LaTeX), otherwise a formatted message.
+    """Deliver an AI answer.
 
-    With a finished stream the placeholder message is reused; every failure
-    falls back to the robust multi-message send, so the answer is never lost.
+    Preferred path: one native rich message (Bot API 10.1) — Telegram renders
+    the model's Markdown itself: tables, LaTeX, headings, footnotes. When
+    rich messages are off or Telegram rejects the content, the old chain
+    takes over: Telegraph link for what Telegram used to be unable to show,
+    formula PNGs, and the MarkdownV2/HTML formatting fallback — so the
+    answer is never lost.
     """
+    if config.rich_messages:
+        if printer is not None and printer.message is not None:
+            # The placeholder served the stream; the rich answer is a new
+            # message, so remove the stale preview before it duplicates.
+            await printer.discard()
+        body = with_timing(text, footer)
+        if await send_rich(message, body, reply_markup=reply_markup):
+            return True
+        logger.warning("Rich delivery failed; falling back to the legacy chain")
+
     if config.render_formula_images:
         text = promote_complex_inline(text)
     if config.enable_telegraph and needs_telegraph(

@@ -90,6 +90,19 @@ DEFAULT_STYLE_HINT = (
     "or lists instead."
 )
 
+# Used instead of DEFAULT_STYLE_HINT when RICH_MESSAGES is on: Telegram renders
+# rich messages natively, so the model may use tables and LaTeX directly.
+DEFAULT_RICH_STYLE_HINT = (
+    "Your answer is displayed in a Telegram rich message that natively renders "
+    "GitHub-Flavored Markdown: **bold**, *italic*, `code`, fenced ``` blocks "
+    "with a language, # headings, - and 1. lists, task lists, > quotes, "
+    "~~strike~~, ==marks==, ||spoiler||, footnotes [^1], tables with | pipes |, "
+    "and LaTeX formulas: inline $x^2$ and display $$...$$ blocks. Use tables "
+    "and LaTeX freely when they help. Plain Unicode notation (H₂SO₄, E=mc²) is "
+    "still fine for short inline expressions. Do not embed external media "
+    "(![](http://...) images/video) — text answers only."
+)
+
 FORMULA_STYLE_HINT = (
     "Your answer is displayed in Telegram. Use Markdown for text and Unicode "
     "for short inline formulas and chemical formulas (H₂SO₄, CO₂, x², 25 °C). "
@@ -372,6 +385,17 @@ class Config:
     # question with a different model (one-time, the default model stays).
     enable_ask_other_model: bool = field(
         default_factory=lambda: _env_bool("ASK_OTHER_MODEL", True)
+    )
+
+    # --- Rich messages (Bot API 10.1+) ---
+    # AI answers are sent as native Telegram "rich messages": the model's
+    # GitHub-Flavored Markdown (tables, $$LaTeX$$, headings, footnotes) is
+    # rendered by Telegram itself, and streaming uses ephemeral rich drafts
+    # (private chats). When disabled — or when Telegram rejects a rich
+    # message — delivery falls back to the legacy chain (Telegraph pages,
+    # PNG formulas, MarkdownV2/HTML).
+    rich_messages: bool = field(
+        default_factory=lambda: _env_bool("RICH_MESSAGES", True)
     )
 
     # --- Scientific notation ---
