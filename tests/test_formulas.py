@@ -106,6 +106,7 @@ class FormulaTests(unittest.IsolatedAsyncioTestCase):
 
     def test_default_prompt_requests_display_math(self):
         with (
+            patch.object(config, "rich_messages", False),
             patch.object(config, "render_formula_images", True),
             patch.object(config, "enable_style_hint", True),
             patch.object(config, "style_hint", DEFAULT_STYLE_HINT),

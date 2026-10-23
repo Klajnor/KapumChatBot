@@ -3,13 +3,20 @@ from __future__ import annotations
 import datetime
 
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
-from bot.database.models import AllowedUser, DailyUsage, Message, User, UserSettings
+from bot.database.models import (
+    AllowedUser,
+    DailyUsage,
+    Message,
+    Reminder,
+    User,
+    UserSettings,
+)
 
 
 class UserRepository:
@@ -204,6 +211,11 @@ class UserRepository:
             select(AllowedUser).order_by(AllowedUser.added_at.desc())
         )
         return list(result.scalars().all())
+
+    async def get_all_user_ids(self) -> list[int]:
+        """Return the Telegram IDs of every registered user (for broadcasts)."""
+        result = await self.session.execute(select(User.telegram_id))
+        return [int(row[0]) for row in result.all()]
 
     async def is_allowed_user(self, telegram_id: int) -> bool:
         """Check if a user is in the allowed list."""
@@ -405,3 +417,135 @@ class MessageRepository:
             select(func.count()).select_from(Message).where(Message.user_id == user_id)
         )
         return int(result.scalar() or 0)
+
+    # --- Export ---------------------------------------------------------------
+
+    async def get_message(self, message_id: int) -> Message | None:
+        """One stored message by its database id."""
+        return await self.session.get(Message, message_id)
+
+    async def get_previous_user_message(
+        self, chat_id: int, user_id: int, before_id: int
+    ) -> Message | None:
+        """The user's latest message before ``before_id`` (the question context)."""
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.chat_id == chat_id,
+                Message.user_id == user_id,
+                Message.role == "user",
+                Message.id < before_id,
+            )
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_messages_for_export(
+        self, chat_id: int, user_id: int, limit: int
+    ) -> list[Message]:
+        """The last ``limit`` messages of a user's thread, oldest first."""
+        result = await self.session.execute(
+            select(Message)
+            .where(Message.chat_id == chat_id, Message.user_id == user_id)
+            .order_by(Message.id.desc())
+            .limit(limit)
+        )
+        return list(reversed(result.scalars().all()))
+
+
+class ReminderRepository:
+    """Repository for scheduled reminders and recurring messages."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add(self, reminder: Reminder) -> Reminder:
+        """Persist a new reminder and return it (with its id)."""
+        self.session.add(reminder)
+        await self.session.flush()
+        return reminder
+
+    async def count(self, user_id: int, *, recurring: bool | None = None) -> int:
+        """Count a user's enabled reminders.
+
+        ``recurring=None`` counts all; ``True`` only scheduled ones; ``False``
+        only one-time ones.
+        """
+        stmt = (
+            select(func.count())
+            .select_from(Reminder)
+            .where(Reminder.user_id == user_id, Reminder.enabled.is_(True))
+        )
+        if recurring is True:
+            stmt = stmt.where(Reminder.schedule.isnot(None))
+        elif recurring is False:
+            stmt = stmt.where(Reminder.schedule.is_(None))
+        result = await self.session.execute(stmt)
+        return int(result.scalar() or 0)
+
+    async def list_by_user(self, user_id: int) -> list[Reminder]:
+        """All enabled reminders of a user, soonest first."""
+        result = await self.session.execute(
+            select(Reminder)
+            .where(Reminder.user_id == user_id, Reminder.enabled.is_(True))
+            .order_by(Reminder.fire_at, Reminder.id)
+        )
+        return list(result.scalars().all())
+
+    async def get(self, reminder_id: int, user_id: int) -> Reminder | None:
+        """One reminder, scoped to its owner (never another user's)."""
+        result = await self.session.execute(
+            select(Reminder).where(
+                Reminder.id == reminder_id, Reminder.user_id == user_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def delete(self, reminder_id: int, user_id: int) -> bool:
+        """Delete one reminder; True when it existed (and belonged to the user)."""
+        reminder = await self.get(reminder_id, user_id)
+        if reminder is None:
+            return False
+        await self.session.delete(reminder)
+        await self.session.flush()
+        return True
+
+    async def delete_all(self, user_id: int) -> int:
+        """Delete every reminder of a user; returns how many were removed."""
+        result = await self.session.execute(
+            delete(Reminder).where(Reminder.user_id == user_id)
+        )
+        await self.session.flush()
+        return int(result.rowcount or 0)
+
+    async def delete_by_id(self, reminder_id: int) -> None:
+        """Delete a reminder regardless of owner (scheduler cleanup)."""
+        await self.session.execute(
+            delete(Reminder).where(Reminder.id == reminder_id)
+        )
+        await self.session.flush()
+
+    async def get_due(self, now: datetime.datetime, limit: int = 50) -> list[Reminder]:
+        """Enabled reminders whose fire time has come (oldest first)."""
+        result = await self.session.execute(
+            select(Reminder)
+            .where(Reminder.enabled.is_(True), Reminder.fire_at <= now)
+            .order_by(Reminder.fire_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def reschedule(self, reminder: Reminder, next_fire_at: datetime.datetime) -> None:
+        """Move a recurring reminder to its next fire time."""
+        reminder.fire_at = next_fire_at
+        await self.session.flush()
+
+    async def disable(self, reminder_id: int) -> None:
+        """Stop a reminder without deleting it (broken schedule, blocked bot)."""
+        await self.session.execute(
+            update(Reminder)
+            .where(Reminder.id == reminder_id)
+            .values(enabled=False)
+        )
+        await self.session.flush()

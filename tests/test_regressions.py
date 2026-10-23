@@ -1,8 +1,9 @@
 """Offline regression checks: no Telegram, AI or database connections."""
 from __future__ import annotations
 
-import os
 import asyncio
+import datetime
+import os
 import unittest
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -13,12 +14,30 @@ os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
 os.environ["AI_API_KEY"] = "test-key"
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
 
-from bot.config import Config, config, _env_float
+from bot.config import (
+    DEFAULT_PERSONAS,
+    DEFAULT_SYSTEM_PROMPT_TEXT,
+    Config,
+    _env_float,
+    _parse_personas,
+    config,
+)
 from bot.database.repository import UserRepository
 from bot.database.session import _run_migrations
-from bot.handlers import chat, guest
-from bot.services.ai_client import AIClient, ImageResult, _request_log_payload
-from bot.services.telegram_utils import _retry_delay
+from bot.handlers import chat, guest, prompt
+from bot.handlers import export as export_handler
+from bot.keyboards.inline import get_answer_keyboard, get_persona_keyboard
+from bot.services import documents, search
+from bot.services import export as export_service
+from bot.services import reminders as reminder_service
+from bot.services.ai_client import (
+    AIClient,
+    ChatResult,
+    ImageResult,
+    ToolCall,
+    _request_log_payload,
+)
+from bot.services.telegram_utils import _retry_delay, format_timing
 from bot.services.user_service import UserService
 
 
@@ -138,6 +157,48 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 await guest.handle_guest_message(message)
         session.close.assert_awaited_once()
         answer.assert_not_awaited()
+
+    async def test_guest_too_long_text_does_not_consume_quota(self):
+        message = SimpleNamespace(
+            text="x" * 50,
+            caption=None,
+            photo=[],
+            voice=None,
+            reply_to_message=None,
+            from_user=SimpleNamespace(
+                id=7, username="u", first_name="U", last_name=None
+            ),
+        )
+        service = SimpleNamespace(register_user=AsyncMock(), session=SimpleNamespace(close=AsyncMock()))
+        with (
+            patch.object(config, "max_guest_text_length", 10),
+            patch.object(guest, "check_access", AsyncMock()) as access,
+        ):
+            reply = await guest._build_reply(message, service, message.from_user, 42)
+        self.assertEqual(reply.mode, "plain")
+        self.assertIn("too long", reply.text)
+        access.assert_not_awaited()
+
+    async def test_guest_long_voice_does_not_consume_quota(self):
+        message = SimpleNamespace(
+            text="@bot hello",
+            caption=None,
+            photo=[],
+            voice=SimpleNamespace(duration=301, file_size=10, file_id="f", mime_type="audio/ogg"),
+            reply_to_message=None,
+            from_user=SimpleNamespace(
+                id=8, username="u", first_name="U", last_name=None
+            ),
+        )
+        service = SimpleNamespace(register_user=AsyncMock(), session=SimpleNamespace(close=AsyncMock()))
+        with (
+            patch.object(config, "enable_voice", True),
+            patch.object(guest, "check_access", AsyncMock()) as access,
+        ):
+            reply = await guest._build_reply(message, service, message.from_user, 42)
+        self.assertEqual(reply.mode, "plain")
+        self.assertIn("5 minutes", reply.text)
+        access.assert_not_awaited()
 
     async def test_failed_photo_is_not_saved_as_success(self):
         message = SimpleNamespace(
@@ -274,7 +335,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(guest, "safe_answer_guest", AsyncMock(return_value=False)) as answer,
         ):
             await guest.handle_guest_message(message)
-        answer.assert_awaited_once()
+        # Guest handler may try multiple formats (rich → markdown → plain);
+        # all fail here because the mock returns False each time.
+        self.assertGreaterEqual(answer.await_count, 1)
 
     def test_guest_image_link_is_complete_when_caption_is_long(self):
         url = "https://example.test/image?signature=" + "x" * 3000
@@ -294,6 +357,1366 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
     def test_nonfinite_float_uses_default(self):
         with patch.dict(os.environ, {"TEST_FLOAT": "nan"}):
             self.assertEqual(_env_float("TEST_FLOAT", 0.7), 0.7)
+
+    # --- Token usage in the timing footer -----------------------------------
+
+    def test_chat_result_exposes_openai_style_token_usage(self):
+        result = ChatResult(
+            content="hi",
+            usage={"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165},
+        )
+        self.assertEqual(result.input_tokens, 120)
+        self.assertEqual(result.output_tokens, 45)
+        self.assertEqual(result.total_tokens, 165)
+
+    def test_chat_result_exposes_dashscope_style_token_usage(self):
+        result = ChatResult(
+            content="hi",
+            usage={"input_tokens": 30, "output_tokens": 7, "total_tokens": 37},
+        )
+        self.assertEqual(result.input_tokens, 30)
+        self.assertEqual(result.output_tokens, 7)
+        self.assertEqual(result.total_tokens, 37)
+
+    def test_chat_result_without_usage_has_no_token_counts(self):
+        result = ChatResult(content="hi")
+        self.assertIsNone(result.input_tokens)
+        self.assertIsNone(result.output_tokens)
+        self.assertIsNone(result.total_tokens)
+
+    def test_timing_footer_uses_token_format_when_usage_present(self):
+        with (
+            patch.object(config, "show_timing", True),
+            patch.object(config, "timing_format", "⏱️ {seconds} s · {model}"),
+            patch.object(
+                config, "timing_format_tokens",
+                "⏱️ {seconds} s · {model} · ↑{input} ↓{output} tok",
+            ),
+        ):
+            with_usage = format_timing(
+                2.0, model="qwen3.8-flash",
+                tokens=165, input_tokens=120, output_tokens=45,
+            )
+            without_usage = format_timing(1.5, model="qwen-image-3.0-pro")
+        self.assertEqual(with_usage, "⏱️ 2.0 s · qwen3.8-flash · ↑120 ↓45 tok")
+        # Image generation reports no usage: the plain format is kept.
+        self.assertEqual(without_usage, "⏱️ 1.5 s · qwen-image-3.0-pro")
+
+    def test_timing_footer_falls_back_on_invalid_token_format(self):
+        with (
+            patch.object(config, "show_timing", True),
+            patch.object(config, "timing_format_tokens", "{nope}"),
+            self.assertLogs("bot.services.telegram_utils", level="WARNING"),
+        ):
+            footer = format_timing(3.0, model="m", input_tokens=1, output_tokens=2)
+        self.assertIn("↑1 ↓2", footer)
+        self.assertIn("3.0 s", footer)
+
+    # --- Quoted / forwarded context -----------------------------------------
+
+    @staticmethod
+    def _fake_message(**kwargs):
+        """A SimpleNamespace shaped like an aiogram Message for quoting tests."""
+        base = {
+            "photo": None, "text": None, "caption": None, "voice": None,
+            "video": None, "animation": None, "document": None,
+            "sticker": None, "from_user": None, "sender_chat": None,
+            "reply_to_message": None, "forward_date": None,
+            "forward_origin": None,
+        }
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    def test_quoted_text_message_becomes_context_block(self):
+        reply = self._fake_message(
+            text="Check this error log",
+            from_user=SimpleNamespace(id=5, first_name="Alice", username=None),
+        )
+        with patch.object(chat, "get_bot_id", return_value=777):
+            quoted = chat._describe_quoted(reply)
+        self.assertIn("[Quoted message from Alice]", quoted)
+        self.assertIn("Check this error log", quoted)
+
+    def test_reply_to_bot_answer_is_not_quoted(self):
+        reply = self._fake_message(
+            text="I am the bot answer",
+            from_user=SimpleNamespace(id=777, first_name="Bot", username=None),
+        )
+        with patch.object(chat, "get_bot_id", return_value=777):
+            self.assertIsNone(chat._describe_quoted(reply))
+
+    def test_reply_to_photo_is_left_to_the_vision_path(self):
+        reply = self._fake_message(photo=[SimpleNamespace(file_id="x")])
+        self.assertIsNone(chat._describe_quoted(reply))
+
+    def test_quoted_media_gets_markers(self):
+        reply = self._fake_message(
+            voice=SimpleNamespace(),
+            document=SimpleNamespace(file_name="report.pdf"),
+            from_user=SimpleNamespace(id=5, first_name=None, username="bob"),
+        )
+        with patch.object(chat, "get_bot_id", return_value=777):
+            quoted = chat._describe_quoted(reply)
+        self.assertIn("[Quoted message from bob]", quoted)
+        self.assertIn("[Voice message]", quoted)
+        self.assertIn("[Document: report.pdf]", quoted)
+
+    def test_long_quote_is_truncated(self):
+        reply = self._fake_message(
+            text="x" * 5000,
+            from_user=SimpleNamespace(id=5, first_name="Alice", username=None),
+        )
+        with patch.object(chat, "get_bot_id", return_value=777):
+            quoted = chat._describe_quoted(reply)
+        self.assertLessEqual(len(quoted), chat._MAX_QUOTED_CHARS + 60)
+        self.assertTrue(quoted.endswith("…"))
+
+    def test_forwarded_message_gets_provenance_label(self):
+        message = self._fake_message(
+            forward_date=object(),
+            forward_origin=SimpleNamespace(
+                sender_user=SimpleNamespace(first_name="Carol", username=None),
+                sender_chat=None,
+                chat=None,
+            ),
+        )
+        text = chat._with_quoted_context(message, "summary?")
+        self.assertTrue(text.startswith("[Forwarded message from Carol]"))
+        self.assertIn("summary?", text)
+
+    def test_plain_message_text_is_unchanged(self):
+        message = self._fake_message()
+        self.assertEqual(chat._with_quoted_context(message, "hello"), "hello")
+
+    async def test_text_reply_to_photo_routes_to_vision(self):
+        photo_msg = self._fake_message(
+            photo=[SimpleNamespace(file_id="abc", file_size=100)]
+        )
+        message = self._fake_message(
+            text="what is this?",
+            reply_to_message=photo_msg,
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(chat, "_is_addressed", return_value=True),
+            patch.object(chat, "_route_single_photo", AsyncMock()) as route,
+        ):
+            await chat.handle_text(message)
+        route.assert_awaited_once()
+        self.assertIs(route.call_args.kwargs["photo_from"], photo_msg)
+        self.assertEqual(route.call_args.kwargs["question"], "what is this?")
+
+
+# --- Automatic model fallback -------------------------------------------
+
+    def test_fallback_models_are_parsed_and_separate_from_catalog(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AI_FALLBACK_MODELS": "fast-a:Fast A:vision,fast-b:Fast B:novision",
+                "AI_MODELS": "main-a:Main A:vision",
+            },
+        ):
+            settings = Config()
+        self.assertEqual([m["id"] for m in settings.ai_fallback_models], ["fast-a", "fast-b"])
+        self.assertTrue(settings.ai_fallback_models[0]["vision"])
+        self.assertFalse(settings.ai_fallback_models[1]["vision"])
+        self.assertEqual([m["id"] for m in settings.ai_models], ["main-a"])
+
+    async def test_fallback_chain_walks_catalog_then_emergency_models(self):
+        client = AIClient(api_key="test-key")
+        catalog = [
+            {"id": "m1", "name": "M1", "vision": True},
+            {"id": "m2", "name": "M2", "vision": True},
+            {"id": "m3", "name": "M3", "vision": False},
+        ]
+        emergency = [
+            {"id": "f1", "name": "F1", "vision": True},
+            {"id": "f2", "name": "F2", "vision": False},
+        ]
+        with (
+            patch.object(config, "ai_models", catalog),
+            patch.object(config, "ai_fallback_models", emergency),
+        ):
+            self.assertEqual(client.model_chain("m2"), ["m2", "m3", "f1", "f2"])
+            self.assertEqual(client.model_chain("m3"), ["m3", "f1", "f2"])
+            # Unknown primary -> the whole catalog, then fallbacks.
+            self.assertEqual(client.model_chain("x"), ["x", "m1", "m2", "m3", "f1", "f2"])
+            # Vision requests skip text-only models.
+            self.assertEqual(
+                client.model_chain("m2", require_vision=True), ["m2", "f1"]
+            )
+
+    async def test_chat_retries_with_next_model_on_quota(self):
+        client = AIClient(api_key="test-key")
+        catalog = [
+            {"id": "m1", "name": "M1", "vision": True},
+            {"id": "m2", "name": "M2", "vision": True},
+        ]
+        ok = {"choices": [{"message": {"content": "from m2"}}]}
+        with (
+            patch.object(config, "ai_models", catalog),
+            patch.object(config, "ai_fallback_models", []),
+            patch.object(
+                client,
+                "_post_chat",
+                AsyncMock(side_effect=[(429, None, 0.1), (200, ok, 0.2)]),
+            ) as request,
+        ):
+            result = await client.chat_completion_result(
+                [{"role": "user", "content": "hi"}], model="m1"
+            )
+        self.assertEqual(result.content, "from m2")
+        self.assertEqual(result.model, "m2")
+        self.assertEqual(
+            [call.args[0]["model"] for call in request.await_args_list], ["m1", "m2"]
+        )
+
+    async def test_chat_uses_emergency_model_after_last_catalog_model(self):
+        client = AIClient(api_key="test-key")
+        catalog = [{"id": "last", "name": "Last", "vision": True}]
+        emergency = [{"id": "rescue", "name": "Rescue", "vision": True}]
+        ok = {"choices": [{"message": {"content": "rescued"}}]}
+        with (
+            patch.object(config, "ai_models", catalog),
+            patch.object(config, "ai_fallback_models", emergency),
+            patch.object(
+                client,
+                "_post_chat",
+                AsyncMock(side_effect=[(500, None, 0.1), (200, ok, 0.2)]),
+            ) as request,
+        ):
+            result = await client.chat_completion_result(
+                [{"role": "user", "content": "hi"}], model="last"
+            )
+        self.assertEqual(result.content, "rescued")
+        self.assertEqual(result.model, "rescue")
+        self.assertEqual(
+            [call.args[0]["model"] for call in request.await_args_list],
+            ["last", "rescue"],
+        )
+
+    async def test_empty_answer_also_moves_to_next_model(self):
+        client = AIClient(api_key="test-key")
+        catalog = [
+            {"id": "m1", "name": "M1", "vision": True},
+            {"id": "m2", "name": "M2", "vision": True},
+        ]
+        empty = {"choices": [{"message": {"content": ""}}]}
+        ok = {"choices": [{"message": {"content": "second"}}]}
+        with (
+            patch.object(config, "ai_models", catalog),
+            patch.object(config, "ai_fallback_models", []),
+            patch.object(
+                client,
+                "_post_chat",
+                AsyncMock(side_effect=[(200, empty, 0.1), (200, ok, 0.2)]),
+            ),
+        ):
+            result = await client.chat_completion_result(
+                [{"role": "user", "content": "hi"}], model="m1"
+            )
+        self.assertEqual(result.content, "second")
+        self.assertEqual(result.model, "m2")
+
+    async def test_stream_moves_to_next_model_after_empty_answer(self):
+        client = AIClient(api_key="test-key")
+        catalog = [
+            {"id": "m1", "name": "M1", "vision": True},
+            {"id": "m2", "name": "M2", "vision": True},
+        ]
+        empty = ChatResult()
+        answer = ChatResult(content="streamed")
+        with (
+            patch.object(config, "ai_models", catalog),
+            patch.object(config, "ai_fallback_models", []),
+            patch.object(
+                client,
+                "_stream_attempt",
+                AsyncMock(side_effect=[empty, answer]),
+            ) as stream,
+        ):
+            result = await client.stream_chat_completion(
+                [{"role": "user", "content": "hi"}], model="m1"
+            )
+        self.assertEqual(result.content, "streamed")
+        self.assertEqual(result.model, "m2")
+        self.assertEqual(
+            [call.args[0]["model"] for call in stream.await_args_list],
+            ["m1", "m2"],
+        )
+
+    def test_timing_footer_reports_the_model_that_answered(self):
+        result = ChatResult(content="hi", elapsed=1.0, model="fallback-model")
+        with (
+            patch.object(config, "show_timing", True),
+            patch.object(config, "timing_format", "⏱️ {seconds} s · {model}"),
+        ):
+            footer = format_timing(result.elapsed, model=result.model or "selected")
+        self.assertIn("fallback-model", footer)
+
+
+class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
+    """Offline checks for document extraction, link fetching and SSRF guards."""
+
+    def test_detect_file_type_by_extension_and_mime(self):
+        self.assertEqual(documents.detect_file_type("report.PDF", None), "pdf")
+        self.assertEqual(documents.detect_file_type("notes.docx", None), "docx")
+        self.assertEqual(documents.detect_file_type("data.csv", None), "txt")
+        self.assertEqual(documents.detect_file_type("script.py", None), "txt")
+        self.assertEqual(documents.detect_file_type(None, "application/pdf"), "pdf")
+        self.assertEqual(
+            documents.detect_file_type("file", "text/plain; charset=utf-8"), "txt"
+        )
+        self.assertIsNone(documents.detect_file_type("archive.zip", "application/zip"))
+        self.assertIsNone(
+            documents.detect_file_type("legacy.doc", "application/msword")
+        )
+
+    def test_decode_text_handles_utf8_cyrillic_and_utf16(self):
+        self.assertEqual(
+            documents.decode_text_bytes("привет".encode()), "привет"
+        )
+        self.assertEqual(
+            documents.decode_text_bytes("привет".encode("cp1251")), "привет"
+        )
+        self.assertEqual(documents.decode_text_bytes("hi".encode("utf-16")), "hi")
+
+    def test_clip_extracted_marks_truncation(self):
+        with patch.object(config, "max_extracted_chars", 100):
+            clipped = documents.clip_extracted("x" * 500)
+        self.assertLessEqual(len(clipped), 200)
+        self.assertIn("truncated", clipped)
+
+    def test_naive_html_extract_strips_scripts_and_gets_title(self):
+        body = (
+            b"<html><head><title>Test Page</title><style>b{color:red}</style></head>"
+            b"<body><script>evil()</script><h1>Head</h1><p>Hello world</p></body>"
+            b"</html>"
+        )
+        title, text = documents._naive_html_extract(body)
+        self.assertEqual(title, "Test Page")
+        self.assertIn("Hello world", text)
+        self.assertIn("Head", text)
+        self.assertNotIn("evil", text)
+        self.assertNotIn("color:red", text)
+
+    def test_private_and_local_urls_are_refused(self):
+        for url in (
+            "ftp://example.com/x",
+            "http://127.0.0.1/admin",
+            "http://192.168.1.1/",
+            "http://10.0.0.5/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/",
+            "http://0.0.0.0/",
+        ):
+            self.assertFalse(documents.is_safe_public_url(url), url)
+
+    def test_public_literal_ip_is_allowed(self):
+        self.assertTrue(documents.is_safe_public_url("https://93.184.216.34/page"))
+
+    def test_hostname_resolution_decides_safety(self):
+        local = [(2, 1, 6, "", ("127.0.0.1", 0))]
+        public = [(2, 1, 6, "", ("93.184.216.34", 0))]
+        with patch.object(documents.socket, "getaddrinfo", return_value=local):
+            self.assertFalse(documents.is_safe_public_url("http://internal.test/"))
+        with patch.object(documents.socket, "getaddrinfo", return_value=public):
+            self.assertTrue(documents.is_safe_public_url("http://example.test/"))
+
+    async def test_extract_document_text_plain_and_unknown(self):
+        text = await documents.extract_document_text("txt", b"hello")
+        self.assertEqual(text, "hello")
+        self.assertIsNone(await documents.extract_document_text("zip", b"binary"))
+
+    async def test_pdf_extraction_uses_pdfplumber_when_available(self):
+        import sys
+
+        pdf = SimpleNamespace(
+            pages=[SimpleNamespace(extract_text=lambda: "Page text")]
+        )
+        context = MagicMock()
+        context.__enter__.return_value = pdf
+        fake_module = SimpleNamespace(open=lambda *a, **k: context)
+        with patch.dict(sys.modules, {"pdfplumber": fake_module}):
+            self.assertEqual(documents._extract_pdf(b"%PDF-fake"), "Page text")
+
+    async def test_pdf_extraction_is_graceful_without_pdfplumber(self):
+        import sys
+
+        with patch.dict(sys.modules, {"pdfplumber": None}):
+            self.assertIsNone(documents._extract_pdf(b"%PDF-fake"))
+
+    def test_clean_url_keeps_balanced_brackets(self):
+        self.assertEqual(
+            chat._clean_url("https://en.wikipedia.org/wiki/Foo_(bar)."),
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+        )
+        self.assertEqual(chat._clean_url("https://x.com/a,"), "https://x.com/a")
+        self.assertEqual(chat._clean_url("https://x.com/a)."), "https://x.com/a")
+
+    def test_document_context_uses_caption_or_default(self):
+        composed = chat._compose_document_context("r.pdf", "TEXT", "what is this?")
+        self.assertIn("[Document: r.pdf]", composed)
+        self.assertIn("User request: what is this?", composed)
+        composed = chat._compose_document_context("r.pdf", "TEXT", "   ")
+        self.assertIn(chat.DEFAULT_DOCUMENT_PROMPT, composed)
+
+    async def test_link_expansion_builds_context(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        page = documents.FetchedPage(
+            url="https://a.test/post", title="Post", text="Body text"
+        )
+        with (
+            patch.object(chat, "fetch_url_text", AsyncMock(return_value=page)),
+            patch.object(chat, "safe_answer", AsyncMock()),
+        ):
+            expanded = await chat._expand_links_with_content(
+                message, "Summarize https://a.test/post"
+            )
+        self.assertIn("[Web page: https://a.test/post]", expanded)
+        self.assertIn("Title: Post", expanded)
+        self.assertIn("Body text", expanded)
+        self.assertIn("User request: Summarize", expanded)
+
+    async def test_failed_fetch_keeps_original_text(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        original = "what is https://b.test/ ?"
+        with (
+            patch.object(chat, "fetch_url_text", AsyncMock(return_value=None)),
+            patch.object(chat, "safe_answer", AsyncMock()),
+        ):
+            expanded = await chat._expand_links_with_content(message, original)
+        self.assertEqual(expanded, original)
+
+    async def test_prose_with_links_is_not_expanded(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        text = "word " * 100 + "https://c.test/"
+        with patch.object(chat, "fetch_url_text", AsyncMock()) as fetch:
+            expanded = await chat._expand_links_with_content(message, text)
+        self.assertEqual(expanded, text)
+        fetch.assert_not_awaited()
+
+    async def test_unsupported_document_rejected_before_quota(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            document=SimpleNamespace(
+                file_name="archive.zip", mime_type="application/zip", file_size=10
+            ),
+        )
+        with (
+            patch.object(config, "enable_document_analysis", True),
+            patch.object(chat, "_is_addressed", return_value=True),
+            patch.object(chat, "safe_answer", AsyncMock()) as answer,
+            patch.object(chat, "_open_registered", AsyncMock()) as register,
+        ):
+            await chat._handle_document(message)
+        answer.assert_awaited_once()
+        register.assert_not_awaited()
+
+    async def test_oversized_document_rejected_before_quota(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            document=SimpleNamespace(
+                file_name="big.pdf",
+                mime_type="application/pdf",
+                file_size=50 * 1024 * 1024,
+            ),
+        )
+        with (
+            patch.object(config, "enable_document_analysis", True),
+            patch.object(config, "max_document_bytes", 10 * 1024 * 1024),
+            patch.object(chat, "_is_addressed", return_value=True),
+            patch.object(chat, "safe_answer", AsyncMock()) as answer,
+            patch.object(chat, "_open_registered", AsyncMock()) as register,
+        ):
+            await chat._handle_document(message)
+        answer.assert_awaited_once()
+        register.assert_not_awaited()
+
+
+class ReminderTests(unittest.IsolatedAsyncioTestCase):
+    """Offline checks for /remind parsing and schedule math (UTC forced)."""
+
+    NOW = datetime.datetime(2026, 10, 23, 12, 0, tzinfo=datetime.UTC)
+
+    def _parse(self, argument: str):
+        with (
+            patch.object(config, "reminder_timezone", "UTC"),
+            patch.object(config, "reminder_min_interval_minutes", 30),
+            patch.object(config, "reminder_ai_enabled", True),
+        ):
+            return reminder_service.parse_reminder(argument, now=self.NOW)
+
+    def test_in_minutes_creates_one_time_reminder(self):
+        parsed = self._parse("in 30 minutes check the oven")
+        self.assertIsInstance(parsed, reminder_service.ParsedReminder)
+        self.assertIsNone(parsed.schedule)
+        self.assertFalse(parsed.ai_mode)
+        self.assertEqual(parsed.text, "check the oven")
+        self.assertEqual(parsed.fire_at, self.NOW + datetime.timedelta(minutes=30))
+
+    def test_at_time_uses_today_when_in_future(self):
+        parsed = self._parse("at 15:30 review")
+        self.assertEqual((parsed.fire_at.hour, parsed.fire_at.minute), (15, 30))
+        self.assertEqual(parsed.fire_at.date(), self.NOW.date())
+
+    def test_at_time_rolls_to_tomorrow_when_passed(self):
+        parsed = self._parse("at 9:00 standup")
+        tomorrow = (self.NOW + datetime.timedelta(days=1)).date()
+        self.assertEqual(parsed.fire_at.date(), tomorrow)
+
+    def test_tomorrow_at(self):
+        parsed = self._parse("tomorrow at 9:00 standup")
+        tomorrow = (self.NOW + datetime.timedelta(days=1)).date()
+        self.assertEqual(parsed.fire_at.date(), tomorrow)
+        self.assertEqual(parsed.fire_at.hour, 9)
+
+    def test_daily_schedule(self):
+        parsed = self._parse("daily at 10:00 drink water")
+        self.assertEqual(parsed.schedule, "daily:10:00")
+        self.assertEqual(parsed.text, "drink water")
+
+    def test_weekly_schedule(self):
+        parsed = self._parse("weekly mon at 10:00 report")
+        self.assertEqual(parsed.schedule, "weekly:0:10:00")
+        self.assertEqual(parsed.fire_at.weekday(), 0)
+
+    def test_every_interval_schedule(self):
+        parsed = self._parse("every 2 hours stretch")
+        self.assertEqual(parsed.schedule, "every:120")
+        self.assertEqual(parsed.fire_at, self.NOW + datetime.timedelta(hours=2))
+
+    def test_every_hour_schedule(self):
+        parsed = self._parse("every hour blink")
+        self.assertEqual(parsed.schedule, "every:60")
+
+    def test_too_frequent_interval_rejected(self):
+        error = self._parse("every 5 minutes poke")
+        self.assertIsInstance(error, str)
+        self.assertIn("Too often", error)
+
+    def test_ai_prefix_sets_mode(self):
+        parsed = self._parse("in 1 hour ai: summarize the news")
+        self.assertTrue(parsed.ai_mode)
+        self.assertEqual(parsed.text, "summarize the news")
+
+    def test_ai_mode_can_be_disabled(self):
+        with (
+            patch.object(config, "reminder_timezone", "UTC"),
+            patch.object(config, "reminder_ai_enabled", False),
+        ):
+            error = reminder_service.parse_reminder("in 1 hour ai: news", now=self.NOW)
+        self.assertIsInstance(error, str)
+        self.assertIn("disabled", error)
+
+    def test_missing_time_returns_help(self):
+        error = self._parse("check the oven")
+        self.assertIsInstance(error, str)
+        self.assertIn("Could not find a time", error)
+
+    def test_missing_text_returns_error(self):
+        error = self._parse("in 30 minutes")
+        self.assertIsInstance(error, str)
+        self.assertIn("Add the reminder text", error)
+
+    def test_invalid_time_rejected(self):
+        error = self._parse("at 25:99 meeting")
+        self.assertIsInstance(error, str)
+        self.assertIn("Invalid time", error)
+
+    def test_next_occurrence_interval_skips_missed_fires(self):
+        previous = self.NOW - datetime.timedelta(hours=5)
+        with patch.object(config, "reminder_timezone", "UTC"):
+            nxt = reminder_service.next_occurrence("every:60", previous, self.NOW)
+        self.assertGreater(nxt, self.NOW)
+        self.assertLessEqual((nxt - self.NOW).total_seconds(), 3600)
+
+    def test_next_occurrence_daily(self):
+        with patch.object(config, "reminder_timezone", "UTC"):
+            nxt = reminder_service.next_occurrence("daily:10:00", self.NOW, self.NOW)
+        self.assertEqual((nxt.hour, nxt.minute), (10, 0))
+        tomorrow = (self.NOW + datetime.timedelta(days=1)).date()
+        self.assertEqual(nxt.date(), tomorrow)
+
+    def test_broken_schedule_returns_none(self):
+        self.assertIsNone(
+            reminder_service.next_occurrence("nonsense", self.NOW, self.NOW)
+        )
+        self.assertIsNone(
+            reminder_service.next_occurrence("every:0", self.NOW, self.NOW)
+        )
+
+    def test_describe_schedule(self):
+        self.assertEqual(reminder_service.describe_schedule(None), "one-time")
+        self.assertEqual(reminder_service.describe_schedule("every:120"), "every 2 h")
+        self.assertEqual(reminder_service.describe_schedule("every:30"), "every 30 min")
+        self.assertEqual(
+            reminder_service.describe_schedule("every:2880"), "every 2 day(s)"
+        )
+        self.assertEqual(
+            reminder_service.describe_schedule("daily:09:00"), "daily at 09:00"
+        )
+        self.assertEqual(
+            reminder_service.describe_schedule("weekly:0:10:00"),
+            "weekly on Mon at 10:00",
+        )
+
+    async def test_fire_text_reminder_sends_message(self):
+        due = reminder_service.DueReminder(
+            id=1, user_id=1, chat_id=42, text="check oven",
+            ai_mode=False, schedule=None,
+        )
+        fake_bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(reminder_service, "bot", fake_bot):
+            await reminder_service.fire_reminder(due)
+        fake_bot.send_message.assert_awaited_once()
+        args = fake_bot.send_message.call_args.args
+        self.assertEqual(args[0], 42)
+        self.assertIn("check oven", args[1])
+
+
+class PersonaTests(unittest.IsolatedAsyncioTestCase):
+    """AI personality presets: parsing, active detection and the keyboard."""
+
+    def test_builtin_personas_are_present(self):
+        for key in ("assistant", "programmer", "writer", "scientist",
+                    "teacher", "translator", "critic", "friend"):
+            self.assertIn(key, DEFAULT_PERSONAS)
+            self.assertTrue(DEFAULT_PERSONAS[key]["name"])
+            self.assertTrue(DEFAULT_PERSONAS[key]["prompt"])
+
+    def test_assistant_persona_matches_default_system_prompt(self):
+        # So a fresh user (default prompt) shows the "assistant" persona active.
+        self.assertEqual(
+            DEFAULT_PERSONAS["assistant"]["prompt"],
+            DEFAULT_SYSTEM_PROMPT_TEXT,
+        )
+        self.assertIn("русском", DEFAULT_SYSTEM_PROMPT_TEXT)
+
+    def test_parse_personas_empty_returns_builtins(self):
+        result = _parse_personas("")
+        self.assertEqual(set(result), set(DEFAULT_PERSONAS))
+
+    def test_parse_personas_string_shorthand(self):
+        result = _parse_personas('{"pirate": "Talk like a pirate."}')
+        self.assertIn("pirate", result)
+        self.assertEqual(result["pirate"]["prompt"], "Talk like a pirate.")
+        self.assertEqual(result["pirate"]["name"], "Pirate")
+        # Built-ins survive.
+        self.assertIn("assistant", result)
+
+    def test_parse_personas_object_form_with_name(self):
+        raw = '{"pirate": {"name": "🏴‍☠️ Pirate", "prompt": "Arr!"}}'
+        result = _parse_personas(raw)
+        self.assertEqual(result["pirate"]["name"], "🏴‍☠️ Pirate")
+        self.assertEqual(result["pirate"]["prompt"], "Arr!")
+
+    def test_parse_personas_overrides_builtin(self):
+        raw = '{"friend": {"name": "🤝 Buddy", "prompt": "Be a buddy."}}'
+        result = _parse_personas(raw)
+        self.assertEqual(result["friend"]["name"], "🤝 Buddy")
+        self.assertEqual(result["friend"]["prompt"], "Be a buddy.")
+
+    def test_parse_personas_invalid_json_keeps_builtins(self):
+        result = _parse_personas("{not json")
+        self.assertEqual(set(result), set(DEFAULT_PERSONAS))
+
+    def test_parse_personas_skips_promptless_entries(self):
+        result = _parse_personas('{"bad": {}, "good": "ok prompt"}')
+        self.assertNotIn("bad", result)
+        self.assertIn("good", result)
+
+    def test_active_persona_name_matches_and_custom(self):
+        with patch.object(config, "personas", _parse_personas("")):
+            self.assertEqual(
+                prompt._active_persona_name(DEFAULT_PERSONAS["programmer"]["prompt"]),
+                "👨‍💻 Программист",
+            )
+            self.assertEqual(prompt._active_persona_name("my own prompt"), "Custom")
+
+    def test_keyboard_marks_current_persona(self):
+        personas = _parse_personas("")
+        markup = get_persona_keyboard(personas, DEFAULT_PERSONAS["writer"]["prompt"])
+        texts = [btn.text for row in markup.inline_keyboard for btn in row]
+        writer_button = next(t for t in texts if "Писатель" in t)
+        programmer_button = next(t for t in texts if "Программист" in t)
+        self.assertTrue(writer_button.endswith("✓"))
+        self.assertFalse(programmer_button.endswith("✓"))
+
+    async def test_cmd_persona_shows_current_and_keyboard(self):
+        fake_service = SimpleNamespace(
+            get_user_settings=AsyncMock(return_value={
+                "system_prompt": DEFAULT_PERSONAS["writer"]["prompt"],
+                "model": "m", "temperature": 0.7, "max_tokens": 100,
+            })
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield fake_service
+
+        message = SimpleNamespace(from_user=SimpleNamespace(id=7), answer=AsyncMock())
+        with (
+            patch.object(config, "personas", _parse_personas("")),
+            patch.object(prompt, "user_service", fake_user_service),
+        ):
+            await prompt.cmd_persona(message)
+        message.answer.assert_awaited_once()
+        text = message.answer.call_args.args[0]
+        self.assertIn("Писатель", text)
+        self.assertIsNotNone(message.answer.call_args.kwargs.get("reply_markup"))
+
+    async def test_cb_persona_sets_system_prompt(self):
+        fake_service = SimpleNamespace(set_system_prompt=AsyncMock())
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield fake_service
+
+        callback = SimpleNamespace(
+            data="persona:programmer",
+            from_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+        with (
+            patch.object(config, "personas", _parse_personas("")),
+            patch.object(prompt, "user_service", fake_user_service),
+            patch.object(prompt, "safe_answer_callback", AsyncMock()) as ans,
+            patch.object(prompt, "safe_edit_text", AsyncMock(return_value=True)),
+        ):
+            await prompt.cb_persona(callback)
+        fake_service.set_system_prompt.assert_awaited_once()
+        args = fake_service.set_system_prompt.call_args.args
+        self.assertEqual(args[0], 7)
+        self.assertEqual(args[1], DEFAULT_PERSONAS["programmer"]["prompt"])
+        ans.assert_awaited()
+
+    async def test_cb_persona_unknown_key_alerts(self):
+        callback = SimpleNamespace(
+            data="persona:doesnotexist",
+            from_user=SimpleNamespace(id=7),
+            message=None,
+        )
+        with (
+            patch.object(config, "personas", _parse_personas("")),
+            patch.object(prompt, "safe_answer_callback", AsyncMock()) as ans,
+        ):
+            await prompt.cb_persona(callback)
+        self.assertTrue(ans.call_args.kwargs.get("show_alert"))
+
+
+class StickerTests(unittest.IsolatedAsyncioTestCase):
+    """Sticker generation: WebP conversion, the client method and the sender."""
+
+    @staticmethod
+    def _png_bytes(width: int, height: int) -> bytes:
+        """A real RGBA PNG of the given size (Pillow is a declared dependency)."""
+        import io
+
+        from PIL import Image
+
+        image = Image.new("RGBA", (width, height), (255, 0, 0, 255))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    @staticmethod
+    def _open(data: bytes):
+        import io
+
+        from PIL import Image
+
+        return Image.open(io.BytesIO(data))
+
+    def test_sticker_tool_definition(self):
+        from bot.services.ai_client import STICKER_TOOL
+
+        self.assertEqual(STICKER_TOOL["function"]["name"], "generate_sticker")
+        props = STICKER_TOOL["function"]["parameters"]["properties"]
+        self.assertIn("prompt", props)
+
+    def test_to_sticker_webp_square(self):
+        from bot.services.ai_client import (
+            STICKER_MAX_BYTES,
+            STICKER_SIZE,
+            to_sticker_webp,
+        )
+
+        webp = to_sticker_webp(self._png_bytes(1024, 1024))
+        self.assertIsNotNone(webp)
+        self.assertLessEqual(len(webp), STICKER_MAX_BYTES)
+        image = self._open(webp)
+        self.assertEqual(image.format, "WEBP")
+        self.assertEqual(image.size, (STICKER_SIZE, STICKER_SIZE))
+
+    def test_to_sticker_webp_center_crops_nonsquare(self):
+        from bot.services.ai_client import to_sticker_webp
+
+        webp = to_sticker_webp(self._png_bytes(800, 400))
+        self.assertIsNotNone(webp)
+        self.assertEqual(self._open(webp).size, (512, 512))
+
+    def test_to_sticker_webp_invalid_returns_none(self):
+        from bot.services.ai_client import to_sticker_webp
+
+        self.assertIsNone(to_sticker_webp(b"definitely not an image"))
+
+    async def test_generate_sticker_converts_to_webp(self):
+        from bot.services.ai_client import AIClient, ImageResult
+
+        client = AIClient(api_key="test-key")
+        png = self._png_bytes(768, 768)
+        source = ImageResult(url="http://x/img.png", data=png, elapsed=1.0)
+        with patch.object(
+            client, "generate_image_result", AsyncMock(return_value=source)
+        ):
+            result = await client.generate_sticker("a cat")
+        self.assertIsNotNone(result.data)
+        image = self._open(result.data)
+        self.assertEqual(image.format, "WEBP")
+        self.assertEqual(image.size, (512, 512))
+
+    async def test_generate_sticker_none_when_generation_fails(self):
+        from bot.services.ai_client import AIClient, ImageResult
+
+        client = AIClient(api_key="test-key")
+        empty = ImageResult(url=None, data=None, elapsed=0.5)
+        with patch.object(
+            client, "generate_image_result", AsyncMock(return_value=empty)
+        ):
+            result = await client.generate_sticker("a cat")
+        self.assertIsNone(result.data)
+
+    async def test_generate_and_send_sticker_sends_webp(self):
+        from bot.services.ai_client import ImageResult
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1),
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+            answer_sticker=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        webp = ImageResult(url="u", data=b"RIFF\x00\x00\x00\x00WEBP", elapsed=1.0)
+        with (
+            patch.object(chat, "waiting", no_wait),
+            patch.object(chat, "throttle", SimpleNamespace(wait=AsyncMock())),
+            patch.object(
+                chat.ai_client, "generate_sticker", AsyncMock(return_value=webp)
+            ),
+        ):
+            ok = await chat.generate_and_send_sticker(message, "a cat")
+        self.assertTrue(ok)
+        message.answer_sticker.assert_awaited_once()
+
+    async def test_generate_and_send_sticker_failure_message(self):
+        from bot.services.ai_client import ImageResult
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1),
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+            answer_sticker=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        failed = ImageResult(url=None, data=None, elapsed=0.5)
+        with (
+            patch.object(chat, "waiting", no_wait),
+            patch.object(chat, "throttle", SimpleNamespace(wait=AsyncMock())),
+            patch.object(
+                chat.ai_client, "generate_sticker", AsyncMock(return_value=failed)
+            ),
+            patch.object(chat, "safe_answer", AsyncMock()) as answer,
+        ):
+            ok = await chat.generate_and_send_sticker(message, "a cat")
+        self.assertFalse(ok)
+        message.answer_sticker.assert_not_awaited()
+        answer.assert_awaited_once()
+
+
+class WebSearchTests(unittest.IsolatedAsyncioTestCase):
+    """Web search (RAG): provider parsing, tool exchange and the round loop."""
+
+    def test_search_tool_definition(self):
+        self.assertEqual(search.SEARCH_TOOL["function"]["name"], "search_web")
+        props = search.SEARCH_TOOL["function"]["parameters"]["properties"]
+        self.assertIn("query", props)
+
+    def test_search_configured_requires_key_and_provider(self):
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", ""),
+        ):
+            self.assertFalse(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "tvly-test"),
+        ):
+            self.assertTrue(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", False),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "tvly-test"),
+        ):
+            self.assertFalse(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "unknown"),
+            patch.object(config, "search_api_key", "k"),
+        ):
+            self.assertFalse(search.search_configured())
+
+    def test_format_search_results_numbered(self):
+        results = [
+            search.SearchResult(title="A", url="https://a.test", snippet="First"),
+            search.SearchResult(title="B", url="https://b.test", snippet="Second"),
+        ]
+        text = search.format_search_results("q", results)
+        self.assertIn("[1] A", text)
+        self.assertIn("URL: https://a.test", text)
+        self.assertIn("[2] B", text)
+        self.assertIn("[n]", text)  # citation instruction
+
+    def test_format_search_results_empty(self):
+        text = search.format_search_results("q", [])
+        self.assertIn("не дал результатов", text)
+
+    async def test_search_tavily_parses_results(self):
+        payload = {
+            "results": [
+                {"title": "T", "url": "https://t.test", "content": "C", "score": 0.9},
+                {"title": "skip-me"},  # no url -> skipped
+            ]
+        }
+        with (
+            patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_url", ""),
+            patch.object(
+                search, "_request_json", AsyncMock(return_value=payload)
+            ) as req,
+        ):
+            results = await search.search_web("query", 5)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title, "T")
+        self.assertEqual(results[0].url, "https://t.test")
+        self.assertEqual(results[0].snippet, "C")
+        # The API key is sent in a header, never logged in the JSON payload.
+        self.assertNotIn("api_key", req.call_args.kwargs.get("json_payload", {}))
+
+    async def test_search_brave_parses_results(self):
+        payload = {
+            "web": {
+                "results": [
+                    {"title": "B", "url": "https://b.test", "description": "D"}
+                ]
+            }
+        }
+        with (
+            patch.object(config, "search_provider", "brave"),
+            patch.object(config, "search_api_key", "BSAkey"),
+            patch.object(search, "_request_json", AsyncMock(return_value=payload)),
+        ):
+            results = await search.search_web("q")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].snippet, "D")
+
+    async def test_search_failure_returns_empty(self):
+        with (
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "k"),
+            patch.object(search, "_request_json", AsyncMock(return_value=None)),
+        ):
+            self.assertEqual(await search.search_web("q"), [])
+
+    async def test_unknown_provider_returns_empty(self):
+        with patch.object(config, "search_provider", "nope"):
+            self.assertEqual(await search.search_web("q"), [])
+
+    def test_tool_exchange_message_shapes(self):
+        result = ChatResult(content="thinking…")
+        calls = [ToolCall(id="c1", name="search_web", arguments={"query": "q"})]
+        assistant = search.build_assistant_tool_message(result.content, calls)
+        self.assertEqual(assistant["role"], "assistant")
+        self.assertEqual(assistant["content"], "thinking…")
+        self.assertEqual(assistant["tool_calls"][0]["id"], "c1")
+        self.assertEqual(
+            assistant["tool_calls"][0]["function"]["name"], "search_web"
+        )
+        response = search.build_tool_response("c1", "results")
+        self.assertEqual(
+            response, {"role": "tool", "tool_call_id": "c1", "content": "results"}
+        )
+
+    def test_apply_search_hint_once(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            {"role": "user", "content": "hi"},
+        ]
+        search.apply_search_hint(messages)
+        search.apply_search_hint(messages)  # idempotent
+        self.assertEqual(
+            messages[0]["content"].count(search.SEARCH_SYSTEM_HINT), 1
+        )
+        self.assertEqual(messages[1]["content"], "hi")
+
+    async def test_resolve_search_round_appends_tool_exchange(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "weather?"},
+        ]
+        call = ToolCall(id="c1", name="search_web", arguments={"query": "weather"})
+        result = ChatResult(content=None, tool_calls=[call])
+        fake = [search.SearchResult(title="W", url="https://w.test", snippet="Sunny")]
+        with (
+            patch.object(chat, "search_web", AsyncMock(return_value=fake)) as sw,
+            patch.object(chat, "safe_answer", AsyncMock()) as notice,
+        ):
+            await chat._resolve_search_round(message, messages, result, [call])
+        sw.assert_awaited_once()
+        self.assertEqual(messages[-2]["role"], "assistant")
+        self.assertIn("tool_calls", messages[-2])
+        self.assertEqual(messages[-1]["role"], "tool")
+        self.assertEqual(messages[-1]["tool_call_id"], "c1")
+        self.assertIn("https://w.test", messages[-1]["content"])
+        notice.assert_awaited_once()
+
+    async def test_resolve_search_round_empty_query_skips_search(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        messages = []
+        call = ToolCall(id="c2", name="search_web", arguments={})
+        result = ChatResult(content=None, tool_calls=[call])
+        with (
+            patch.object(chat, "search_web", AsyncMock()) as sw,
+            patch.object(chat, "safe_answer", AsyncMock()) as notice,
+        ):
+            await chat._resolve_search_round(message, messages, result, [call])
+        sw.assert_not_awaited()
+        notice.assert_not_awaited()
+        self.assertEqual(messages[-1]["role"], "tool")
+        self.assertIn("не дал результатов", messages[-1]["content"])
+
+    async def test_answer_with_ai_runs_search_loop(self):
+        """End-to-end: model asks to search -> results fed back -> answer."""
+        from bot.services.access import AccessResult
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"),
+            from_user=SimpleNamespace(id=1),
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        service = SimpleNamespace(
+            get_user_settings=AsyncMock(return_value={
+                "model": "m", "system_prompt": "sys",
+                "temperature": 0.5, "max_tokens": 100,
+            }),
+            get_history=AsyncMock(return_value=[]),
+            add_message=AsyncMock(),
+        )
+        access = AccessResult(allowed=True, role="admin", consumed=False)
+
+        search_result = ChatResult(
+            content=None,
+            tool_calls=[
+                ToolCall(id="c1", name="search_web", arguments={"query": "news"})
+            ],
+            elapsed=1.0,
+        )
+        final_result = ChatResult(content="Here is the news [1].", elapsed=2.0)
+        fake_hits = [
+            search.SearchResult(title="N", url="https://n.test", snippet="News")
+        ]
+
+        with (
+            patch.object(config, "stream_responses", False),
+            patch.object(config, "enable_image_generation", False),
+            patch.object(config, "enable_sticker_generation", False),
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "max_search_rounds", 2),
+            patch.object(chat, "waiting", no_wait),
+            patch.object(
+                chat, "_single_shot",
+                AsyncMock(side_effect=[search_result, final_result]),
+            ) as single,
+            patch.object(chat, "search_web", AsyncMock(return_value=fake_hits)) as sw,
+            patch.object(chat, "deliver_answer", AsyncMock(return_value=True)) as deliver,
+            patch.object(chat, "safe_answer", AsyncMock()),
+            patch.object(chat, "guest_hint", return_value=None),
+            patch.object(chat, "_retry_markup", return_value=None),
+        ):
+            await chat._answer_with_ai(message, service, "what's the news?", access)
+
+        sw.assert_awaited_once()
+        self.assertEqual(single.await_count, 2)
+        # The second request carried the tool exchange (assistant + tool msgs).
+        second_messages = single.call_args_list[1].args[0]
+        roles = [m.get("role") for m in second_messages]
+        self.assertIn("tool", roles)
+        deliver.assert_awaited_once()
+        self.assertIn("Here is the news", deliver.call_args.args[2])
+
+    async def test_answer_with_ai_no_search_tool_without_key(self):
+        """Backward compat: no key -> the model is not offered search_web."""
+        from bot.services.access import AccessResult
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=2, type="private"),
+            from_user=SimpleNamespace(id=2),
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        service = SimpleNamespace(
+            get_user_settings=AsyncMock(return_value={
+                "model": "m", "system_prompt": "sys",
+                "temperature": 0.5, "max_tokens": 100,
+            }),
+            get_history=AsyncMock(return_value=[]),
+            add_message=AsyncMock(),
+        )
+        access = AccessResult(allowed=True, role="admin", consumed=False)
+        final_result = ChatResult(content="plain answer", elapsed=1.0)
+
+        with (
+            patch.object(config, "stream_responses", False),
+            patch.object(config, "enable_image_generation", False),
+            patch.object(config, "enable_sticker_generation", False),
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_api_key", ""),  # no key
+            patch.object(chat, "waiting", no_wait),
+            patch.object(
+                chat, "_single_shot", AsyncMock(return_value=final_result)
+            ) as single,
+            patch.object(chat, "deliver_answer", AsyncMock(return_value=True)),
+            patch.object(chat, "guest_hint", return_value=None),
+            patch.object(chat, "_retry_markup", return_value=None),
+        ):
+            await chat._answer_with_ai(message, service, "hi", access)
+
+        single.assert_awaited_once()
+        tools_arg = single.call_args.args[3]
+        # No tools at all when image/sticker off and search unconfigured.
+        self.assertIsNone(tools_arg)
+
+
+class ExportTests(unittest.IsolatedAsyncioTestCase):
+    """Conversation export: Markdown/PDF rendering and the handlers."""
+
+    @staticmethod
+    def _entries() -> list:
+        return [
+            export_service.ExportEntry(role="user", content="Привет!"),
+            export_service.ExportEntry(
+                role="assistant", content="**Ответ** с `кодом`", model="qwen3.8-flash"
+            ),
+        ]
+
+    def test_render_markdown_structure(self):
+        md = export_service.render_markdown(
+            self._entries(), title="Export Test", meta=["Scope: test"]
+        )
+        self.assertIn("# Export Test", md)
+        self.assertIn("- Scope: test", md)
+        self.assertIn("## 👤 User", md)
+        self.assertIn("## 🤖 Assistant", md)
+        self.assertIn("Привет!", md)
+        self.assertIn("**Ответ** с `кодом`", md)  # content stays Markdown
+        self.assertIn("qwen3.8-flash", md)
+        self.assertIn("Exported from Kapum ChatBot", md)
+
+    def test_strip_inline_markdown(self):
+        self.assertEqual(export_service._strip_inline("**bold**"), "bold")
+        self.assertEqual(export_service._strip_inline("__bold__"), "bold")
+        self.assertEqual(export_service._strip_inline("*it*"), "it")
+        self.assertEqual(export_service._strip_inline("`code`"), "code")
+        self.assertEqual(export_service._strip_inline("~~x~~"), "x")
+        self.assertEqual(
+            export_service._strip_inline("[docs](https://d.test)"),
+            "docs (https://d.test)",
+        )
+
+    def test_pdf_safe_keeps_cyrillic_drops_emoji(self):
+        cleaned = export_service._pdf_safe("Привет **мир** 😀 → α")
+        self.assertIn("Привет", cleaned)
+        self.assertIn("мир", cleaned)
+        self.assertIn("→", cleaned)  # arrows stay — DejaVu covers them
+        self.assertIn("α", cleaned)
+        self.assertNotIn("😀", cleaned)
+        self.assertNotIn("**", cleaned)
+
+    def test_render_pdf_produces_pdf_bytes(self):
+        if not export_service.pdf_available():
+            self.skipTest("fpdf2 or Unicode fonts unavailable")
+        data = export_service.render_pdf(
+            self._entries(), title="Тест", meta=["Scope: answer"]
+        )
+        self.assertIsNotNone(data)
+        self.assertTrue(data.startswith(b"%PDF-"))
+
+    def test_render_pdf_without_fpdf_returns_none(self):
+        import sys
+
+        with patch.dict(sys.modules, {"fpdf": None}):
+            self.assertIsNone(
+                export_service.render_pdf(self._entries(), title="T", meta=[])
+            )
+
+    def test_render_file_falls_back_to_markdown(self):
+        with patch.object(export_service, "render_pdf", return_value=None):
+            result = export_service.render_file(
+                "pdf", self._entries(), title="T", meta=["m"]
+            )
+        self.assertIsNotNone(result)
+        data, filename, mime = result
+        self.assertTrue(filename.endswith(".md"))
+        self.assertEqual(mime, "text/markdown")
+        self.assertIn(b"# T", data)
+
+    def test_entries_from_messages_reads_row_attributes(self):
+        rows = [
+            SimpleNamespace(role="user", content="q", created_at=None, model=None),
+            SimpleNamespace(role="assistant", content="a", created_at=None, model="m1"),
+        ]
+        entries = export_service.entries_from_messages(rows)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[1].model, "m1")
+
+    def test_answer_keyboard_buttons(self):
+        markup = get_answer_keyboard(42, ask_other=True)
+        data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        self.assertIn("expans:pdf:42", data)
+        self.assertIn("expans:md:42", data)
+        self.assertIn("askother", data)
+
+    def test_answer_keyboard_none_when_nothing_enabled(self):
+        self.assertIsNone(get_answer_keyboard(None, ask_other=False))
+
+    async def test_cmd_export_without_arg_offers_formats(self):
+        message = SimpleNamespace(
+            text="/export", from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(config, "enable_export", True),
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+        ):
+            await export_handler.cmd_export(message)
+        ans.assert_awaited_once()
+        self.assertIsNotNone(ans.call_args.kwargs.get("reply_markup"))
+
+    async def test_cmd_export_disabled(self):
+        message = SimpleNamespace(
+            text="/export", from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(config, "enable_export", False),
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+        ):
+            await export_handler.cmd_export(message)
+        self.assertIn("disabled", ans.call_args.args[1])
+
+    async def test_cmd_export_md_sends_document(self):
+        message = SimpleNamespace(
+            text="/export md", from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+        )
+        rows = [
+            SimpleNamespace(role="user", content="q", created_at=None, model=None),
+            SimpleNamespace(role="assistant", content="a", created_at=None, model="m"),
+        ]
+        service = SimpleNamespace(get_export_history=AsyncMock(return_value=rows))
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(config, "enable_export", True),
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "_send_document", AsyncMock(return_value=True)
+            ) as send,
+        ):
+            await export_handler.cmd_export(message)
+        send.assert_awaited_once()
+        self.assertTrue(send.call_args.args[2].endswith(".md"))
+
+    async def test_export_history_empty_sends_notice(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        service = SimpleNamespace(get_export_history=AsyncMock(return_value=[]))
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+            patch.object(export_handler, "_send_document", AsyncMock()) as send,
+        ):
+            await export_handler._export_history(message, "md", 1)
+        ans.assert_awaited_once()
+        send.assert_not_awaited()
+
+    async def test_single_answer_export_owner_check(self):
+        callback = SimpleNamespace(
+            data="expans:md:999", from_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(chat=SimpleNamespace(id=7)),
+        )
+        service = SimpleNamespace(
+            get_message_for_export=AsyncMock(return_value=None)
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(config, "enable_export", True),
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "safe_answer_callback", AsyncMock()
+            ) as ans,
+        ):
+            await export_handler.cb_export_answer(callback)
+        self.assertTrue(ans.call_args.kwargs.get("show_alert"))
+
+    async def test_single_answer_export_sends_file(self):
+        callback = SimpleNamespace(
+            data="expans:md:5", from_user=SimpleNamespace(id=7),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=7), answer_document=AsyncMock()
+            ),
+        )
+        answer_row = SimpleNamespace(
+            role="assistant", content="The answer", created_at=None,
+            model="m", chat_id=7, user_id=7, id=5,
+        )
+        question_row = SimpleNamespace(
+            role="user", content="The question", created_at=None
+        )
+        service = SimpleNamespace(
+            get_message_for_export=AsyncMock(return_value=answer_row),
+            get_question_for=AsyncMock(return_value=question_row),
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(config, "enable_export", True),
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(export_handler, "safe_answer_callback", AsyncMock()),
+        ):
+            await export_handler.cb_export_answer(callback)
+        callback.message.answer_document.assert_awaited_once()
 
 
 if __name__ == "__main__":

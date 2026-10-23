@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
-from bot.database.repository import MessageRepository, UserRepository
+from bot.database.models import Message, Reminder
+from bot.database.repository import (
+    MessageRepository,
+    ReminderRepository,
+    UserRepository,
+)
 
 
 class UserService:
@@ -15,6 +22,7 @@ class UserService:
         self.session = session
         self.user_repo = UserRepository(session)
         self.message_repo = MessageRepository(session)
+        self.reminder_repo = ReminderRepository(session)
 
     # --- Users -------------------------------------------------------------
 
@@ -74,9 +82,13 @@ class UserService:
         content: str,
         image_url: str | None = None,
         model: str | None = None,
-    ) -> None:
-        """Save a message to the database."""
-        await self.message_repo.add_message(
+    ) -> Message | None:
+        """Save a message to the database and return the stored row.
+
+        The returned row carries the database id, which the per-answer export
+        buttons embed in their callback data.
+        """
+        saved = await self.message_repo.add_message(
             chat_id=chat_id,
             user_id=user_id,
             role=role,
@@ -85,6 +97,7 @@ class UserService:
             model=model,
         )
         await self.session.commit()
+        return saved
 
     async def get_history(
         self, chat_id: int, limit: int | None = None, user_id: int | None = None
@@ -98,6 +111,40 @@ class UserService:
         """Clear the messages of a conversation (only ``user_id``'s when given)."""
         await self.message_repo.clear_history(chat_id, user_id=user_id)
         await self.session.commit()
+
+    # --- Export ----------------------------------------------------------------
+
+    async def get_message_for_export(
+        self, message_id: int, user_id: int
+    ) -> Message | None:
+        """One stored message, but only when it belongs to ``user_id``.
+
+        The owner check lives here so a callback with a guessed id can never
+        export somebody else's answer.
+        """
+        message = await self.message_repo.get_message(message_id)
+        if message is None or message.user_id != user_id:
+            return None
+        return message
+
+    async def get_question_for(self, answer: Message) -> Message | None:
+        """The user message that preceded ``answer`` in the same thread."""
+        if answer.chat_id is None:
+            return None
+        return await self.message_repo.get_previous_user_message(
+            answer.chat_id, answer.user_id, answer.id
+        )
+
+    async def get_export_history(
+        self, chat_id: int, user_id: int, limit: int | None = None
+    ) -> list[Message]:
+        """The user's thread in ``chat_id`` (oldest first) for /export."""
+        rows = await self.message_repo.get_messages_for_export(
+            chat_id, user_id, limit or config.export_max_messages
+        )
+        # Detach: attributes stay loaded after the session closes.
+        await self.session.commit()
+        return rows
 
     # --- Guest access ------------------------------------------------------
 
@@ -128,6 +175,39 @@ class UserService:
         """Get the number of remaining free-trial messages for a guest."""
         used = await self.get_guest_messages_used(telegram_id)
         return max(0, config.guest_message_limit - used)
+
+    # --- Reminders -----------------------------------------------------------
+
+    async def count_reminders(
+        self, telegram_id: int, *, recurring: bool | None = None
+    ) -> int:
+        """Count a user's enabled reminders (all / one-time / recurring)."""
+        return await self.reminder_repo.count(telegram_id, recurring=recurring)
+
+    async def add_reminder(self, reminder: Reminder) -> Reminder:
+        """Persist a new reminder and return it (with its assigned id)."""
+        created = await self.reminder_repo.add(reminder)
+        await self.session.commit()
+        return created
+
+    async def list_reminders(self, telegram_id: int) -> list[Reminder]:
+        """All enabled reminders of a user, soonest first."""
+        reminders = await self.reminder_repo.list_by_user(telegram_id)
+        # Detach the plain data before the session closes.
+        await self.session.commit()
+        return reminders
+
+    async def delete_reminder(self, reminder_id: int, telegram_id: int) -> bool:
+        """Delete one reminder; True when it existed and belonged to the user."""
+        deleted = await self.reminder_repo.delete(reminder_id, telegram_id)
+        await self.session.commit()
+        return deleted
+
+    async def delete_all_reminders(self, telegram_id: int) -> int:
+        """Delete every reminder of a user; returns how many were removed."""
+        count = await self.reminder_repo.delete_all(telegram_id)
+        await self.session.commit()
+        return count
 
     # --- Statistics --------------------------------------------------------
 
@@ -176,6 +256,10 @@ class UserService:
     async def is_allowed_user(self, telegram_id: int) -> bool:
         """Check if a user is in the allowed list."""
         return await self.user_repo.is_allowed_user(telegram_id)
+
+    async def get_all_user_ids(self) -> list[int]:
+        """Return the Telegram IDs of every registered user (for broadcasts)."""
+        return await self.user_repo.get_all_user_ids()
 
     # --- Daily usage -------------------------------------------------------
 
@@ -230,3 +314,27 @@ class UserService:
     async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
         """Get total usage for a specific user over the last 14 days."""
         return await self.user_repo.get_user_total_usage_last_14_days(telegram_id)
+
+
+@asynccontextmanager
+async def user_service() -> AsyncIterator[UserService]:
+    """Yield a :class:`UserService` bound to a short-lived database session.
+
+    Replaces the repeated boilerplate::
+
+        async with async_session_factory() as session:
+            service = UserService(session)
+            ...
+
+    with::
+
+        async with user_service() as service:
+            ...
+
+    The import of the session factory is local to avoid a circular import
+    (``bot.database.session`` must not import this module at load time).
+    """
+    from bot.database.session import async_session_factory
+
+    async with async_session_factory() as session:
+        yield UserService(session)

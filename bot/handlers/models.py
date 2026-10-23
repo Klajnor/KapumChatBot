@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import html
 
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.database.session import async_session_factory
 from bot.keyboards.inline import get_model_selection_keyboard
 from bot.services.ai_client import ai_client, is_vision_model
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 router = Router()
 
@@ -37,8 +36,7 @@ async def cmd_model(message: Message) -> None:
     if user is None:
         return
 
-    async with async_session_factory() as session:
-        service = UserService(session)
+    async with user_service() as service:
         settings = await service.get_user_settings(user.id)
 
     await message.answer(
@@ -65,8 +63,7 @@ async def cb_model_selected(callback: CallbackQuery) -> None:
 
     model_name = available[model_id]
 
-    async with async_session_factory() as session:
-        service = UserService(session)
+    async with user_service() as service:
         await service.set_model(callback.from_user.id, model_id)
 
     vision = "\n🖼️ Supports images (vision)." if is_vision_model(model_id) else ""

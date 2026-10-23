@@ -1,56 +1,88 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.config import config
-from bot.database.session import async_session_factory
-from bot.handlers.chat import generate_and_send_image
+from bot.handlers.chat import generate_and_send_image, generate_and_send_sticker
 from bot.services import limits
 from bot.services.access import check_access, guest_hint, refund_access
 from bot.services.themed_responses import get_random_themed_response
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
+# A sender produces the media from a prompt and sends it, returning True on
+# success. Both image and sticker generators share this shape.
+Sender = Callable[..., Awaitable[bool]]
+
 
 @router.message(Command("image"))
 async def cmd_image(message: Message) -> None:
     """Handle /image <prompt> — generate an image and send it."""
+    if not config.enable_image_generation:
+        await message.answer("🚫 <b>Image generation is disabled.</b>")
+        return
+    await _handle_generation_command(
+        message,
+        generate_and_send_image,
+        usage=(
+            "🎨 <b>Generate an image</b>\n\n"
+            "Usage: <code>/image &lt;description&gt;</code>\n"
+            "Example: <code>/image a red fox in a snowy forest</code>"
+        ),
+    )
+
+
+@router.message(Command("sticker"))
+async def cmd_sticker(message: Message) -> None:
+    """Handle /sticker <prompt> — generate a Telegram sticker and send it."""
+    if not config.enable_sticker_generation:
+        await message.answer("🚫 <b>Sticker generation is disabled.</b>")
+        return
+    await _handle_generation_command(
+        message,
+        generate_and_send_sticker,
+        usage=(
+            "🎨 <b>Generate a sticker</b>\n\n"
+            "Usage: <code>/sticker &lt;description&gt;</code>\n"
+            "Example: <code>/sticker a smiling cat giving a thumbs up</code>\n\n"
+            "The result is a real 512×512 Telegram sticker you can save or "
+            "add to a sticker set."
+        ),
+    )
+
+
+async def _handle_generation_command(
+    message: Message, sender: Sender, *, usage: str
+) -> None:
+    """Shared body of /image and /sticker: validate, then generate under a slot."""
     user = message.from_user
     if user is None:
         return
 
-    if not config.enable_image_generation:
-        await message.answer("🚫 <b>Image generation is disabled.</b>")
-        return
-
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer(
-            "🎨 <b>Generate an image</b>\n\n"
-            "Usage: <code>/image &lt;description&gt;</code>\n"
-            "Example: <code>/image a red fox in a snowy forest</code>"
-        )
+        await message.answer(usage)
         return
 
     prompt = parts[1].strip()
-
     with limits.slot(user.id) as granted:
         if not granted:
             await message.answer(limits.BUSY_MESSAGE)
             return
-        await _generate(message, user, prompt)
+        await _generate(message, user, prompt, sender)
 
 
-async def _generate(message: Message, user, prompt: str) -> None:
-    async with async_session_factory() as session:
-        service = UserService(session)
+async def _generate(message: Message, user, prompt: str, sender: Sender) -> None:
+    """Register the user, check access, run ``sender`` and settle the quota."""
+    async with user_service() as service:
         await service.register_user(
             telegram_id=user.id,
             username=user.username,
@@ -64,7 +96,7 @@ async def _generate(message: Message, user, prompt: str) -> None:
             return
 
         settings = await service.get_user_settings(user.id)
-        sent = await generate_and_send_image(
+        sent = await sender(
             message,
             prompt,
             service=service,

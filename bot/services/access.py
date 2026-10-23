@@ -68,7 +68,11 @@ async def refund_access(service: UserService, telegram_id: int, result: AccessRe
 
 
 async def check_access(
-    service: UserService, telegram_id: int, *, consume: bool = True
+    service: UserService,
+    telegram_id: int,
+    *,
+    consume: bool = True,
+    require_quota: bool = True,
 ) -> AccessResult:
     """Check whether a user may query the bot, consuming quota when allowed.
 
@@ -77,16 +81,25 @@ async def check_access(
       * whitelisted users — ``config.daily_limit`` questions per day;
       * everyone else    — ``config.guest_message_limit`` free-trial messages
         (when guest access is enabled), otherwise denied.
+
+    ``consume=False`` performs the check without taking a quota unit.
+
+    ``require_quota=False`` (only meaningful with ``consume=False``) asks
+    "is this user *authorized* at all?" and ignores the remaining budget. Free
+    operations — creating or listing reminders — must use it, otherwise a user
+    who has spent today's questions is locked out of features that cost nothing.
     """
     if config.is_admin(telegram_id):
         return AccessResult(allowed=True, role="admin")
 
     if await service.is_allowed_user(telegram_id):
         remaining = await service.get_daily_usage_remaining(telegram_id)
+        if not consume:
+            if require_quota and remaining <= 0:
+                return _daily_limit_result()
+            return AccessResult(allowed=True, role="allowed", remaining=remaining)
         if remaining <= 0:
             return _daily_limit_result()
-        if not consume:
-            return AccessResult(allowed=True, role="allowed", remaining=remaining)
         used = await service.consume_daily_usage(telegram_id)
         if used is None:  # a parallel request took the last unit
             return _daily_limit_result()
@@ -99,10 +112,12 @@ async def check_access(
 
     if config.allow_guest_access:
         remaining = await service.get_guest_messages_remaining(telegram_id)
+        if not consume:
+            if require_quota and remaining <= 0:
+                return _guest_limit_result()
+            return AccessResult(allowed=True, role="guest", remaining=remaining)
         if remaining <= 0:
             return _guest_limit_result()
-        if not consume:
-            return AccessResult(allowed=True, role="guest", remaining=remaining)
         used = await service.consume_guest_message(telegram_id)
         if used is None:  # a parallel request took the last unit
             return _guest_limit_result()

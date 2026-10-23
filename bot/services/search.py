@@ -1,0 +1,289 @@
+"""Web search for RAG-style answers.
+
+The chat model receives a ``search_web`` tool (see :data:`SEARCH_TOOL`) and
+calls it when a question needs up-to-date information. The handler executes
+the call against the configured provider, feeds the formatted results back
+as a ``tool`` message and lets the model compose a cited answer
+(``bot/handlers/chat.py`` runs the multi-round loop).
+
+Supported providers (``SEARCH_PROVIDER``):
+
+* ``tavily`` — LLM-oriented search API (https://tavily.com, ``tvly-…`` keys);
+* ``brave``  — Brave Search API (``BSA…`` subscription tokens).
+
+Both speak plain HTTPS through aiohttp and need ``SEARCH_API_KEY``. Without a
+key the tool is simply not offered to the model and the bot behaves exactly
+as before. Result URLs are never fetched here — reading a specific page is
+the job of the link-analysis pipeline (``bot/services/documents.py``), which
+is SSRF-guarded.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
+
+import aiohttp
+
+from bot.config import config
+from bot.services.ai_client import ToolCall
+
+logger = logging.getLogger(__name__)
+
+# Providers with a built-in implementation.
+PROVIDERS = ("tavily", "brave")
+
+# Snippets are trimmed so one search cannot flood the model's context.
+_SNIPPET_CHARS = 700
+
+# Tool exposed to the chat model for live web search.
+SEARCH_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": (
+            "Search the web for up-to-date information. Use this when the "
+            "user asks about recent events, fresh releases, prices, weather, "
+            "sports results, documentation changes or anything else that may "
+            "have changed after your training cutoff — or when the user "
+            "explicitly asks to search / find / look something up online."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A concise, specific search query.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "How many results to fetch (1-10, default 5).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# Appended to the system prompt while the search tool is offered.
+SEARCH_SYSTEM_HINT = (
+    "Тебе доступен инструмент search_web, который ищет информацию в интернете "
+    "в реальном времени. Используй его, когда ответ может зависеть от "
+    "актуальных данных, вместо того чтобы догадываться или отказываться. "
+    "Строй ответ на полученных результатах, цитируй фактически использованные "
+    "источники маркерами [n] по номерам результатов и отвечай на русском "
+    "языке, если пользователь явно не попросил другой язык."
+)
+
+
+@dataclass(slots=True)
+class SearchResult:
+    """One web search hit."""
+
+    title: str
+    url: str
+    snippet: str
+
+
+def search_configured() -> bool:
+    """True when the ``search_web`` tool should be offered to the model."""
+    if not config.enable_web_search or not config.search_api_key:
+        return False
+    return config.search_provider.strip().lower() in PROVIDERS
+
+
+# --- HTTP helpers (keys are never logged) --------------------------------------
+
+
+async def _request_json(
+    url: str,
+    headers: dict[str, str],
+    *,
+    method: str = "POST",
+    json_payload: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any | None:
+    """One JSON request to a search API; None on any failure."""
+    host = urlsplit(url).netloc
+    timeout = aiohttp.ClientTimeout(total=config.search_timeout)
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.request(
+                method, url, json=json_payload, params=params, headers=headers
+            ) as resp,
+        ):
+            body = await resp.text()
+            if resp.status != 200:
+                logger.warning(
+                    "Search API %s returned HTTP %s: %s",
+                    host, resp.status, body[:200],
+                )
+                return None
+            return json.loads(body)
+    except (TimeoutError, aiohttp.ClientError, OSError) as exc:
+        logger.warning("Search API request to %s failed: %s", host, exc)
+        return None
+    except json.JSONDecodeError:
+        logger.warning("Search API %s returned invalid JSON", host)
+        return None
+
+
+# --- Providers ------------------------------------------------------------------
+
+
+async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
+    """Tavily Search API (POST /search, Bearer auth)."""
+    url = config.search_api_url or "https://api.tavily.com/search"
+    data = await _request_json(
+        url,
+        {
+            "Authorization": f"Bearer {config.search_api_key}",
+            "Content-Type": "application/json",
+        },
+        json_payload={
+            "query": query,
+            "max_results": max_results,
+            "search_depth": "basic",
+            "include_answer": False,
+        },
+    )
+    if not isinstance(data, dict):
+        return []
+    results = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        results.append(
+            SearchResult(
+                title=str(item.get("title") or item["url"]),
+                url=str(item["url"]),
+                snippet=str(item.get("content") or "")[:_SNIPPET_CHARS],
+            )
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
+    """Brave Search API (GET /res/v1/web/search, subscription token header)."""
+    url = config.search_api_url or "https://api.brave.com/res/v1/web/search"
+    data = await _request_json(
+        url,
+        {
+            "X-Subscription-Token": config.search_api_key,
+            "Accept": "application/json",
+        },
+        method="GET",
+        params={"q": query, "count": max_results},
+    )
+    if not isinstance(data, dict):
+        return []
+    results = []
+    web = data.get("web") or {}
+    for item in web.get("results") or []:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        results.append(
+            SearchResult(
+                title=str(item.get("title") or item["url"]),
+                url=str(item["url"]),
+                snippet=str(item.get("description") or "")[:_SNIPPET_CHARS],
+            )
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+# --- Entry point ----------------------------------------------------------------
+
+
+async def search_web(query: str, max_results: int | None = None) -> list[SearchResult]:
+    """Run one web search; returns [] on any failure (never raises)."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    limit = max_results if isinstance(max_results, int) else config.search_max_results
+    limit = max(1, min(limit, 10))
+    provider = config.search_provider.strip().lower()
+    try:
+        if provider == "tavily":
+            results = await _search_tavily(query, limit)
+        elif provider == "brave":
+            results = await _search_brave(query, limit)
+        else:
+            logger.warning("Unknown SEARCH_PROVIDER %r; search skipped", provider)
+            return []
+    except Exception:  # search must never break an answer
+        logger.exception("Web search failed for %r", query[:80])
+        return []
+    logger.info(
+        "Web search (%s) %r -> %d result(s)", provider, query[:80], len(results)
+    )
+    return results
+
+
+def format_search_results(query: str, results: list[SearchResult]) -> str:
+    """Tool-message body: numbered results the model cites as [n]."""
+    if not results:
+        return (
+            f"Живой поиск по запросу {query!r} не дал результатов. Ответь из "
+            "собственных знаний и упомяни, что поиск в интернете ничего не "
+            "нашёл."
+        )
+    blocks = [f"Результаты веб-поиска по запросу {query!r}:"]
+    for index, item in enumerate(results, start=1):
+        blocks.append(f"[{index}] {item.title}\n{item.snippet}\nURL: {item.url}")
+    blocks.append(
+        "Ответь пользователю, опираясь на эти результаты, где это уместно; "
+        "цитируй использованные источники маркерами [n]."
+    )
+    return "\n\n".join(blocks)
+
+
+# --- Tool-exchange message builders (OpenAI chat format) -------------------------
+
+
+def build_assistant_tool_message(
+    content: str | None, calls: list[ToolCall]
+) -> dict[str, Any]:
+    """The assistant turn carrying ``tool_calls``, as the API expects back.
+
+    Every tool_call of an assistant turn must be answered with a ``tool``
+    message in the next request, or the API rejects the conversation.
+    """
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+            for call in calls
+        ],
+    }
+
+
+def build_tool_response(call_id: str, content: str) -> dict[str, Any]:
+    """One ``role: tool`` answer for a tool_call id."""
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def apply_search_hint(messages: list[dict[str, Any]]) -> None:
+    """Append the search guidance to the system prompt, in place, once."""
+    for entry in messages:
+        if entry.get("role") == "system":
+            content = entry.get("content")
+            if isinstance(content, str) and SEARCH_SYSTEM_HINT not in content:
+                entry["content"] = f"{content}\n\n{SEARCH_SYSTEM_HINT}"
+            return

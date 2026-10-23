@@ -61,6 +61,39 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _run_migrations(conn)
+        await _run_data_migrations(conn)
+
+
+async def _run_data_migrations(conn: Any) -> None:
+    """Dialect-agnostic data fixes (they run on SQLite too).
+
+    Currently one fix: rows whose ``system_prompt`` still holds the *exact*
+    legacy English default are switched to the current Russian default, so
+    existing installations start answering in Russian after the update.
+    Custom prompts and chosen personas differ from the legacy string and are
+    therefore never touched.
+    """
+    from bot.config import LEGACY_DEFAULT_SYSTEM_PROMPT
+
+    if config.default_system_prompt == LEGACY_DEFAULT_SYSTEM_PROMPT:
+        return  # the deployment intentionally kept the English default
+    try:
+        await conn.execute(
+            text(
+                "UPDATE user_settings SET system_prompt = :new "
+                "WHERE system_prompt = :legacy"
+            ),
+            {
+                "new": config.default_system_prompt,
+                "legacy": LEGACY_DEFAULT_SYSTEM_PROMPT,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - a data fix must never abort startup
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Default-prompt data migration skipped: %s", exc
+        )
 
 
 async def _run_migrations(conn: Any) -> None:
@@ -97,6 +130,19 @@ async def _run_migrations(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_messages_chat_id ON messages (chat_id)",
         # Backfill existing rows: private-chat history was keyed by the user id.
         "UPDATE messages SET chat_id = user_id WHERE chat_id IS NULL",
+        # reminders table (scheduled messages and AI requests).
+        "CREATE TABLE IF NOT EXISTS reminders ("
+        "id SERIAL PRIMARY KEY, "
+        "user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE, "
+        "chat_id BIGINT NOT NULL, "
+        "text TEXT NOT NULL, "
+        "ai_mode BOOLEAN NOT NULL DEFAULT FALSE, "
+        "fire_at TIMESTAMPTZ NOT NULL, "
+        "schedule VARCHAR(64), "
+        "enabled BOOLEAN NOT NULL DEFAULT TRUE, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS ix_reminders_user_id ON reminders (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_reminders_fire_at ON reminders (fire_at)",
     ]
 
     for statement in statements:

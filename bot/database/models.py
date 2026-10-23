@@ -5,6 +5,8 @@ import datetime
 from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from bot.config import DEFAULT_SYSTEM_PROMPT_TEXT
+
 
 class Base(DeclarativeBase):
     pass
@@ -43,7 +45,7 @@ class UserSettings(Base):
     )
     system_prompt: Mapped[str] = mapped_column(
         Text,
-        default="You are a helpful AI assistant. Answer questions concisely and accurately.",
+        default=DEFAULT_SYSTEM_PROMPT_TEXT,
     )
     temperature: Mapped[float] = mapped_column(default=0.7)
     max_tokens: Mapped[int] = mapped_column(default=2048)
@@ -102,4 +104,35 @@ class DailyUsage(Base):
 
     __table_args__ = (
         UniqueConstraint("telegram_id", "date", name="uq_daily_usage_user_date"),
+    )
+
+
+class Reminder(Base):
+    """Scheduled one-time reminders and recurring messages / AI requests.
+
+    ``text`` is the reminder body, or — when ``ai_mode`` is set — the prompt
+    sent to the user's model at fire time (the answer is what gets delivered).
+    ``fire_at`` is the next fire time in UTC; one-time reminders (``schedule``
+    is NULL) are removed after firing, recurring ones are advanced according
+    to ``schedule``: ``every:<minutes>``, ``daily:<HH>:<MM>`` or
+    ``weekly:<dow>:<HH>:<MM>`` (dow: 0 = Monday).
+    """
+
+    __tablename__ = "reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.telegram_id", ondelete="CASCADE"), index=True
+    )
+    # Chat the reminder fires in (the private chat or group where it was set).
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    ai_mode: Mapped[bool] = mapped_column(default=False)
+    fire_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    schedule: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )

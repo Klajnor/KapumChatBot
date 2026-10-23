@@ -38,11 +38,51 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def get_enhance_choice_keyboard() -> InlineKeyboardMarkup:
+    """Ask where to enhance the photo: local server pipeline or AI redraw."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🖥️ Server — fast, content untouched", callback_data="enh:local")
+    builder.button(text="🧠 Neural network — AI redraw", callback_data="enh:ai")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def get_ask_other_model_keyboard() -> InlineKeyboardMarkup:
     """Keyboard shown under an answer: re-ask the question with another model."""
     builder = InlineKeyboardBuilder()
     builder.button(text="🔀 Ask another model", callback_data="askother")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_answer_keyboard(
+    export_id: int | None = None, *, ask_other: bool = False
+) -> InlineKeyboardMarkup | None:
+    """Action row under an AI answer: 📄 PDF / 📝 MD export + re-ask.
+
+    ``export_id`` is the database id of the saved assistant message; the
+    export callbacks carry it so the handler can reload the exact answer
+    (with an owner check) instead of trusting callback text. Returns None
+    when there would be no buttons at all.
+    """
+    if export_id is None and not ask_other:
+        return None
+    builder = InlineKeyboardBuilder()
+    if export_id is not None:
+        builder.button(text="📄 PDF", callback_data=f"expans:pdf:{export_id}")
+        builder.button(text="📝 MD", callback_data=f"expans:md:{export_id}")
+    if ask_other:
+        builder.button(text="🔀 Ask another model", callback_data="askother")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def get_export_format_keyboard() -> InlineKeyboardMarkup:
+    """Format picker for a full-history ``/export`` (PDF or Markdown)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📄 PDF", callback_data="expall:pdf")
+    builder.button(text="📝 Markdown", callback_data="expall:md")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -52,4 +92,19 @@ def get_resend_model_keyboard() -> InlineKeyboardMarkup:
     for model in ai_client.available_models():
         builder.button(text=model["name"], callback_data=f"resend:{model['id']}")
     builder.adjust(2)
+    return builder.as_markup()
+
+
+def get_persona_keyboard(
+    personas: dict[str, dict[str, str]], current_prompt: str
+) -> InlineKeyboardMarkup:
+    """Persona picker for /persona; the active preset is marked with ✓."""
+    builder = InlineKeyboardBuilder()
+    for key, persona in personas.items():
+        marker = " ✓" if persona.get("prompt") == current_prompt else ""
+        builder.button(
+            text=f"{persona.get('name', key)}{marker}",
+            callback_data=f"persona:{key}",
+        )
+    builder.adjust(1)
     return builder.as_markup()

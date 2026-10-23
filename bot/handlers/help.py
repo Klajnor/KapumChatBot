@@ -8,8 +8,7 @@ from aiogram.types import Message
 
 from bot.bot import get_bot_username
 from bot.config import config
-from bot.database.session import async_session_factory
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 router = Router()
 
@@ -17,13 +16,22 @@ _CHAT_SECTION = (
     "<b>Chat:</b>\n"
     "• <b>Send any text</b> — chat with the AI\n"
     "• <b>Send an image</b> — analyze it with a vision model\n"
-    "• <b>Send a voice message</b> — I'll recognize it and reply\n\n"
+    "• <b>Send a voice message</b> — I'll recognize it and reply\n"
+    "• <b>Send a document</b> (PDF/DOCX/TXT/code) — I'll read and analyze it\n"
+    "• <b>Send a link</b> — I'll fetch the page and summarize it\n"
+    "• <b>Reply to a message</b> — I'll answer about the quoted text or photo\n\n"
     "<b>Commands:</b>\n"
     "• /start — welcome message and registration\n"
     "• /help — this help message\n"
     "• /models — select an AI model\n"
     "• /model — show your current model\n"
     "• /image &lt;prompt&gt; — generate an image\n"
+    "• /sticker &lt;prompt&gt; — generate a Telegram sticker\n"
+    "• /remind &lt;when&gt; &lt;text&gt; — reminder or scheduled AI request\n"
+    "• /reminders — list your reminders\n"
+    "• /delreminder &lt;N|all&gt; — delete a reminder\n"
+    "• /export — save this conversation as Markdown or PDF\n"
+    "• /persona — choose an AI personality (preset system prompt)\n"
     "• /prompt — view the current system prompt\n"
     "• /prompt &lt;text&gt; — set a new system prompt\n"
     "• /clear — clear the history of this chat\n"
@@ -33,9 +41,10 @@ _CHAT_SECTION = (
 
 _TIPS = (
     "<b>💡 Tips:</b>\n"
-    "• Customize the AI with /prompt\n"
+    "• Pick a ready-made personality with /persona, or write your own with /prompt\n"
     "• Switch models with /models (models marked 🖼️ support images)\n"
     "• Ask to draw something and I'll reply with a generated image\n"
+    "• <code>/remind daily at 9:00 ai: …</code> — a scheduled request to the AI\n"
     "• Use /clear to start a fresh conversation\n"
     "• In groups, mention me or reply to my message to get an answer"
 )
@@ -63,8 +72,7 @@ async def cmd_help(message: Message) -> None:
 
     is_allowed = False
     if not is_admin:
-        async with async_session_factory() as session:
-            service = UserService(session)
+        async with user_service() as service:
             is_allowed = await service.is_allowed_user(user.id)
 
     if is_admin:
@@ -76,6 +84,7 @@ async def cmd_help(message: Message) -> None:
             "• /remove_user &lt;id&gt; — remove a user from the allowed list\n"
             "• /list_users — show all allowed users\n"
             "• /admin_stats — usage statistics for the last 14 days\n"
+            "• /broadcast &lt;text&gt; — send an announcement to every user\n"
             "• /reset_daily_usage &lt;id&gt; — reset a user's daily usage"
             f"{_guest_mode_tip()}\n\n"
             f"{_TIPS}"

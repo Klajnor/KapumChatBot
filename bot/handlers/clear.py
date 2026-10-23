@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.database.session import async_session_factory
 from bot.keyboards.inline import get_clear_confirmation_keyboard
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 router = Router()
 
@@ -34,8 +33,7 @@ async def cb_clear_confirm(callback: CallbackQuery) -> None:
     # In a group the history is shared: a participant clears only their own part.
     chat = callback.message.chat
     own_only = None if chat.type == ChatType.PRIVATE else callback.from_user.id
-    async with async_session_factory() as session:
-        service = UserService(session)
+    async with user_service() as service:
         await service.clear_history(chat.id, user_id=own_only)
 
     await safe_edit_text(

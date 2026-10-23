@@ -1,0 +1,7 @@
+# Ruff configuration for Kapum ChatBot.
+#
+# The project targets Python 3.12+ (see README → Стек технологий), so
+# version-gated rules (UP017 `datetime.UTC`, UP041 `TimeoutError`, …) are
+# enabled and their fixes are safe to apply. Without this file ruff infers
+# the target from the current interpreter, which can drift between machines.
+target-version = "py312"

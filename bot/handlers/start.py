@@ -8,9 +8,8 @@ from aiogram.types import Message
 
 from bot.bot import get_bot_username
 from bot.config import config
-from bot.database.session import async_session_factory
 from bot.services.themed_responses import get_random_themed_response
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 router = Router()
 
@@ -18,8 +17,15 @@ _BASE_COMMANDS = (
     "💬 <b>Send any text</b> — chat with the AI\n"
     "🖼️ <b>Send an image</b> — analyze it (vision models)\n"
     "🎤 <b>Send a voice message</b> — I'll recognize it and reply\n"
+    "📄 <b>Send a document</b> (PDF/DOCX/TXT) — I'll read and analyze it\n"
+    "🔗 <b>Send a link</b> — I'll fetch the page and summarize it\n"
+    "↩️ <b>Reply to a message</b> — I'll answer about the quoted text or photo\n"
     "🤖 /models — choose an AI model\n"
     "🎨 /image &lt;prompt&gt; — generate an image\n"
+    "🩹 /sticker &lt;prompt&gt; — generate a Telegram sticker\n"
+    "⏰ /remind &lt;when&gt; &lt;text&gt; — reminder or scheduled AI request\n"
+    "🎭 /persona — choose an AI personality\n"
+    "📤 /export — save the conversation (MD/PDF)\n"
     "📝 /prompt — view or set the system prompt\n"
     "🧹 /clear — clear conversation history\n"
     "📊 /stats — your usage statistics\n"
@@ -56,8 +62,7 @@ async def cmd_start(message: Message) -> None:
     if user is None:
         return
 
-    async with async_session_factory() as session:
-        service = UserService(session)
+    async with user_service() as service:
         await service.register_user(
             telegram_id=user.id,
             username=user.username,
@@ -81,6 +86,7 @@ async def cmd_start(message: Message) -> None:
             f"➖ /remove_user &lt;id&gt; — remove a user from the allowed list\n"
             f"📋 /list_users — show all allowed users\n"
             f"📈 /admin_stats — usage statistics (14 days)\n"
+            f"📣 /broadcast &lt;text&gt; — message every user\n"
             f"🔄 /reset_daily_usage &lt;id&gt; — reset a user's daily usage"
             f"{_guest_mode_hint()}\n\n"
             f"<i>Let's get started! 🚀</i>"

@@ -12,3 +12,23 @@ matplotlib>=3.9
 # formulas); matplotlib pulls it in transitively, but the dependency is
 # declared explicitly because our code imports PIL directly.
 pillow>=10.0
+# Document analysis (optional at runtime — imports are guarded):
+# pdfplumber reads PDF text layers, python-docx reads DOCX (paragraphs and
+# tables). Without them such uploads are rejected with an explanation;
+# plain-text/code files need no extra dependency.
+pdfplumber>=0.11
+python-docx>=1.1
+# Link analysis (optional): high-quality main-content extraction from web
+# pages. Without it a built-in stdlib HTML parser is used as a fallback.
+trafilatura>=2.0
+# Conversation export (optional): PDF rendering for /export and the 📄 button.
+# Unicode (Cyrillic) works via the DejaVu fonts that matplotlib already ships;
+# without fpdf2 the export falls back to Markdown automatically.
+fpdf2>=2.8
+# IANA timezone database — required by zoneinfo on Windows (REMINDER_TIMEZONE);
+# Linux servers use the system tzdata and do not need this package.
+tzdata>=2024.1
+
+# NOTE: ffmpeg is NOT a pip package — install it with your system package
+# manager. It is required for voice messages (Telegram OGG/Opus → PCM16 for
+# the Realtime ASR WebSocket). See README → «Установка ffmpeg».

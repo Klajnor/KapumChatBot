@@ -8,8 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.config import config
-from bot.database.session import async_session_factory
-from bot.services.user_service import UserService
+from bot.services.user_service import user_service
 
 router = Router()
 
@@ -21,8 +20,7 @@ async def cmd_stats(message: Message) -> None:
     if user is None:
         return
 
-    async with async_session_factory() as session:
-        service = UserService(session)
+    async with user_service() as service:
         stats = await service.get_stats(user.id)
 
         lines = [

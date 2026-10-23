@@ -19,8 +19,13 @@ from aiogram.types import (
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.services import limits
-from bot.services.access import AccessResult, check_access
+from bot.services.access import AccessResult, check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
+from bot.services.intent import (
+    VISION_FOR_GEN_PROMPT,
+    detect_intent,
+    generation_prompt,
+)
 from bot.services.markdown import render, split_chunks
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
@@ -41,7 +46,7 @@ router = Router()
 
 MAX_TEXT_LENGTH = 4000
 MAX_CAPTION_LENGTH = 1000
-DEFAULT_VISION_PROMPT = "What's in this image?"
+DEFAULT_VISION_PROMPT = "Что изображено на этой картинке?"
 
 
 @dataclass(slots=True)
@@ -64,14 +69,17 @@ def _to_result(reply: GuestReply, *, mode: str | None = None) -> InlineQueryResu
         # signed PNG URLs, so send the complete link without a preview fetch.
         url = reply.photo_url
         if len(url) > MAX_TEXT_LENGTH - 100:
-            text = "Картинка создана, но ссылка слишком длинная. Используйте /image в личном чате с ботом."
+            text = (
+                "Image generated, but the link is too long. "
+                "Use /image in a private chat with the bot."
+            )
         else:
-            caption = (reply.caption or "🎨 Картинка готова.")[:MAX_CAPTION_LENGTH]
+            caption = (reply.caption or "🎨 Image is ready.")[:MAX_CAPTION_LENGTH]
             caption = caption[:max(0, MAX_TEXT_LENGTH - len(url) - 2)]
             text = f"{caption}\n\n{url}"
         return InlineQueryResultArticle(
             id="image",
-            title="Открыть сгенерированное изображение",
+            title="Open the generated image",
             input_message_content=InputTextMessageContent(
                 message_text=text,
                 parse_mode=None,
@@ -194,23 +202,43 @@ async def _build_reply(
         last_name=caller.last_name,
     )
 
+    text = _extract_text(message)
+
+    # Enforce maximum summon-text length to prevent abuse.
+    if len(text) > config.max_guest_text_length:
+        return GuestReply(
+            text=(
+                f"⚠️ The message is too long "
+                f"({len(text)} characters; limit {config.max_guest_text_length}). "
+                f"Please shorten it."
+            ),
+            mode="plain",
+        )
+
+    # Validate the voice attachment *before* consuming quota: a too-long or
+    # too-large note must not cost the guest one of their free messages.
+    voice = _voice_of(message)
+    voice_ok = voice is not None and config.enable_voice
+    if voice_ok:
+        if voice.duration > 300:
+            return GuestReply(
+                text="⚠️ Voice messages must be at most 5 minutes long.",
+                mode="plain",
+            )
+        if voice.file_size and voice.file_size > config.voice_max_bytes:
+            return GuestReply(
+                text="⚠️ The voice message is too large to recognize.",
+                mode="plain",
+            )
+
     access = await check_access(service, caller_id)
     if not access.allowed:
         return GuestReply(
             text=access.message or get_random_themed_response(), mode="html"
         )
 
-    text = _extract_text(message)
-
-    # Voice message: recognize it first, then answer like a text message.
-    voice = _voice_of(message)
-    if voice is not None and config.enable_voice:
-        if voice.duration > 300:
-            return GuestReply(text="⚠️ Voice messages must be at most 5 minutes long.", mode="plain")
-        if voice.file_size and voice.file_size > config.voice_max_bytes:
-            return GuestReply(
-                text="⚠️ The voice message is too large to recognize.", mode="plain"
-            )
+    # Voice message: recognize it now (after the quota has been taken).
+    if voice_ok:
         audio = await _download(message, voice.file_id)
         transcript = None
         if audio:
@@ -218,12 +246,15 @@ async def _build_reply(
                 audio, mime=voice.mime_type or "audio/ogg"
             )
         if not transcript or not transcript.strip():
+            await refund_access(service, caller_id, access)
             return GuestReply(
                 text="❌ Could not recognize the voice message.", mode="plain"
             )
         text = f"{text}\n{transcript}".strip() if text else transcript.strip()
 
     if not text:
+        # Nothing to send to the model: give the quota unit back.
+        await refund_access(service, caller_id, access)
         return GuestReply(
             text=(
                 "Summon me with a text message, for example: "
@@ -256,10 +287,73 @@ async def _build_reply(
             model=settings["model"],
         )
 
-    # Attached (or replied-to) photo -> vision answer.
+    # Attached (or replied-to) photo: classify the intent, then answer.
+    # Guest mode allows exactly one inline result and a guest bot cannot
+    # upload files, so enhancement here is always neural: the re-drawn photo
+    # comes back as a generated URL and is delivered as a link.
     photo_bytes = await _download_photo(message)
     if photo_bytes is not None:
+        intent, enhance_ops = "analyze", []
+        if text and config.enable_image_generation:
+            intent, enhance_ops = await detect_intent(text, settings["model"])
+
+        if intent == "enhance":
+            result = await ai_client.enhance_image_via_ai(
+                photo_bytes, operations=enhance_ops, caption=text, download=False
+            )
+            if result.url:
+                await _save(f"[Enhanced image: neural] {text}")
+                footer = format_timing(result.elapsed, model=config.image_model)
+                return GuestReply(
+                    photo_url=result.url,
+                    caption=with_timing(
+                        f"🧠 Enhanced by the neural network: {text[:200]}", footer
+                    ),
+                )
+            await refund_access(service, caller_id, access)
+            return GuestReply(
+                text="❌ Could not enhance the image. Please try again.",
+                mode="plain",
+            )
+
+        if intent == "generate":
+            if not is_vision_model(settings["model"]):
+                await refund_access(service, caller_id, access)
+                return GuestReply(
+                    text=(
+                        f"⚠️ Model `{settings['model']}` cannot analyze the "
+                        "reference. Ask in a private chat with a vision model."
+                    ),
+                    mode="plain",
+                )
+            vision = await ai_client.chat_with_image_result(
+                VISION_FOR_GEN_PROMPT,
+                photo_bytes,
+                base_messages,
+                model=settings["model"],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            description = (vision.content or "").strip() if vision else ""
+            gen_prompt = generation_prompt(text, description or None)
+            image = await ai_client.generate_image_result(
+                gen_prompt, download=False, reference_images=[photo_bytes]
+            )
+            if image.url:
+                await _save(f"[Generated image] {gen_prompt}")
+                footer = format_timing(image.elapsed, model=config.image_model)
+                return GuestReply(
+                    photo_url=image.url,
+                    caption=with_timing(f"🎨 {text[:200]}", footer),
+                )
+            await refund_access(service, caller_id, access)
+            return GuestReply(
+                text="❌ Could not generate the image. Please try again.",
+                mode="plain",
+            )
+
         if not is_vision_model(settings["model"]):
+            await refund_access(service, caller_id, access)
             return GuestReply(
                 text=(
                     f"⚠️ Model `{settings['model']}` cannot analyze images. "
@@ -277,13 +371,18 @@ async def _build_reply(
         )
         response = vision.content if vision else None
         if not response:
+            await refund_access(service, caller_id, access)
             return GuestReply(
                 text="❌ Error analyzing the image. Please try again later.",
                 mode="plain",
             )
         await _save(response)
         footer = format_timing(
-            vision.elapsed, model=settings["model"], tokens=vision.total_tokens
+            vision.elapsed,
+            model=vision.model or settings["model"],
+            tokens=vision.total_tokens,
+            input_tokens=vision.input_tokens,
+            output_tokens=vision.output_tokens,
         )
         telegraph_reply = await _maybe_telegraph_reply(text, response, footer)
         if telegraph_reply is not None:
@@ -325,12 +424,14 @@ async def _build_reply(
                 photo_url=image_url, caption=with_timing(caption, footer)
             )
         if not result.content:
+            await refund_access(service, caller_id, access)
             return GuestReply(
                 text="❌ Could not generate the image. Please try again.",
                 mode="plain",
             )
 
     if not result.content:
+        await refund_access(service, caller_id, access)
         return GuestReply(
             text="❌ Error communicating with the AI. Please try again later.",
             mode="plain",
@@ -338,7 +439,11 @@ async def _build_reply(
 
     await _save(result.content)
     footer = format_timing(
-        result.elapsed, model=settings["model"], tokens=result.total_tokens
+        result.elapsed,
+        model=result.model or settings["model"],
+        tokens=result.total_tokens,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
     )
     telegraph_reply = await _maybe_telegraph_reply(text, result.content, footer)
     if telegraph_reply is not None:
@@ -403,17 +508,17 @@ async def _run_guest_reply(message: Message, caller, chat_id: int) -> GuestReply
             _build_reply(message, service, caller, chat_id),
             timeout=config.guest_timeout,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "Guest request exceeded the total processing budget (%ss)",
             config.guest_timeout,
         )
         reply = GuestReply(
             text=(
-                "⏳ Не удалось завершить запрос за отведённое время. "
-                "Попробуйте ещё раз. Для генерации картинок откройте личный "
-                "чат с ботом и используйте /image с описанием — там можно "
-                "дождаться более долгой генерации."
+                "⏳ The request could not be completed within the time limit. "
+                "Please try again. For image generation, open a private chat "
+                "with the bot and use /image with a description — longer "
+                "generation times are supported there."
             ),
             mode="plain",
         )

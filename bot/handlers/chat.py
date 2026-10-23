@@ -18,24 +18,39 @@ from aiogram.types import (
     User,
 )
 
-from bot.bot import get_bot_username
+from bot.bot import get_bot_id, get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.keyboards.inline import (
-    get_ask_other_model_keyboard,
+    get_answer_keyboard,
+    get_enhance_choice_keyboard,
     get_resend_model_keyboard,
 )
 from bot.services import limits
 from bot.services.access import AccessResult, check_access, guest_hint, refund_access
 from bot.services.ai_client import (
     IMAGE_TOOL,
-    AIStreamError,
+    STICKER_TOOL,
     AIClient,
+    AIStreamError,
     ChatResult,
+    ToolCall,
+    _image_data_url,
     ai_client,
     is_vision_model,
 )
+from bot.services.documents import (
+    detect_file_type,
+    extract_document_text,
+    fetch_url_text,
+)
 from bot.services.formulas import has_table, promote_complex_inline
+from bot.services.image_tools import enhance_image
+from bot.services.intent import (
+    VISION_FOR_GEN_PROMPT,
+    detect_intent,
+    generation_prompt,
+)
 from bot.services.progress import waiting
 from bot.services.rich import (
     RICH_LIMIT,
@@ -43,6 +58,15 @@ from bot.services.rich import (
     send_rich,
     send_rich_draft,
     send_text_draft,
+)
+from bot.services.search import (
+    SEARCH_TOOL,
+    apply_search_hint,
+    build_assistant_tool_message,
+    build_tool_response,
+    format_search_results,
+    search_configured,
+    search_web,
 )
 from bot.services.telegram_utils import (
     edit_formatted,
@@ -68,14 +92,89 @@ router = Router()
 
 MAX_MESSAGE_LENGTH = 4000  # Telegram hard limit is 4096; keep a safety margin.
 
-DEFAULT_VISION_PROMPT = "What's in this image?"
-MAX_PHOTO_BYTES = 10 * 1024 * 1024
+DEFAULT_VISION_PROMPT = "Что изображено на этой картинке?"
 
-DEFAULT_VOICE_PROMPT = "Answer what the user said in this voice message."
+DEFAULT_VOICE_PROMPT = "Ответь на то, что пользователь сказал в этом голосовом сообщении."
+
+# Default ask when a document/link arrives without the user's own question.
+DEFAULT_DOCUMENT_PROMPT = (
+    "Сделай краткое изложение этого документа: основные темы, ключевые "
+    "моменты и выводы."
+)
+
+DEFAULT_LINK_PROMPT = (
+    "Сделай краткое изложение этой страницы: основные темы, ключевые моменты "
+    "и выводы."
+)
+
+MSG_UNSUPPORTED_DOCUMENT = (
+    "📎 <b>This file type cannot be analyzed.</b>\n\n"
+    "Supported formats: <b>PDF</b>, <b>DOCX</b>, plain text and code "
+    "(TXT, MD, CSV, JSON, PY, …).\n"
+    "Scanned PDFs without a text layer are not supported — send the page "
+    "as a photo for vision analysis instead.\n\n"
+    "Maximum file size: {limit} MB."
+)
+
+# Shown when the selected model cannot process images.
+MSG_NO_VISION = (
+    "⚠️ <b>The current model does not support images.</b>\n\n"
+    "Model <code>{model}</code> cannot process images. "
+    "Switch to a vision-capable model with /models.\n\n"
+    "<b>Vision models</b> are marked 🖼️ in the list "
+    "(for example <code>qwen3.8-max</code> or <code>qwen3.8-flash</code>)."
+)
+
+MSG_ENHANCE_CHOICE = (
+    "🔧 <b>How should I improve the photo?</b>\n\n"
+    "🖥️ <b>Server</b> — processed locally (fast, no AI cost): upscale, "
+    "denoise, sharpen, colour; the content is never altered.\n"
+    "🧠 <b>Neural network</b> — the photo is re-drawn to restore lost "
+    "detail; slower, may slightly change small details."
+)
 
 # Display math still reaches the PNG renderer, so the streamed text must not
 # be edited into a formatted message (that would skip formula images).
 _DISPLAY_MATH_RE = re.compile(r"\$\$|\\\[")
+
+
+# --- Media group (album) support -------------------------------------------
+
+# Collect photos that arrive in a single album; each group_id maps to a dict
+# with ``images`` (list of bytes) and an ``event`` that processing awaits.
+_album_images: dict[str, dict[str, Any]] = {}
+_album_lock: asyncio.Lock = asyncio.Lock()
+_album_total_bytes: dict[str, int] = {}  # per-key running total for size checks
+_ALBUM_COLLECT_SECONDS = 1.5  # how long to wait for the next photo
+_ALBUM_CLEANUP_SECONDS = 300  # discard stale album entries after 5 minutes
+
+
+async def _album_cleanup() -> None:
+    """Periodically remove stale album entries to prevent memory leaks."""
+    while True:
+        await asyncio.sleep(_ALBUM_CLEANUP_SECONDS)
+        cutoff = time.monotonic() - _ALBUM_CLEANUP_SECONDS
+        async with _album_lock:
+            stale = [k for k, v in _album_images.items() if v["last"] < cutoff]
+            for key in stale:
+                _album_images.pop(key, None)
+                _album_total_bytes.pop(key, None)
+
+
+async def _touch_album(key: str, stamp: float) -> None:
+    """Mark an album as recently touched so this handler may finalize it.
+
+    Called for rejected photos too: without it an album whose *last* photo was
+    oversized would never be processed and the valid photos would be lost.
+    """
+    async with _album_lock:
+        entry = _album_images.get(key)
+        if entry is not None:
+            entry["last"] = stamp
+
+
+def _album_key(chat_id: int, group_id: str) -> str:
+    return f"{chat_id}:{group_id}"
 
 
 # --- Addressing helpers ----------------------------------------------------
@@ -102,6 +201,175 @@ def _is_addressed(message: Message) -> bool:
     return text.lstrip().startswith("/")
 
 
+# --- Quoted / forwarded context ---------------------------------------------
+
+# A quoted message is included in the AI request verbatim; keep it bounded so
+# one huge forward cannot crowd out the conversation history.
+_MAX_QUOTED_CHARS = 4000
+
+
+def _sender_name(message: Message) -> str:
+    """Human-readable sender of a message (for quoted/forwarded context)."""
+    sender_chat = getattr(message, "sender_chat", None)
+    if sender_chat is not None:
+        return sender_chat.title or "channel"
+    user = message.from_user
+    if user is None:
+        return "unknown"
+    return user.first_name or user.username or "user"
+
+
+def _describe_quoted(reply: Message | None) -> str | None:
+    """Render the replied-to message as a context block for the AI.
+
+    Returns None when there is nothing worth quoting: no reply at all, a
+    reply to a photo (the vision pipeline attaches the image itself) or a
+    reply to the bot's own answer (already part of the user's history).
+    """
+    if reply is None or reply.photo:
+        return None
+    bot_id = get_bot_id()
+    if bot_id != 0 and reply.from_user is not None and reply.from_user.id == bot_id:
+        return None
+
+    parts: list[str] = []
+    text = reply.text or reply.caption or ""
+    if text:
+        parts.append(text)
+    if reply.voice is not None:
+        parts.append("[Voice message]")
+    if reply.video is not None:
+        parts.append("[Video]")
+    if reply.animation is not None:
+        parts.append("[Animation]")
+    if reply.document is not None:
+        parts.append(f"[Document: {reply.document.file_name or 'file'}]")
+    if reply.sticker is not None:
+        emoji = reply.sticker.emoji or ""
+        parts.append(f"[Sticker{' ' + emoji if emoji else ''}]")
+    if not parts:
+        return None
+
+    body = "\n".join(parts)
+    if len(body) > _MAX_QUOTED_CHARS:
+        body = body[:_MAX_QUOTED_CHARS] + "…"
+    return f"[Quoted message from {_sender_name(reply)}]\n{body}"
+
+
+def _forward_source_name(message: Message) -> str | None:
+    """Where a forwarded message came from, when Telegram tells us."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is None:
+        return None
+    sender = getattr(origin, "sender_user", None)
+    if sender is not None:
+        return sender.first_name or getattr(sender, "username", None) or "user"
+    chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+    if chat is not None:
+        return getattr(chat, "title", None) or "chat"
+    return None
+
+
+def _with_quoted_context(message: Message, text: str) -> str:
+    """Prepend quoted-reply and forwarding provenance to the question.
+
+    The combined text is what the AI sees and what is stored in history, so
+    follow-up questions keep working after the original leaves the window.
+    """
+    quoted = _describe_quoted(message.reply_to_message)
+    if quoted:
+        text = f"{quoted}\n\n---\n\n{text}"
+    if message.forward_date is not None:
+        source = _forward_source_name(message)
+        label = (
+            f"[Forwarded message from {source}]" if source else "[Forwarded message]"
+        )
+        text = f"{label}\n{text}"
+    return text
+
+
+# --- Document & link analysis -------------------------------------------------
+
+# URLs inside a text message; trailing punctuation is stripped by _clean_url.
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_MAX_LINKS_PER_MESSAGE = 2
+# A message with more non-URL text than this is a discussion that merely
+# contains links, not a "read this" request — fetch nothing, pollute nothing.
+_LINK_REMAINDER_LIMIT = 300
+
+
+def _clean_url(candidate: str) -> str:
+    """Strip sentence punctuation from a URL match, keeping balanced brackets.
+
+    ``https://example.com/a_(b).`` → ``https://example.com/a_(b)``: a closing
+    bracket is only removed when it has no opening partner inside the URL.
+    """
+    openers = {")": "(", "]": "[", "}": "{"}
+    cleaned = candidate
+    while cleaned:
+        last = cleaned[-1]
+        if last in ".,;:!?\"'":
+            drop = True
+        elif last in openers:
+            drop = cleaned.count(openers[last]) < cleaned.count(last)
+        else:
+            drop = False
+        if not drop:
+            break
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+def _compose_document_context(name: str, text: str, question: str) -> str:
+    """The AI request for an uploaded document: content plus the user's ask."""
+    request = question.strip() or DEFAULT_DOCUMENT_PROMPT
+    return f"[Document: {name}]\n\n{text}\n\n---\n\nUser request: {request}"
+
+
+async def _expand_links_with_content(message: Message, text: str) -> str:
+    """Replace a URL-centric message with the fetched page content.
+
+    Returns ``text`` unchanged when there is nothing worth fetching, the
+    message is mostly prose, or every fetch failed — the model still answers,
+    just without the page body. Fetching happens after the access check, so
+    only authorized users can make the server issue HTTP requests.
+    """
+    urls: list[str] = []
+    for candidate in _URL_RE.findall(text):
+        cleaned = _clean_url(candidate)
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+    if not urls:
+        return text
+    remainder = _URL_RE.sub(" ", text).strip()
+    if len(remainder) > _LINK_REMAINDER_LIMIT:
+        return text
+    urls = urls[:_MAX_LINKS_PER_MESSAGE]
+
+    listed = "\n".join(f"<code>{html.escape(u[:120])}</code>" for u in urls)
+    await safe_answer(message, f"🔗 <b>Reading {len(urls)} link(s)…</b>\n{listed}")
+
+    blocks: list[str] = []
+    for url in urls:
+        page = await fetch_url_text(url)
+        if page is None:
+            continue
+        header = f"[Web page: {page.url}]"
+        if page.title:
+            header += f"\nTitle: {page.title}"
+        blocks.append(f"{header}\n\n{page.text}")
+
+    if not blocks:
+        await safe_answer(
+            message,
+            "⚠️ <b>Could not read the linked page(s)</b> — answering without them.",
+        )
+        return text
+
+    request = remainder or DEFAULT_LINK_PROMPT
+    return "\n\n".join(blocks) + f"\n\n---\n\nUser request: {request}"
+
+
 # --- "Ask another model" registry ------------------------------------------
 
 # Last user question per private chat, kept in memory on purpose: after a bot
@@ -119,11 +387,74 @@ def _remember_question(chat_id: int, text: str) -> None:
         _last_questions.pop(next(iter(_last_questions)))
 
 
-def _retry_markup(message: Message) -> Any:
-    """Inline keyboard offering to re-ask, private chats only (never guests)."""
-    if config.enable_ask_other_model and _is_private(message):
-        return get_ask_other_model_keyboard()
-    return None
+# --- Edited-message notices -------------------------------------------------
+
+# Editing is free and repeatable, so the "message edited" notice is limited to
+# one per chat per cooldown: without it a user editing a message in a loop
+# would make the bot answer once per second indefinitely.
+_edit_notice_last: dict[int, float] = {}
+_EDIT_NOTICE_COOLDOWN = 30.0
+_EDIT_NOTICE_CAP = 500
+
+
+def _edit_notice_allowed(chat_id: int) -> bool:
+    """Return True (and record the time) when an edit notice may be sent."""
+    now = time.monotonic()
+    last = _edit_notice_last.get(chat_id, 0.0)
+    if now - last < _EDIT_NOTICE_COOLDOWN:
+        return False
+    _edit_notice_last.pop(chat_id, None)
+    _edit_notice_last[chat_id] = now
+    while len(_edit_notice_last) > _EDIT_NOTICE_CAP:
+        _edit_notice_last.pop(next(iter(_edit_notice_last)))
+    return True
+
+
+# --- Pending "server or neural?" enhance choices ----------------------------
+
+# Telegram user id -> clarify-question context (photo file ids, caption,
+# operations). Bytes are not cached: the stored ``file_id`` values are
+# re-downloaded when the user presses a button, which works long after the
+# original upload. One active question per user — a newer photo replaces it.
+_pending_enhance: dict[int, dict[str, Any]] = {}
+_PENDING_ENHANCE_TTL_SECONDS = 600
+
+
+def _remember_pending_enhance(
+    user_id: int, file_ids: list[str], caption: str, operations: list[str]
+) -> None:
+    now = time.monotonic()
+    _pending_enhance[user_id] = {
+        "file_ids": file_ids,
+        "caption": caption,
+        "operations": operations,
+        "expires": now + _PENDING_ENHANCE_TTL_SECONDS,
+    }
+    # Opportunistic cleanup of everything that has gone stale.
+    for uid in [u for u, item in _pending_enhance.items() if item["expires"] < now]:
+        _pending_enhance.pop(uid, None)
+
+
+def _pop_pending_enhance(user_id: int) -> dict[str, Any] | None:
+    entry = _pending_enhance.pop(user_id, None)
+    if entry is None or entry["expires"] < time.monotonic():
+        return None
+    return entry
+
+
+def _retry_markup(message: Message, export_id: int | None = None) -> Any:
+    """Inline keyboard under an answer: 📄/📝 export + re-ask (private only).
+
+    ``export_id`` is the database id of the saved assistant message; the
+    export buttons embed it in their callback data so the handler can reload
+    the exact answer with an owner check.
+    """
+    if not _is_private(message):
+        return None
+    return get_answer_keyboard(
+        export_id=export_id if config.enable_export else None,
+        ask_other=config.enable_ask_other_model,
+    )
 
 
 # --- Sending helpers -------------------------------------------------------
@@ -254,6 +585,80 @@ async def generate_and_send_image(
     return True
 
 
+async def generate_and_send_sticker(
+    message: Message,
+    prompt: str,
+    *,
+    service: UserService | None = None,
+    user_id: int | None = None,
+    model: str | None = None,
+) -> bool:
+    """Generate a sticker from ``prompt`` and send it. Returns True on success.
+
+    The image is produced by the model, then converted to a 512×512 WebP and
+    sent as a real Telegram sticker (``answer_sticker``), so the user can save
+    it or add it to a sticker set. Stickers carry no caption, so the timing
+    footer (when enabled) is sent as a short follow-up reply.
+    """
+    await message.bot.send_chat_action(
+        chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO
+    )
+    async with waiting(message):
+        result = await ai_client.generate_sticker(prompt)
+    sticker = result.data
+
+    if sticker is None:
+        await safe_answer(
+            message,
+            "❌ <b>Could not generate the sticker.</b>\n\n"
+            "The prompt may have been rejected by moderation, or the image "
+            "service / model is unavailable for your account.",
+        )
+        return False
+
+    sent = False
+    for attempt in range(2):
+        try:
+            await throttle.wait(message.chat.id)
+            await message.answer_sticker(
+                BufferedInputFile(sticker, filename="sticker.webp")
+            )
+            sent = True
+            break
+        except TelegramRetryAfter as exc:
+            if attempt >= 1:
+                break
+            await asyncio.sleep(float(exc.retry_after) + 0.1)
+        except TelegramAPIError as exc:
+            logger.error("Sending the sticker failed: %s", exc)
+            break
+
+    if not sent:
+        await safe_answer(
+            message,
+            "⚠️ <b>The sticker was generated but could not be sent.</b> "
+            "Please try again in a moment.",
+        )
+        return False
+
+    footer = format_timing(result.elapsed, model=config.image_model)
+    if footer:
+        await safe_answer(
+            message,
+            f"🎨 <i>{html.escape(prompt[:300])}</i>\n\n{html.escape(footer)}",
+        )
+
+    if service is not None and user_id is not None:
+        await service.add_message(
+            chat_id=message.chat.id,
+            user_id=user_id,
+            role="assistant",
+            content=f"[Generated sticker] {prompt}",
+            model=model,
+        )
+    return True
+
+
 # --- Access helpers --------------------------------------------------------
 
 
@@ -358,9 +763,7 @@ class _StreamPrinter:
             self._draft_id,
             self._clip(full, RICH_LIMIT),
             message_thread_id=self._thread_id,
-        ):
-            self._last_edit = time.monotonic()
-        elif await send_text_draft(
+        ) or await send_text_draft(
             bot, chat_id, self._draft_id, self._clip(full),
             message_thread_id=self._thread_id,
         ):
@@ -492,6 +895,39 @@ async def _single_shot(
     )
 
 
+async def _resolve_search_round(
+    message: Message,
+    messages: list[dict[str, Any]],
+    result: ChatResult,
+    search_calls: list[ToolCall],
+) -> None:
+    """Run the model's ``search_web`` calls and append the tool exchange.
+
+    Adds the assistant turn that requested the searches, one ``tool`` response
+    per call (the chat API rejects an assistant turn with unanswered
+    tool_calls), and a short "searching…" notice for the user. ``messages`` is
+    extended in place so the next round sees the results.
+    """
+    messages.append(build_assistant_tool_message(result.content, search_calls))
+
+    queries = [str(call.arguments.get("query") or "").strip() for call in search_calls]
+    shown = ", ".join(q for q in queries if q)
+    if shown:
+        await safe_answer(
+            message,
+            f"🔎 <b>Searching the web:</b> <i>{html.escape(shown[:200])}</i>",
+        )
+
+    for call, query in zip(search_calls, queries):
+        max_results = call.arguments.get("max_results")
+        if not isinstance(max_results, int) or isinstance(max_results, bool):
+            max_results = None
+        results = await search_web(query, max_results) if query else []
+        messages.append(
+            build_tool_response(call.id, format_search_results(query, results))
+        )
+
+
 async def _answer_with_ai(
     message: Message,
     service: UserService,
@@ -531,37 +967,86 @@ async def _answer_with_ai(
         model=model,
     )
 
-    tools = [IMAGE_TOOL] if config.enable_image_generation else None
+    tools: list[dict[str, Any]] = []
+    if config.enable_image_generation:
+        tools.append(IMAGE_TOOL)
+    if config.enable_sticker_generation:
+        tools.append(STICKER_TOOL)
+    search_ready = search_configured()
+    if search_ready:
+        tools.append(SEARCH_TOOL)
+        apply_search_hint(messages)
+    tools_arg = tools or None
     printer: _StreamPrinter | None = None
+    total_elapsed = 0.0
+    search_rounds = 0
+    result: ChatResult
 
     async with waiting(message) as notifier:
-        if config.stream_responses:
-            printer = _StreamPrinter(message, notifier)
-            try:
-                result: ChatResult = await ai_client.stream_chat_completion(
-                    messages,
-                    model=model,
-                    temperature=settings["temperature"],
-                    max_tokens=settings["max_tokens"],
-                    tools=tools,
-                    on_delta=printer.on_delta,
-                )
-            except AIStreamError as exc:
-                logger.warning(
-                    "Streaming failed (%s); retrying as a single request", exc
-                )
-                await printer.discard()
-                result = await _single_shot(messages, model, settings, tools)
-        else:
-            result = await _single_shot(messages, model, settings, tools)
+        while True:
+            if config.stream_responses:
+                printer = _StreamPrinter(message, notifier)
+                try:
+                    result = await ai_client.stream_chat_completion(
+                        messages,
+                        model=model,
+                        temperature=settings["temperature"],
+                        max_tokens=settings["max_tokens"],
+                        tools=tools_arg,
+                        on_delta=printer.on_delta,
+                    )
+                except AIStreamError as exc:
+                    logger.warning(
+                        "Streaming failed (%s); retrying as a single request", exc
+                    )
+                    await printer.discard()
+                    printer = None
+                    result = await _single_shot(messages, model, settings, tools_arg)
+            else:
+                result = await _single_shot(messages, model, settings, tools_arg)
 
-    image_call = next(
-        (call for call in result.tool_calls if call.name == "generate_image"), None
-    )
+            total_elapsed += result.elapsed
+
+            image_call = next(
+                (call for call in result.tool_calls if call.name == "generate_image"),
+                None,
+            )
+            sticker_call = next(
+                (call for call in result.tool_calls if call.name == "generate_sticker"),
+                None,
+            )
+            search_calls = (
+                [call for call in result.tool_calls if call.name == "search_web"]
+                if search_ready
+                else []
+            )
+            # Web search is a multi-round tool loop: run the searches and ask
+            # again — unless the same turn also asked for an image/sticker
+            # (those win) or the round budget is spent.
+            if (
+                search_calls
+                and image_call is None
+                and sticker_call is None
+                and search_rounds < config.max_search_rounds
+            ):
+                search_rounds += 1
+                if printer is not None:
+                    await printer.discard()
+                    printer = None
+                await _resolve_search_round(message, messages, result, search_calls)
+                continue
+            if search_calls and not result.content:
+                # Budget spent and the model still only wants to search: one
+                # final tools-less request so the user gets an answer from the
+                # results already gathered.
+                logger.info("Search round limit reached; forcing a final answer")
+                result = await _single_shot(messages, model, settings, None)
+                total_elapsed += result.elapsed
+            break
 
     # Send the textual part first, if any.
     if result.content:
-        await service.add_message(
+        saved = await service.add_message(
             chat_id=message.chat.id,
             user_id=user.id,
             role="assistant",
@@ -569,9 +1054,11 @@ async def _answer_with_ai(
             model=model,
         )
         footer = format_timing(
-            result.elapsed,
-            model=model,
+            total_elapsed,
+            model=result.model or model,
             tokens=result.total_tokens,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
         )
         await deliver_answer(
             message,
@@ -579,12 +1066,22 @@ async def _answer_with_ai(
             result.content,
             footer,
             title_source=text,
-            reply_markup=_retry_markup(message),
+            reply_markup=_retry_markup(message, saved.id if saved else None),
         )
-    elif image_call is None and printer is not None:
+    elif image_call is None and sticker_call is None and printer is not None:
         await printer.discard()
 
-    if image_call is not None:
+    if sticker_call is not None:
+        prompt = str(sticker_call.arguments.get("prompt") or text).strip() or text
+        if not await generate_and_send_sticker(
+            message,
+            prompt,
+            service=service,
+            user_id=user.id,
+            model=model,
+        ) and not result.content:
+            await refund_access(service, user.id, access)
+    elif image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
         if not await generate_and_send_image(
             message,
@@ -625,6 +1122,16 @@ async def handle_text(message: Message) -> None:
     if not text:
         return
 
+    # A question sent as a reply to a photo analyzes (or regenerates from)
+    # the quoted image instead of chatting about text alone.
+    reply = message.reply_to_message
+    if reply is not None and reply.photo:
+        await _guarded(
+            message,
+            lambda m: _route_single_photo(m, photo_from=reply, question=text),
+        )
+        return
+
     with limits.slot(user.id) as granted:
         if not granted:
             await safe_answer(message, limits.BUSY_MESSAGE)
@@ -637,6 +1144,15 @@ async def handle_text(message: Message) -> None:
             access = await _consume_access(message, service)
             if access is None:
                 return
+            # A message that is essentially bare links is expanded with the
+            # fetched page content. Runs after the access check on purpose:
+            # only authorized users may make the server issue HTTP requests.
+            if config.enable_link_analysis:
+                text = await _expand_links_with_content(message, text)
+            # Replies to text/media messages and forwards carry their
+            # provenance into the AI request so the model knows what the
+            # user is referring to.
+            text = _with_quoted_context(message, text)
             await message.bot.send_chat_action(
                 chat_id=message.chat.id, action=ChatAction.TYPING
             )
@@ -720,7 +1236,7 @@ async def _handle_voice(message: Message) -> None:
             return
 
         asr_timing = (
-            f" <i>({asr_elapsed:.1f} с)</i>"
+            f" <i>({asr_elapsed:.1f} s)</i>"
             if config.show_timing and asr_elapsed > 0
             else ""
         )
@@ -739,11 +1255,180 @@ async def _handle_voice(message: Message) -> None:
 
 @router.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    """Photos, one request at a time per user."""
-    await _guarded(message, _handle_photo)
+    """Photos: route to album (media group), vision analysis, or generation."""
+    # Media groups (albums) are collected and processed together.
+    if message.media_group_id:
+        await _handle_album_photo(message)
+        return
+    await _guarded(message, _route_single_photo)
 
 
-async def _handle_photo(message: Message) -> None:
+# --- Document analysis --------------------------------------------------------
+
+
+@router.message(F.document)
+async def handle_document(message: Message) -> None:
+    """Uploaded files: extract the text and let the AI analyze it."""
+    await _guarded(message, _handle_document)
+
+
+async def _handle_document(message: Message) -> None:
+    """Download an uploaded document, extract its text and ask the AI.
+
+    The extracted text (clipped to ``MAX_EXTRACTED_CHARS``) is stored in
+    history together with the user's caption as the question, so follow-ups
+    ("what does section 2 say?") keep the document in context.
+    """
+    user = message.from_user
+    doc = message.document
+    if user is None or doc is None:
+        return
+    if not config.enable_document_analysis:
+        return
+    if not _is_addressed(message):
+        return
+
+    file_type = detect_file_type(doc.file_name, doc.mime_type)
+    if file_type is None:
+        await safe_answer(
+            message,
+            MSG_UNSUPPORTED_DOCUMENT.format(
+                limit=config.max_document_bytes // (1024 * 1024)
+            ),
+        )
+        return
+    if doc.file_size and doc.file_size > config.max_document_bytes:
+        await safe_answer(
+            message,
+            f"⚠️ <b>The file is too large.</b> The limit is "
+            f"{config.max_document_bytes // (1024 * 1024)} MB.",
+        )
+        return
+
+    service = await _open_registered(message)
+    if service is None:
+        return
+    try:
+        access = await _consume_access(message, service)
+        if access is None:
+            return
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action=ChatAction.TYPING
+        )
+        try:
+            file = await message.bot.get_file(doc.file_id)
+            buffer = await message.bot.download_file(file.file_path)
+            data = buffer.read()
+        except Exception as exc:  # noqa: BLE001 - any download failure is final
+            logger.warning("Document download failed: %s", exc)
+            await refund_access(service, user.id, access)
+            await safe_answer(
+                message,
+                "❌ <b>Could not download the file.</b> Please try again.",
+            )
+            return
+        if len(data) > config.max_document_bytes:
+            await refund_access(service, user.id, access)
+            await safe_answer(
+                message,
+                f"⚠️ <b>The file is too large.</b> The limit is "
+                f"{config.max_document_bytes // (1024 * 1024)} MB.",
+            )
+            return
+
+        async with waiting(message):
+            extracted = await extract_document_text(file_type, data)
+        if not extracted:
+            await refund_access(service, user.id, access)
+            await safe_answer(
+                message,
+                "❌ <b>Could not extract any text from this file.</b>\n\n"
+                "Scanned PDFs (images without a text layer), password-protected "
+                "and empty documents are not supported. Send a scanned page as "
+                "a photo — vision models can read it.",
+            )
+            return
+
+        caption = strip_bot_mention(message.caption or "")
+        combined = _compose_document_context(
+            doc.file_name or "document", extracted, caption
+        )
+        await _answer_with_ai(message, service, combined, access)
+    finally:
+        await service.session.close()
+
+
+async def _route_single_photo(
+    message: Message,
+    *,
+    photo_from: Message | None = None,
+    question: str | None = None,
+) -> None:
+    """Decide whether a single photo needs analysis, generation or enhancement.
+
+    ``photo_from`` points to the message carrying the image when it is not
+    ``message`` itself (a question sent as a reply to a photo); ``question``
+    is the user's text in that case — the triggering message has no caption.
+    """
+    if not _is_addressed(message):
+        return
+    if question is not None:
+        caption = question
+    else:
+        caption = strip_bot_mention(message.caption or "").strip()
+
+    # Detect intent via AI before consuming quota.
+    service = await _open_registered(message)
+    if service is None:
+        return
+    try:
+        settings = await service.get_user_settings(message.from_user.id)  # type: ignore[union-attr]
+        intent = "analyze"
+        enhance_ops: list[str] = []
+        if caption:
+            # Intent classification is itself a PAID model call, so gate it
+            # behind a non-consuming access check: otherwise anyone — even a
+            # user with no access at all — could farm the API by sending
+            # captioned photos in a loop. The real quota unit is still consumed
+            # later, by the handler that produces the answer.
+            gate = await check_access(service, message.from_user.id, consume=False)  # type: ignore[union-attr]
+            if not gate.allowed:
+                await safe_answer(
+                    message, gate.message or get_random_themed_response()
+                )
+                return
+            intent, enhance_ops = await detect_intent(caption, settings["model"])
+            logger.info(
+                "Photo intent for %r: %s %s",
+                caption[:100],
+                intent,
+                " ".join(enhance_ops),
+            )
+    finally:
+        await service.session.close()
+
+    if intent == "enhance":
+        # Local processing: no vision model needed, no generation quota.
+        await _handle_enhance_photo(
+            message,
+            photo_from=photo_from,
+            question=question,
+            operations=enhance_ops,
+        )
+    elif intent == "generate" and config.enable_image_generation:
+        await _handle_vision_and_generate(
+            message, photo_from=photo_from, question=question
+        )
+    else:
+        await _handle_photo(message, photo_from=photo_from, question=question)
+
+
+async def _handle_photo(
+    message: Message,
+    *,
+    photo_from: Message | None = None,
+    question: str | None = None,
+) -> None:
     """Handle photo messages: analyze the image with a vision model."""
     user = message.from_user
     if user is None:
@@ -751,7 +1436,15 @@ async def _handle_photo(message: Message) -> None:
     if not _is_addressed(message):
         return
 
-    caption = strip_bot_mention(message.caption or "") or DEFAULT_VISION_PROMPT
+    photo_msg = message if photo_from is None else photo_from
+    if question is not None:
+        caption = question
+    else:
+        caption = strip_bot_mention(message.caption or "") or DEFAULT_VISION_PROMPT
+        # A photo sent as a reply to a text message: quote it for context.
+        quoted = _describe_quoted(message.reply_to_message)
+        if quoted:
+            caption = f"{quoted}\n\n---\n\n{caption}"
 
     service = await _open_registered(message)
     if service is None:
@@ -762,13 +1455,7 @@ async def _handle_photo(message: Message) -> None:
 
         # Verify the model supports images *before* consuming quota.
         if not is_vision_model(settings["model"]):
-            await message.answer(
-                "⚠️ <b>The current model does not support images.</b>\n\n"
-                f"Model <code>{html.escape(settings['model'])}</code> cannot "
-                f"process images. Switch to a vision-capable model with /models.\n\n"
-                "<b>Vision models</b> are marked 🖼️ in the list "
-                "(for example <code>qwen3.8-max</code> or <code>qwen3.8-flash</code>)."
-            )
+            await message.answer(MSG_NO_VISION.format(model=html.escape(settings["model"])))
             return
 
         access = await _consume_access(message, service)
@@ -779,10 +1466,14 @@ async def _handle_photo(message: Message) -> None:
             chat_id=message.chat.id, action=ChatAction.TYPING
         )
 
-        photo = message.photo[-1]
-        if photo.file_size and photo.file_size > MAX_PHOTO_BYTES:
+        photo = photo_msg.photo[-1]
+        if photo.file_size and photo.file_size > config.max_photo_bytes:
             await refund_access(service, user.id, access)
-            await safe_answer(message, "⚠️ <b>The image is too large</b> (limit 10 MB).")
+            await safe_answer(
+                message,
+                f"⚠️ <b>The image is too large</b> "
+                f"(limit {config.max_photo_bytes // (1024 * 1024)} MB).",
+            )
             return
         file = await message.bot.get_file(photo.file_id)
         buffer = await message.bot.download_file(file.file_path)
@@ -852,7 +1543,7 @@ async def _handle_photo(message: Message) -> None:
             )
             return
 
-        await service.add_message(
+        saved = await service.add_message(
             chat_id=message.chat.id,
             user_id=user.id,
             role="assistant",
@@ -862,12 +1553,25 @@ async def _handle_photo(message: Message) -> None:
 
         footer = format_timing(
             vision_result.elapsed,
-            model=settings["model"],
+            model=vision_result.model or settings["model"],
             tokens=vision_result.total_tokens,
+            input_tokens=vision_result.input_tokens,
+            output_tokens=vision_result.output_tokens,
         )
         # No "Ask another model" button: re-asking needs the image attached.
+        # The 📄/📝 export buttons still apply to the answer text.
+        export_markup = (
+            get_answer_keyboard(export_id=saved.id if saved else None)
+            if config.enable_export and _is_private(message)
+            else None
+        )
         await deliver_answer(
-            message, printer, response, footer, title_source=caption
+            message,
+            printer,
+            response,
+            footer,
+            title_source=caption,
+            reply_markup=export_markup,
         )
 
         hint = guest_hint(access)
@@ -875,6 +1579,784 @@ async def _handle_photo(message: Message) -> None:
             await safe_answer(message, hint)
     finally:
         await service.session.close()
+
+
+# --- Vision -> generation pipeline ----------------------------------------
+
+
+async def _handle_vision_and_generate(
+    message: Message,
+    *,
+    photo_from: Message | None = None,
+    question: str | None = None,
+) -> None:
+    """Analyze the attached photo with vision, then generate a new image.
+
+    The vision model produces a detailed description of the reference image;
+    that description and the user's prompt are combined for image generation.
+    ``photo_from``/``question`` allow the reference to come from a replied-to
+    photo while the prompt is the text of the triggering message.
+    """
+    user = message.from_user
+    if user is None:
+        return
+
+    if question is not None:
+        caption = question
+    else:
+        caption = strip_bot_mention(message.caption or "").strip()
+    photo_msg = message if photo_from is None else photo_from
+    service = await _open_registered(message)
+    if service is None:
+        return
+
+    try:
+        access = await _consume_access(message, service)
+        if access is None:
+            return
+        settings = await service.get_user_settings(user.id)
+
+        if not is_vision_model(settings["model"]):
+            await message.answer(
+                "⚠️ <b>Image generation with a reference needs a vision model.</b>\n\n"
+                f"Model <code>{html.escape(settings['model'])}</code> cannot "
+                f"process images. Switch to a vision-capable model with /models.\n\n"
+                "<b>Vision models</b> are marked 🖼️ in the list "
+                "(for example <code>qwen3.8-max</code> or <code>qwen3.8-flash</code>)."
+            )
+            return
+
+        photo = photo_msg.photo[-1]
+        if photo.file_size and photo.file_size > config.max_photo_bytes:
+            await refund_access(service, user.id, access)
+            await safe_answer(
+                message,
+                f"⚠️ <b>The image is too large</b> "
+                f"(limit {config.max_photo_bytes // (1024 * 1024)} MB).",
+            )
+            return
+        file = await message.bot.get_file(photo.file_id)
+        buffer = await message.bot.download_file(file.file_path)
+        image_bytes = buffer.read()
+
+        # Step 1: vision analysis
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action=ChatAction.TYPING
+        )
+        await safe_answer(message, "🔍 <b>Analyzing the reference image…</b>")
+
+        history = await service.get_history(message.chat.id, user_id=user.id)
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": settings["system_prompt"]},
+            *history,
+        ]
+
+        async with waiting(message):
+            vision_result = await ai_client.chat_with_image_result(
+                text=VISION_FOR_GEN_PROMPT,
+                image_bytes=image_bytes,
+                messages=base_messages,
+                model=settings["model"],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+        vision_description = (vision_result.content or "").strip()
+        if not vision_description:
+            await refund_access(service, user.id, access)
+            await safe_answer(message, "❌ <b>Could not analyze the reference image.</b>\n\nPlease try again.")
+            return
+
+        # Step 2: generate
+        gen_prompt = generation_prompt(caption, vision_description)
+
+        await service.add_message(
+            chat_id=message.chat.id,
+            user_id=user.id,
+            role="user",
+            content=f"[Image->Generate] {caption}",
+            image_url=photo.file_id,
+            model=settings["model"],
+        )
+
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO
+        )
+        await safe_answer(
+            message,
+            "🎨 <b>Generating an image based on the reference…</b>\n\n"
+            f"<blockquote expandable>{html.escape(gen_prompt[:500])}</blockquote>",
+        )
+
+        async with waiting(message):
+            result = await ai_client.generate_image_with_references(
+                prompt=gen_prompt,
+                reference_images=[image_bytes],
+            )
+        gen_image, gen_url = result.data, result.url
+
+        gen_caption = f"🎨 <i>{html.escape(caption[:900])}</i>"
+        footer = format_timing(result.elapsed, model=config.image_model)
+        if footer:
+            gen_caption = f"{gen_caption}\n\n{html.escape(footer)}"
+
+        if gen_image is not None:
+            sent = await _safe_answer_photo(
+                message,
+                BufferedInputFile(gen_image, filename="generated.png"),
+                gen_caption,
+            )
+        elif gen_url:
+            sent = await _send_image_by_url(message, gen_url, gen_caption)
+        else:
+            sent = False
+            await safe_answer(
+                message,
+                "❌ <b>Could not generate the image.</b>\n\n"
+                "The prompt may have been rejected by moderation, or the image "
+                "service / model is unavailable for your account.",
+            )
+
+        if sent:
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="assistant",
+                content=f"[Generated from reference] {caption}",
+                model=config.image_model,
+            )
+        else:
+            await refund_access(service, user.id, access)
+
+        hint = guest_hint(access)
+        if hint:
+            await safe_answer(message, hint)
+
+    finally:
+        await service.session.close()
+
+
+# --- Photo enhancement ----------------------------------------------------
+
+
+async def _handle_enhance_photo(
+    message: Message,
+    *,
+    photo_from: Message | None = None,
+    question: str | None = None,
+    operations: list[str] | None = None,
+) -> None:
+    """Improve the attached photo — on the server or with the neural network.
+
+    In private chats the user is asked which path to take (the question
+    itself consumes no quota; the answer arrives via the ``enh:`` callback).
+    Groups — and private chats with generation switched off, where the
+    neural option does not exist — get the fast, free server pipeline
+    without prompting. No vision model is required for either path: the
+    classifier already picked the operations, the server uses Pillow and
+    the neural path talks to the image-synthesis API directly.
+    """
+    user = message.from_user
+    if user is None:
+        return
+
+    if question is not None:
+        caption = question
+    else:
+        caption = strip_bot_mention(message.caption or "").strip()
+    photo_msg = message if photo_from is None else photo_from
+
+    photo = photo_msg.photo[-1]
+    if photo.file_size and photo.file_size > config.max_photo_bytes:
+        await safe_answer(
+            message,
+            f"⚠️ <b>The image is too large</b> "
+            f"(limit {config.max_photo_bytes // (1024 * 1024)} MB).",
+        )
+        return
+
+    if _is_private(message) and config.enable_image_generation:
+        # The neural option means the generation API: no question without it.
+        _remember_pending_enhance(
+            user.id, [photo.file_id], caption, operations or []
+        )
+        await safe_answer(
+            message, MSG_ENHANCE_CHOICE, reply_markup=get_enhance_choice_keyboard()
+        )
+        return
+
+    try:
+        file = await message.bot.get_file(photo.file_id)
+        buffer = await message.bot.download_file(file.file_path)
+        image_bytes = buffer.read()
+    except Exception:
+        logger.warning("Could not download photo to enhance", exc_info=True)
+        await safe_answer(
+            message, "❌ <b>Could not download the photo.</b> Please try again."
+        )
+        return
+
+    # Quota is consumed inside _run_enhancement (and refunded on failure).
+    await _run_enhancement(
+        message,
+        user,
+        [(photo.file_id, image_bytes)],
+        caption,
+        operations or [],
+        via="server",
+    )
+
+
+async def _run_enhancement(
+    target: Message,
+    user: User,
+    items: list[tuple[str, bytes]],
+    caption: str,
+    operations: list[str],
+    *,
+    via: str,
+) -> None:
+    """Enhance one or more photos and deliver the results.
+
+    Shared by the group path (``via="server"``, straight away) and by the
+    private clarify-callback (``via`` comes from the pressed button).
+    ``target`` is the message to answer into — the photo itself or the bot's
+    clarify question. Quota is consumed here: check_access counts the
+    request, refund_access gives it back when nothing could be delivered.
+    """
+    service = await _open_registered_user(user)
+    try:
+        access = await check_access(service, user.id)
+        if not access.allowed:
+            await target.answer(access.message or get_random_themed_response())
+            return
+
+        settings = await service.get_user_settings(user.id)
+        await service.add_message(
+            chat_id=target.chat.id,
+            user_id=user.id,
+            role="user",
+            content=f"[Image→Enhance:{via} {len(items)}] {caption}",
+            image_url=items[0][0],
+            model=settings["model"],
+        )
+
+        await target.bot.send_chat_action(
+            chat_id=target.chat.id, action=ChatAction.UPLOAD_PHOTO
+        )
+
+        done = 0
+        for index, (file_id, image_bytes) in enumerate(items, 1):
+            if via == "neural":
+                async with waiting(target):
+                    result = await ai_client.enhance_image_via_ai(
+                        image_bytes, operations=operations, caption=caption
+                    )
+                data, url, elapsed = result.data, result.url, result.elapsed
+                label = "🧠 <b>Enhanced by the neural network</b>"
+                timing_model = config.image_model
+            else:
+                started = time.monotonic()
+                data, applied = await enhance_image(image_bytes, operations)
+                url = None
+                elapsed = time.monotonic() - started
+                label = "🔧 <b>Enhanced:</b> " + html.escape(", ".join(applied))
+                timing_model = "Pillow"
+
+            if data is None and url is None:
+                logger.warning(
+                    "Enhance (%s) failed for photo %s of %s", via, index, file_id
+                )
+                continue
+
+            photo_caption = (
+                f"({index}/{len(items)}) {label}" if len(items) > 1 else label
+            )
+            footer = format_timing(elapsed, model=timing_model)
+            if footer:
+                photo_caption = f"{photo_caption}\n\n{html.escape(footer)}"
+
+            if data is not None:
+                filename = "enhanced.png" if data[:4] == b"\x89PNG" else "enhanced.jpg"
+                sent = await _safe_answer_photo(
+                    target,
+                    BufferedInputFile(data, filename=filename),
+                    photo_caption,
+                )
+            else:
+                sent = await _send_image_by_url(target, url or "", photo_caption)
+            if sent:
+                done += 1
+
+        if done == 0:
+            await refund_access(service, user.id, access)
+            await safe_answer(
+                target,
+                "❌ <b>Could not enhance the image.</b>\n\n"
+                "The file may be damaged or in an unsupported format, or the "
+                "image service is temporarily unavailable.",
+            )
+            return
+
+        await service.add_message(
+            chat_id=target.chat.id,
+            user_id=user.id,
+            role="assistant",
+            content=f"[Enhanced via {via}] {caption}",
+            model=settings["model"],
+        )
+
+        hint = guest_hint(access)
+        if hint:
+            await safe_answer(target, hint)
+
+    finally:
+        await service.session.close()
+
+
+# --- Album (media group) handling ----------------------------------------
+
+
+async def _handle_album_photo(message: Message) -> None:
+    """Collect photos from a media group and process the album once complete."""
+    group_id = str(message.media_group_id)
+    key = _album_key(message.chat.id, group_id)
+
+    photo = message.photo[-1]
+    now = time.monotonic()
+
+    # Reserve room BEFORE downloading: Telegram reports the size up front, so
+    # an oversized photo — or an album whose budget is already spent — costs
+    # neither bandwidth nor memory.
+    declared = photo.file_size or 0
+    async with _album_lock:
+        if key not in _album_images:
+            _album_images[key] = {
+                "images": [],
+                "message": message,
+                "last": 0.0,
+            }
+            _album_total_bytes[key] = 0
+        entry = _album_images[key]
+        if not entry["message"].caption and message.caption:
+            entry["message"] = message
+        total_before = _album_total_bytes.get(key, 0)
+
+    over_single = bool(declared) and declared > config.max_photo_bytes
+    over_album = total_before + declared > config.max_album_bytes
+
+    if over_single:
+        await safe_answer(
+            message,
+            f"⚠️ <b>Image too large.</b> Maximum size per image is "
+            f"{config.max_photo_bytes // (1024 * 1024)} MB. "
+            f"This image is {declared / (1024 * 1024):.1f} MB — skipped.",
+        )
+        await _touch_album(key, now)
+    elif over_album:
+        await safe_answer(
+            message,
+            f"⚠️ <b>Album size limit reached.</b> The maximum total is "
+            f"{config.max_album_bytes // (1024 * 1024)} MB — this image was skipped.",
+        )
+        await _touch_album(key, now)
+    else:
+        try:
+            file = await message.bot.get_file(photo.file_id)
+            buffer = await message.bot.download_file(file.file_path)
+            image_bytes = buffer.read()
+        except Exception:
+            logger.warning("Could not download album photo %s", photo.file_id, exc_info=True)
+            await _touch_album(key, now)
+            image_bytes = None
+
+        if image_bytes is not None:
+            img_size = len(image_bytes)
+            if img_size > config.max_photo_bytes:
+                await safe_answer(
+                    message,
+                    f"⚠️ <b>Image too large.</b> Maximum size per image is "
+                    f"{config.max_photo_bytes // (1024 * 1024)} MB. "
+                    f"This image is {img_size / (1024 * 1024):.1f} MB — skipped.",
+                )
+                await _touch_album(key, now)
+            else:
+                async with _album_lock:
+                    entry = _album_images.get(key)
+                    if entry is not None:
+                        entry["images"].append((photo.file_id, image_bytes))
+                        entry["last"] = now
+                        _album_total_bytes[key] = _album_total_bytes.get(key, 0) + img_size
+
+    await asyncio.sleep(_ALBUM_COLLECT_SECONDS)
+    await asyncio.sleep(0)  # yield to let other album handlers update the entry
+
+    async with _album_lock:
+        entry = _album_images.get(key)
+        if entry is None or entry["last"] > now:
+            return
+        images: list[tuple[str, bytes]] = entry.pop("images", [])
+        first_message: Message = entry.pop("message", message)
+        total_size = _album_total_bytes.pop(key, 0)
+        _album_images.pop(key, None)
+
+    if not images:
+        return
+
+    if total_size > config.max_album_bytes:
+        await safe_answer(
+            first_message,
+            f"⚠️ <b>Album too large.</b> The total album size is "
+            f"{total_size / (1024 * 1024):.1f} MB; the maximum is "
+            f"{config.max_album_bytes // (1024 * 1024)} MB. "
+            f"Please send fewer or smaller images.",
+        )
+        return
+
+    await _guarded(first_message, lambda m: _process_album(m, images))
+
+
+async def _process_album(
+    message: Message, images: list[tuple[str, bytes]]
+) -> None:
+    """Process a collected album: vision analysis, generation or enhancement."""
+    user = message.from_user
+    if user is None:
+        return
+    if not _is_addressed(message):
+        return
+
+    caption = strip_bot_mention(message.caption or "")
+
+    service = await _open_registered(message)
+    if service is None:
+        return
+
+    try:
+        access = await _consume_access(message, service)
+        if access is None:
+            return
+        settings = await service.get_user_settings(user.id)
+
+        # Detect intent via AI before processing (safe: defaults to 'analyze').
+        intent, enhance_ops = "analyze", []
+        if caption:
+            intent, enhance_ops = await detect_intent(caption, settings["model"])
+            logger.info(
+                "Album intent for %r: %s %s",
+                caption[:100],
+                intent,
+                " ".join(enhance_ops),
+            )
+
+        # Enhancement runs locally: it needs neither a vision model nor
+        # the generation service, so only the other paths check for vision.
+        wants_gen = intent == "generate" and config.enable_image_generation
+        if intent != "enhance" and not is_vision_model(settings["model"]):
+            await message.answer(MSG_NO_VISION.format(model=html.escape(settings["model"])))
+            return
+
+        valid = [(fid, img) for fid, img in images if len(img) <= config.max_photo_bytes]
+        valid_images = [img for _, img in valid]
+        if len(valid_images) < len(images):
+            await safe_answer(
+                message,
+                f"⚠️ <b>{len(images) - len(valid_images)} image(s) too large</b> "
+                f"(limit {config.max_photo_bytes // (1024 * 1024)} MB). Skipped.",
+            )
+        if not valid_images:
+            await refund_access(service, user.id, access)
+            return
+
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id, action=ChatAction.TYPING
+        )
+
+        if wants_gen:
+            # Album -> generation
+            await safe_answer(
+                message,
+                f"🔍🎨 <b>Analyzing {len(valid_images)} reference image(s) and generating…</b>",
+            )
+
+            history = await service.get_history(message.chat.id, user_id=user.id)
+            base_messages: list[dict[str, Any]] = [
+                {"role": "system", "content": settings["system_prompt"]},
+                *history,
+            ]
+
+            descriptions: list[str] = []
+            for i, img in enumerate(valid_images, 1):
+                async with waiting(message):
+                    vis = await ai_client.chat_with_image_result(
+                        text=VISION_FOR_GEN_PROMPT,
+                        image_bytes=img,
+                        messages=base_messages,
+                        model=settings["model"],
+                        temperature=0.3,
+                        max_tokens=512,
+                    )
+                desc = (vis.content or "").strip()
+                if desc:
+                    descriptions.append(f"Image {i}: {desc}")
+
+            if not descriptions:
+                await refund_access(service, user.id, access)
+                await safe_answer(message, "❌ Could not analyze the reference images.")
+                return
+
+            combined_desc = "\n\n".join(descriptions)
+            gen_prompt = generation_prompt(
+                caption or "Generate an image inspired by these references",
+                combined_desc,
+            )
+
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="user",
+                content=f"[Album->Generate {len(valid_images)} images] {caption}",
+                model=settings["model"],
+            )
+
+            await message.bot.send_chat_action(
+                chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO
+            )
+            async with waiting(message):
+                result = await ai_client.generate_image_with_references(
+                    prompt=gen_prompt,
+                    reference_images=valid_images,
+                )
+            gen_image, gen_url = result.data, result.url
+
+            gen_caption = f"🎨 <i>{html.escape((caption or 'Generated image')[:900])}</i>"
+            footer = format_timing(result.elapsed, model=config.image_model)
+            if footer:
+                gen_caption = f"{gen_caption}\n\n{html.escape(footer)}"
+
+            sent = False
+            if gen_image is not None:
+                sent = await _safe_answer_photo(
+                    message,
+                    BufferedInputFile(gen_image, filename="generated.png"),
+                    gen_caption,
+                )
+            elif gen_url:
+                sent = await _send_image_by_url(message, gen_url, gen_caption)
+
+            if sent:
+                await service.add_message(
+                    chat_id=message.chat.id,
+                    user_id=user.id,
+                    role="assistant",
+                    content=f"[Generated from {len(valid_images)} references] {caption}",
+                    model=config.image_model,
+                )
+            else:
+                await refund_access(service, user.id, access)
+                await safe_answer(message, "❌ <b>Could not generate the image.</b>")
+        elif intent == "enhance":
+            # Album -> enhancement. In private chats ask first: server or
+            # neural? The consumed quota is refunded and re-charged when the
+            # user presses a button (the photos' file ids stay fetchable).
+            if _is_private(message) and config.enable_image_generation:
+                _remember_pending_enhance(
+                    user.id,
+                    [fid for fid, _ in valid],
+                    caption,
+                    enhance_ops,
+                )
+                await refund_access(service, user.id, access)
+                await safe_answer(
+                    message,
+                    MSG_ENHANCE_CHOICE,
+                    reply_markup=get_enhance_choice_keyboard(),
+                )
+                return
+
+            await safe_answer(
+                message,
+                f"🖥️ <b>Enhancing {len(valid_images)} image(s) on the server…</b>",
+            )
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="user",
+                content=f"[Album→Enhance {len(valid_images)} images] {caption}",
+                model=settings["model"],
+            )
+
+            done = 0
+            for index, img in enumerate(valid_images, 1):
+                enhanced, applied = await enhance_image(img, enhance_ops)
+                if not enhanced:
+                    await safe_answer(
+                        message, f"⚠️ <b>Image {index} could not be processed.</b>"
+                    )
+                    continue
+                photo_caption = (
+                    f"🔧 <b>Enhanced {index}/{len(valid_images)}:</b> "
+                    + html.escape(", ".join(applied))
+                )
+                filename = (
+                    "enhanced.png" if enhanced[:4] == b"\x89PNG" else "enhanced.jpg"
+                )
+                if not await _safe_answer_photo(
+                    message, BufferedInputFile(enhanced, filename=filename), photo_caption
+                ):
+                    break
+                done += 1
+
+            if done == 0:
+                await refund_access(service, user.id, access)
+                await safe_answer(message, "❌ <b>Could not process the images.</b>")
+                return
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="assistant",
+                content=f"[Enhanced {done} images] {caption}",
+                model=settings["model"],
+            )
+        else:
+            # Album -> vision analysis
+            await safe_answer(
+                message,
+                f"🔍 <b>Analyzing {len(valid_images)} image(s)…</b>",
+            )
+
+            history = await service.get_history(message.chat.id, user_id=user.id)
+            base_messages = [
+                {"role": "system", "content": settings["system_prompt"]},
+                *history,
+            ]
+
+            full_messages = [dict(entry) for entry in base_messages]
+            content_parts: list[dict[str, Any]] = [
+                {"type": "text", "text": caption or f"Describe these {len(valid_images)} images."}
+            ]
+            for img in valid_images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": _image_data_url(img)},
+                })
+            full_messages.append({"role": "user", "content": content_parts})
+
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="user",
+                content=f"[Album {len(valid_images)} images] {caption}",
+                model=settings["model"],
+            )
+
+            async with waiting(message):
+                album_result = await ai_client.chat_completion_result(
+                    full_messages,
+                    model=settings["model"],
+                    temperature=settings["temperature"],
+                    max_tokens=settings["max_tokens"],
+                )
+            response = album_result.content or ""
+
+            if not response:
+                await refund_access(service, user.id, access)
+                await safe_answer(message, "❌ <b>Error analyzing the images.</b>")
+                return
+
+            await service.add_message(
+                chat_id=message.chat.id,
+                user_id=user.id,
+                role="assistant",
+                content=response,
+                model=settings["model"],
+            )
+
+            footer = format_timing(
+                album_result.elapsed,
+                model=album_result.model or settings["model"],
+                tokens=album_result.total_tokens,
+                input_tokens=album_result.input_tokens,
+                output_tokens=album_result.output_tokens,
+            )
+            await deliver_answer(message, None, response, footer, title_source=caption)
+
+        hint = guest_hint(access)
+        if hint:
+            await safe_answer(message, hint)
+
+    finally:
+        await service.session.close()
+
+
+# --- Enhance choice callbacks ----------------------------------------------
+
+
+@router.callback_query(F.data.startswith("enh:"))
+async def cb_enhance_choice(callback: CallbackQuery) -> None:
+    """Finish a private enhance request after the server/neural choice.
+
+    The photo is re-downloaded from the stored ``file_id`` (still valid
+    after the question), quota is consumed now — not when the question was
+    asked — and the chosen pipeline runs via the shared enhancement flow.
+    """
+    if callback.data is None or callback.from_user is None or callback.message is None:
+        await safe_answer_callback(callback)
+        return
+    via = "neural" if callback.data == "enh:ai" else "server"
+
+    entry = _pop_pending_enhance(callback.from_user.id)
+    if entry is None:
+        await safe_answer_callback(
+            callback,
+            "This enhance request has expired — please send the photo again.",
+            show_alert=True,
+        )
+        return
+
+    await safe_answer_callback(
+        callback,
+        "🧠 Enhancing with the neural network…"
+        if via == "neural"
+        else "🖥️ Enhancing on the server…",
+    )
+    origin = callback.message
+    await safe_edit_text(
+        origin,
+        "🧠 <b>Enhancing with the neural network…</b>"
+        if via == "neural"
+        else "🖥️ <b>Enhancing on the server…</b>",
+    )
+
+    with limits.slot(callback.from_user.id) as granted:
+        if not granted:
+            await safe_answer(origin, limits.BUSY_MESSAGE)
+            return
+
+        items: list[tuple[str, bytes]] = []
+        for file_id in entry["file_ids"]:
+            try:
+                file = await origin.bot.get_file(file_id)
+                buffer = await origin.bot.download_file(file.file_path)
+                items.append((str(file_id), buffer.read()))
+            except Exception:
+                logger.warning(
+                    "Could not re-download pending photo %s", file_id, exc_info=True
+                )
+        if not items:
+            await safe_answer(
+                origin,
+                "❌ <b>Could not fetch the photo anymore.</b> Please resend it.",
+            )
+            return
+
+        await _run_enhancement(
+            origin,
+            callback.from_user,
+            items,
+            str(entry["caption"]),
+            list(entry["operations"]),
+            via=via,
+        )
 
 
 # --- "Ask another model" callbacks -----------------------------------------
@@ -971,6 +2453,46 @@ async def cb_resend_with_model(callback: CallbackQuery) -> None:
             )
         finally:
             await service.session.close()
+
+
+@router.edited_message(F.text, ~F.text.startswith("/"))
+async def handle_edited_text(message: Message) -> None:
+    """Handle a user editing an already-sent question.
+
+    The answer above was produced from the previous version of the message, so
+    silently accepting the edit would desynchronise the visible conversation
+    from the stored context. Editing does **not** consume quota: the user is
+    told about it and the remembered question is refreshed so the
+    "ask another model" button re-asks the edited text.
+
+    Notices are rate-limited per chat: repeated edits must not turn into a
+    flood of bot messages.
+    """
+    user = message.from_user
+    if user is None or not message.text:
+        return
+    if not _is_addressed(message):
+        return
+
+    text = strip_bot_mention(message.text)
+    if not text:
+        return
+
+    private = _is_private(message)
+    if private:
+        _remember_question(message.chat.id, _with_quoted_context(message, text))
+
+    if not _edit_notice_allowed(message.chat.id):
+        return
+
+    note = (
+        "✏️ <b>Message edited.</b>\n\n"
+        "The answer above was based on the previous version. "
+        "Send the text again to get an answer to the new version."
+    )
+    if private and config.enable_ask_other_model:
+        note += " Or use the button below to re-ask it."
+    await safe_answer(message, note, reply_markup=_retry_markup(message))
 
 
 @router.message(F.text.startswith("/"))

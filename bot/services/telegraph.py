@@ -375,7 +375,7 @@ async def _post(endpoint: str, data: dict[str, str]) -> dict[str, Any]:
             if resp.status != 200:
                 return {"ok": False, "error": f"HTTP {resp.status}: {body[:200]}"}
             parsed = json.loads(body)
-    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+    except (TimeoutError, aiohttp.ClientError) as exc:
         return {"ok": False, "error": f"network: {exc}"}
     except json.JSONDecodeError as exc:
         return {"ok": False, "error": f"bad JSON: {exc}"}

@@ -12,23 +12,28 @@ from aiogram.types import (
 from bot.bot import bot, dp, setup_bot
 from bot.config import config
 from bot.database.session import engine, init_db
-from bot.services import telegraph
-from bot.services.ai_client import ai_client
-from bot.services.telegram_utils import safe_answer_guest
 
 # Import all handlers and register their routers with the dispatcher.
-from bot.handlers import (  # noqa: F401
+from bot.handlers import (
     admin,
     chat,
     clear,
+    export,
     guest,
     help,
     image,
     models,
     prompt,
+    reminders,
     start,
     stats,
 )
+from bot.handlers.chat import _album_cleanup
+from bot.services import telegraph
+from bot.services.ai_client import ai_client, ffmpeg_available
+from bot.services.health import start_health_server, stop_health_server
+from bot.services.reminders import cancel_pending_fires, reminder_scheduler_loop
+from bot.services.telegram_utils import safe_answer_guest
 
 # Order matters: command routers are registered before the catch-all chat router.
 dp.include_router(start.router)
@@ -36,6 +41,8 @@ dp.include_router(help.router)
 dp.include_router(models.router)
 dp.include_router(image.router)
 dp.include_router(prompt.router)
+dp.include_router(reminders.router)
+dp.include_router(export.router)
 dp.include_router(clear.router)
 dp.include_router(stats.router)
 dp.include_router(admin.router)
@@ -106,11 +113,25 @@ async def main() -> None:
     config.validate()
     logger.info("Configuration validated successfully")
 
+    cleanup_task: asyncio.Task[None] | None = None
+    reminder_task: asyncio.Task[None] | None = None
+    health_runner = None
     try:
         await init_db()
         logger.info("Database initialized")
 
         await setup_bot()
+
+        # Optional HTTP liveness endpoint (HEALTH_PORT; disabled by default).
+        health_runner = await start_health_server()
+
+        # Start the periodic album-cleanup background task (prevents memory
+        # leak from stale media-group entries).
+        cleanup_task = asyncio.create_task(_album_cleanup())
+
+        # Start the reminder scheduler (fires due reminders / AI requests).
+        if config.enable_reminders:
+            reminder_task = asyncio.create_task(reminder_scheduler_loop())
 
         # Hide curated models the account cannot access via the API.
         available = await ai_client.refresh_available_models()
@@ -125,6 +146,17 @@ async def main() -> None:
                 config.default_model,
             )
 
+        # Voice recognition needs ffmpeg to convert OGG/Opus → PCM16 for the
+        # Realtime ASR WebSocket.  Warn loudly but keep the bot running: text,
+        # photos and images still work, and the voice handler degrades to the
+        # "could not recognize" reply.
+        if config.enable_voice and not ffmpeg_available():
+            logger.warning(
+                "ffmpeg not found on PATH: voice messages cannot be recognized. "
+                "Install it (see README → «Установка ffmpeg») or set "
+                "ENABLE_VOICE=false to silence the feature."
+            )
+
         logger.info(
             "Starting bot polling (guest access: %s, guest mode: %s)",
             config.allow_guest_access,
@@ -133,6 +165,17 @@ async def main() -> None:
 
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        for task in (cleanup_task, reminder_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        # Stop in-flight reminder deliveries before the engine goes away:
+        # they still touch the database (disable/reschedule on failure).
+        await cancel_pending_fires()
+        await stop_health_server(health_runner)
         await ai_client.close()
         await telegraph.close()
         await bot.session.close()

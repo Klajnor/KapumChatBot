@@ -15,7 +15,7 @@ from aiogram.exceptions import (
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from bot.bot import get_bot_id, get_bot_username
-from bot.config import DEFAULT_TIMING_FORMAT, config
+from bot.config import DEFAULT_TIMING_FORMAT, DEFAULT_TIMING_FORMAT_TOKENS, config
 from bot.services.markdown import render, split_chunks
 from bot.services.science import normalize_formulas
 from bot.services.formulas import (
@@ -95,24 +95,41 @@ def format_timing(
     *,
     model: str | None = None,
     tokens: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
 ) -> str:
     """Footer with the AI API processing time, or "" when it should not show.
 
     ``TIMING_FORMAT`` supports ``{seconds}``, ``{model}`` and ``{tokens}``.
+    When the API reported token usage (any of ``tokens``/``input_tokens``/
+    ``output_tokens`` is known), ``TIMING_FORMAT_TOKENS`` is used instead:
+    it additionally supports ``{input}`` and ``{output}``. Requests without
+    usage counters (e.g. image generation) keep the plain format.
     """
     if not config.show_timing or not elapsed or elapsed <= 0:
         return ""
+    has_usage = (
+        tokens is not None or input_tokens is not None or output_tokens is not None
+    )
+    if has_usage:
+        template = config.timing_format_tokens or DEFAULT_TIMING_FORMAT_TOKENS
+    else:
+        template = config.timing_format or DEFAULT_TIMING_FORMAT
     values = {
         "seconds": f"{elapsed:.1f}",
         "model": model or config.default_model,
         "tokens": tokens if tokens is not None else "—",
+        "input": input_tokens if input_tokens is not None else "—",
+        "output": output_tokens if output_tokens is not None else "—",
     }
-    template = config.timing_format or DEFAULT_TIMING_FORMAT
     try:
         return template.format(**values)
     except (KeyError, IndexError, ValueError):
         logger.warning("Invalid TIMING_FORMAT %r; using the default", template)
-        return DEFAULT_TIMING_FORMAT.format(**values)
+        fallback = (
+            DEFAULT_TIMING_FORMAT_TOKENS if has_usage else DEFAULT_TIMING_FORMAT
+        )
+        return fallback.format(**values)
 
 
 def with_timing(text: str, footer: str) -> str:
