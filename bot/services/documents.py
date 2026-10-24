@@ -429,14 +429,16 @@ class _PinnedResolver(aiohttp.resolver.AbstractResolver):
         return None
 
 
-async def _fetch_body(url: str) -> tuple[bytes | None, str, str]:
+async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
     """GET ``url`` following redirects manually; validate every hop.
 
-    Returns ``(body, final_url, content_type)``; body is None on any refusal
-    or failure. ``allow_redirects=False`` is deliberate: aiohttp would follow
-    a redirect to an internal address without giving us a chance to check it.
-    Every hop (including the first URL) is resolved once, screened for public
-    addresses, and the request is pinned to exactly those addresses.
+    Returns ``(body, final_url, content_type)``. On any refusal or failure
+    ``body`` and ``content_type`` are ``None``; ``content_type`` is the bare
+    media type (``text/plain``, without parameters like ``charset``).
+    ``allow_redirects=False`` is deliberate: aiohttp would follow a redirect to
+    an internal address without giving us a chance to check it. Every hop
+    (including the first URL) is resolved once, screened for public addresses,
+    and the request is pinned to exactly those addresses.
     """
     timeout = aiohttp.ClientTimeout(total=config.link_fetch_timeout)
     try:
@@ -444,19 +446,19 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str]:
             try:
                 parsed = urlsplit(url)
             except ValueError:
-                return None, url, ""
+                return None, url, None
             if parsed.scheme not in ("http", "https") or not parsed.hostname:
                 logger.warning(
                     "Refusing a non-http(s) or hostless URL: %s",
                     parsed.netloc or url,
                 )
-                return None, url, ""
+                return None, url, None
             ips = await asyncio.to_thread(_resolve_public_ips, parsed.hostname)
             if not ips:
                 logger.warning(
                     "Refusing a host without public addresses: %s", parsed.netloc
                 )
-                return None, url, ""
+                return None, url, None
             connector = aiohttp.TCPConnector(resolver=_PinnedResolver(ips))
             try:
                 async with aiohttp.ClientSession(
@@ -468,14 +470,17 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str]:
                         if resp.status in (301, 302, 303, 307, 308):
                             location = resp.headers.get("Location")
                             if not location:
-                                return None, url, ""
+                                return None, url, None
                             url = urljoin(url, location)
                             continue
                         if resp.status != 200:
                             logger.info("URL fetch got HTTP %s", resp.status)
-                            return None, url, ""
+                            return None, url, None
                         content_type = (
-                            (resp.headers.get("Content-Type") or "").lower()
+                            (resp.headers.get("Content-Type") or "")
+                            .lower()
+                            .split(";", 1)[0]
+                            .strip()
                         )
                         allowed = (
                             content_type.startswith(
@@ -493,21 +498,21 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str]:
                             logger.info(
                                 "Skipping non-text content type %r", content_type
                             )
-                            return None, url, ""
+                            return None, url, None
                         declared = resp.content_length
                         if declared is not None and declared > _MAX_FETCH_BYTES:
                             logger.info("Page is too large (%d bytes)", declared)
-                            return None, url, ""
+                            return None, url, None
                         body = await resp.content.read(_MAX_FETCH_BYTES + 1)
                         if len(body) > _MAX_FETCH_BYTES:
-                            return None, url, ""
+                            return None, url, None
                         return body, str(resp.url), content_type
             finally:
                 await connector.close()
     except (TimeoutError, aiohttp.ClientError, OSError) as exc:
         logger.warning("URL fetch failed for %s: %s", urlsplit(url).netloc, exc)
-        return None, url, ""
-    return None, url, ""
+        return None, url, None
+    return None, url, None
 
 
 async def fetch_url_text(url: str) -> FetchedPage | None:
@@ -523,7 +528,9 @@ async def fetch_url_text(url: str) -> FetchedPage | None:
     if body is None:
         return None
     try:
-        title, text = await asyncio.to_thread(_extract_page_text, body, content_type)
+        title, text = await asyncio.to_thread(
+            _extract_page_text, body, content_type or ""
+        )
     except Exception as exc:  # noqa: BLE001 - extraction must never propagate
         logger.error("Page text extraction failed: %s", exc)
         return None

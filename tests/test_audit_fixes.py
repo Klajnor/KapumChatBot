@@ -123,6 +123,7 @@ class AlbumSizeGuardTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             media_group_id="grp",
             chat=SimpleNamespace(id=42),
+            from_user=SimpleNamespace(id=1),
             caption=caption,
             photo=[SimpleNamespace(file_id="f1", file_size=size)],
             bot=SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
@@ -159,6 +160,56 @@ class AlbumSizeGuardTests(unittest.IsolatedAsyncioTestCase):
         answer.assert_awaited()
         self.assertIn("Album size limit", answer.call_args.args[1])
         guarded.assert_not_awaited()
+
+    async def test_global_concurrency_budget_refuses_new_album(self):
+        for index in range(chat._ALBUM_MAX_CONCURRENT):
+            key = chat._album_key(1000 + index, f"other-{index}")
+            chat._album_images[key] = {
+                "images": [],
+                "message": None,
+                "last": 0.0,
+                "user_id": 1000 + index,
+            }
+            chat._album_total_bytes[key] = 0
+
+        message = self._message(size=1024)
+        with patch.object(chat, "safe_answer", AsyncMock()) as answer:
+            await chat._handle_album_photo(message)
+        message.bot.get_file.assert_not_awaited()
+        self.assertIn("Too many albums", answer.call_args.args[1])
+
+    async def test_per_user_album_budget_refuses_new_album(self):
+        for index in range(chat._ALBUM_MAX_PER_USER):
+            key = chat._album_key(2000 + index, f"same-user-{index}")
+            chat._album_images[key] = {
+                "images": [],
+                "message": None,
+                "last": 0.0,
+                "user_id": 1,
+            }
+            chat._album_total_bytes[key] = 0
+
+        message = self._message(size=1024)
+        with patch.object(chat, "safe_answer", AsyncMock()) as answer:
+            await chat._handle_album_photo(message)
+        message.bot.get_file.assert_not_awaited()
+        self.assertIn("Too many albums", answer.call_args.args[1])
+
+    async def test_total_bytes_budget_refuses_new_album(self):
+        key = chat._album_key(3000, "big")
+        chat._album_images[key] = {
+            "images": [],
+            "message": None,
+            "last": 0.0,
+            "user_id": 999,
+        }
+        chat._album_total_bytes[key] = chat._ALBUM_MAX_TOTAL_BYTES
+
+        message = self._message(size=1024)
+        with patch.object(chat, "safe_answer", AsyncMock()) as answer:
+            await chat._handle_album_photo(message)
+        message.bot.get_file.assert_not_awaited()
+        self.assertIn("Too many albums", answer.call_args.args[1])
 
 
 class EditedNoticeThrottleTests(unittest.IsolatedAsyncioTestCase):

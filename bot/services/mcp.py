@@ -278,6 +278,21 @@ def apply_mcp_hint(messages: list[dict[str, Any]]) -> None:
         return
 
 
+def remove_mcp_hint(messages: list[dict[str, Any]]) -> None:
+    """Drop the "second brain" guidance when its tools are withheld.
+
+    Used when untrusted content disables MCP mid-conversation: the model must
+    not be told about tools it cannot call in this request.
+    """
+    for entry in messages:
+        if entry.get("role") != "system":
+            continue
+        content = entry.get("content")
+        if isinstance(content, str) and MCP_SYSTEM_HINT in content:
+            entry["content"] = content.replace(f"\n\n{MCP_SYSTEM_HINT}", "")
+        return
+
+
 class MCPClient:
     """A single stdio MCP connection (own subprocess and JSON-RPC channel)."""
 
@@ -309,6 +324,20 @@ class MCPClient:
 
             environment = _child_environment(self.server.env)
             command = _expand_env(self.server.command)
+            if not os.path.isabs(command):
+                if not config.mcp_allow_path_command:
+                    raise MCPError(
+                        f"MCP-сервер {self.server.name!r}: команда {command!r} "
+                        "не является абсолютным путём. Укажите полный путь к "
+                        "интерпретатору в .mcp.json (или задайте "
+                        "MCP_ALLOW_PATH_COMMAND=true, если PATH доверенный)."
+                    )
+                logger.warning(
+                    "MCP server %r resolves command %r through PATH; make sure "
+                    "no untrusted directory precedes it",
+                    self.server.name,
+                    command,
+                )
             args = [_expand_env(arg) for arg in self.server.args]
             cwd = _expand_env(self.server.cwd) if self.server.cwd else None
             try:

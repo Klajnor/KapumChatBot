@@ -138,7 +138,58 @@ def _media_log_info(value: str) -> dict[str, Any]:
 
 
 def _request_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Whitelist request details; text is complete, media is metadata only."""
+    """Metadata-only view of a request payload: message **sizes**, not texts.
+
+    Conversation content is personal data, so the default request log carries
+    roles, character counts, media metadata, tool names and parameters — never
+    the prompts, the history or tool results. Full texts require an explicit
+    opt-in (``LOG_PROMPTS=true``) and DEBUG level, see
+    :func:`_full_request_log_payload`.
+    """
+    summary = {key: payload[key] for key in (
+        "model", "temperature", "max_tokens", "stream", "asr_options", "parameters"
+    ) if key in payload}
+    messages = payload.get("messages") or (payload.get("input") or {}).get("messages") or []
+    logged_messages = []
+    for message in messages:
+        content = message.get("content")
+        entry: dict[str, Any] = {"role": message.get("role")}
+        if isinstance(content, str):
+            entry["chars"] = len(content)
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str):
+                    parts.append({"type": "text", "chars": len(part["text"])})
+                elif "image_url" in part:
+                    ref = part["image_url"]
+                    value = ref.get("url", "") if isinstance(ref, dict) else str(ref)
+                    parts.append({"type": "image", **_media_log_info(value)})
+                elif "input_audio" in part:
+                    ref = part["input_audio"]
+                    value = ref.get("data", "") if isinstance(ref, dict) else str(ref)
+                    parts.append({"type": "audio", **_media_log_info(value)})
+            entry["content"] = parts
+        elif message.get("tool_calls"):
+            entry["tool_calls"] = [
+                str(((call or {}).get("function") or {}).get("name") or "")
+                for call in message["tool_calls"]
+            ]
+        logged_messages.append(entry)
+    summary["messages"] = logged_messages
+    if payload.get("tools"):
+        summary["tools"] = [tool.get("function", {}).get("name") for tool in payload["tools"]]
+    return summary
+
+
+def _full_request_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Complete payload including message texts — for ``LOG_PROMPTS`` only.
+
+    Deliberately dangerous: the log becomes a plaintext archive of the
+    conversation. Only used when the operator opted in and DEBUG is enabled.
+    """
     summary = {key: payload[key] for key in (
         "model", "temperature", "max_tokens", "stream", "asr_options", "parameters"
     ) if key in payload}
@@ -165,11 +216,37 @@ def _request_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     value = ref.get("data", "") if isinstance(ref, dict) else str(ref)
                     parts.append({"type": "audio", **_media_log_info(value)})
             entry["content"] = parts
+        elif message.get("tool_calls"):
+            entry["tool_calls"] = [
+                str(((call or {}).get("function") or {}).get("name") or "")
+                for call in message["tool_calls"]
+            ]
         logged_messages.append(entry)
     summary["messages"] = logged_messages
     if payload.get("tools"):
         summary["tools"] = [tool.get("function", {}).get("name") for tool in payload["tools"]]
     return summary
+
+
+def _log_request_payload(request_id: str, endpoint: str, payload: dict[str, Any], *, timeout: float | None = None) -> None:
+    """Log an outgoing request: metadata at INFO, full text only when opted in."""
+    if config.log_prompts and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "AI API request id=%s path=%s timeout=%ss full_payload=%s",
+            request_id,
+            endpoint,
+            timeout if timeout is not None else "-",
+            json.dumps(_full_request_log_payload(payload), ensure_ascii=False),
+        )
+    elif logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "AI API request id=%s path=%s timeout=%ss payload=%s",
+            request_id,
+            endpoint,
+            timeout if timeout is not None else "-",
+            json.dumps(_request_log_payload(payload), ensure_ascii=False),
+        )
+
 
 # Model catalog for the /models menu. It lives in the ``AI_MODELS`` environment
 # variable (see .env) so it can be updated without touching the code; the
@@ -853,12 +930,7 @@ class AIClient:
         """One streaming request; raises :class:`AIStreamError` on failure."""
         request_id = uuid4().hex[:12]
         started = time.monotonic()
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "AI API stream request id=%s path=/chat/completions payload=%s",
-                request_id,
-                json.dumps(_request_log_payload(payload), ensure_ascii=False),
-            )
+        _log_request_payload(request_id, "/chat/completions", payload)
 
         parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
@@ -1564,12 +1636,9 @@ class AIClient:
         started = time.monotonic()
         request_id = uuid4().hex[:12]
         endpoint = urlsplit(target).path
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "AI API request id=%s path=%s timeout=%ss payload=%s",
-                request_id, endpoint, request_timeout.total,
-                json.dumps(_request_log_payload(payload), ensure_ascii=False),
-            )
+        _log_request_payload(
+            request_id, endpoint, payload, timeout=request_timeout.total
+        )
 
         def _elapsed() -> float:
             return time.monotonic() - started

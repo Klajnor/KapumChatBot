@@ -55,6 +55,7 @@ from bot.services.mcp import (
     apply_mcp_hint,
     mcp_available,
     mcp_manager,
+    remove_mcp_hint,
 )
 from bot.services.progress import waiting
 from bot.services.rich import (
@@ -89,6 +90,11 @@ from bot.services.telegram_utils import (
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
+from bot.services.untrusted import (
+    apply_untrusted_hint,
+    messages_have_untrusted_content,
+    wrap_untrusted,
+)
 from bot.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -152,6 +158,22 @@ _album_lock: asyncio.Lock = asyncio.Lock()
 _album_total_bytes: dict[str, int] = {}  # per-key running total for size checks
 _ALBUM_COLLECT_SECONDS = 1.5  # how long to wait for the next photo
 _ALBUM_CLEANUP_SECONDS = 300  # discard stale album entries after 5 minutes
+# Album buffers hold raw photo bytes in RAM for up to _ALBUM_CLEANUP_SECONDS
+# and are collected before any per-user slot is taken, so a flood of media
+# groups must not be able to exhaust memory. New albums are refused once the
+# global budget is spent; every appended photo re-checks the real byte count.
+_ALBUM_MAX_CONCURRENT = 8
+_ALBUM_MAX_PER_USER = 2
+_ALBUM_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+_ALBUM_BUDGET_NOTICE = (
+    "⏳ <b>Too many albums are being processed.</b>\n\n"
+    "Please wait a moment and send the photos again."
+)
+
+
+def _album_bytes_in_flight() -> int:
+    """Total bytes currently buffered across all in-flight albums."""
+    return sum(_album_total_bytes.values())
 
 
 async def _album_cleanup() -> None:
@@ -258,7 +280,8 @@ def _describe_quoted(reply: Message | None) -> str | None:
     body = "\n".join(parts)
     if len(body) > _MAX_QUOTED_CHARS:
         body = body[:_MAX_QUOTED_CHARS] + "…"
-    return f"[Quoted message from {_sender_name(reply)}]\n{body}"
+    # The quoted text was written by somebody else: frame it as data.
+    return f"[Quoted message from {_sender_name(reply)}]\n{wrap_untrusted('quoted', body)}"
 
 
 def _forward_source_name(message: Message) -> str | None:
@@ -280,6 +303,8 @@ def _with_quoted_context(message: Message, text: str) -> str:
 
     The combined text is what the AI sees and what is stored in history, so
     follow-up questions keep working after the original leaves the window.
+    Both the quoted body and a forwarded message are third-party content and
+    are wrapped as untrusted (see ``bot/services/untrusted.py``).
     """
     quoted = _describe_quoted(message.reply_to_message)
     if quoted:
@@ -289,7 +314,7 @@ def _with_quoted_context(message: Message, text: str) -> str:
         label = (
             f"[Forwarded message from {source}]" if source else "[Forwarded message]"
         )
-        text = f"{label}\n{text}"
+        text = f"{label}\n{wrap_untrusted('forward', text)}"
     return text
 
 
@@ -326,9 +351,15 @@ def _clean_url(candidate: str) -> str:
 
 
 def _compose_document_context(name: str, text: str, question: str) -> str:
-    """The AI request for an uploaded document: content plus the user's ask."""
+    """The AI request for an uploaded document: content plus the user's ask.
+
+    The extracted document body is third-party content, so it is wrapped in
+    untrusted-content tags (see ``bot/services/untrusted.py``): a malicious
+    PDF must not be able to inject instructions into the conversation.
+    """
     request = question.strip() or DEFAULT_DOCUMENT_PROMPT
-    return f"[Document: {name}]\n\n{text}\n\n---\n\nUser request: {request}"
+    document = wrap_untrusted("document", f"[Document: {name}]\n\n{text}")
+    return f"{document}\n\n---\n\nUser request: {request}"
 
 
 async def _expand_links_with_content(message: Message, text: str) -> str:
@@ -338,6 +369,9 @@ async def _expand_links_with_content(message: Message, text: str) -> str:
     message is mostly prose, or every fetch failed — the model still answers,
     just without the page body. Fetching happens after the access check, so
     only authorized users can make the server issue HTTP requests.
+
+    Page bodies are wrapped as untrusted content: a page that tries to steer
+    the model ("ignore your rules…") must stay data.
     """
     urls: list[str] = []
     for candidate in _URL_RE.findall(text):
@@ -362,7 +396,7 @@ async def _expand_links_with_content(message: Message, text: str) -> str:
         header = f"[Web page: {page.url}]"
         if page.title:
             header += f"\nTitle: {page.title}"
-        blocks.append(f"{header}\n\n{page.text}")
+        blocks.append(wrap_untrusted("web", f"{header}\n\n{page.text}"))
 
     if not blocks:
         await safe_answer(
@@ -932,7 +966,9 @@ async def _resolve_tool_round(
     tool_calls), and a short notice for the user. A call whose round budget is
     spent still gets an answer explaining that, so every ``tool_call`` is
     closed. ``messages`` is extended in place so the next round sees the
-    results.
+    results. The exchange lives **only** in this request: nothing here is
+    written to the database — the history stores the user question and the
+    final answer, never tool calls or tool output.
     """
     messages.append(build_assistant_tool_message(result.content, calls))
 
@@ -990,6 +1026,20 @@ async def _resolve_tool_round(
         messages.append(build_tool_response(call.id, output))
 
 
+def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the MCP (private notes) tools from the catalog.
+
+    Used when the conversation contains untrusted content: a fetched page or
+    document must not be able to steer the model into reading the admin's
+    personal notes.
+    """
+    return [
+        tool
+        for tool in tools
+        if not str((tool.get("function") or {}).get("name", "")).startswith("mcp__")
+    ]
+
+
 async def _answer_with_ai(
     message: Message,
     service: UserService,
@@ -1045,10 +1095,9 @@ async def _answer_with_ai(
         mcp_tools = await mcp_manager.openai_tools()
         if mcp_tools:
             tools.extend(mcp_tools)
-            apply_mcp_hint(messages)
         else:
             mcp_ready = False
-    tools_arg = tools or None
+    tools_arg: list[dict[str, Any]] | None
     printer: _StreamPrinter | None = None
     total_elapsed = 0.0
     search_rounds = 0
@@ -1057,6 +1106,21 @@ async def _answer_with_ai(
 
     async with waiting(message) as notifier:
         while True:
+            # Third-party content (documents, fetched pages, quoted/forwarded
+            # messages, search results) must not drive the private-note tools.
+            # It can be present from the start (and persists in the stored
+            # history) or appear after a search round — re-check every round.
+            if messages_have_untrusted_content(messages):
+                apply_untrusted_hint(messages)
+                if mcp_ready:
+                    mcp_ready = False
+                    remove_mcp_hint(messages)
+                    logger.info(
+                        "MCP tools withheld: the request contains untrusted content"
+                    )
+            if mcp_ready:
+                apply_mcp_hint(messages)
+            tools_arg = (tools if mcp_ready else _without_mcp_tools(tools)) or None
             if config.stream_responses:
                 printer = _StreamPrinter(message, notifier)
                 try:
@@ -1514,12 +1578,8 @@ async def _route_single_photo(
                 )
                 return
             intent, enhance_ops = await detect_intent(caption, settings["model"])
-            logger.info(
-                "Photo intent for %r: %s %s",
-                caption[:100],
-                intent,
-                " ".join(enhance_ops),
-            )
+            # The caption is user content: log the decision only, not the text.
+            logger.info("Photo intent: %s %s", intent, " ".join(enhance_ops))
     finally:
         await service.session.close()
 
@@ -2054,23 +2114,47 @@ async def _handle_album_photo(message: Message) -> None:
 
     photo = message.photo[-1]
     now = time.monotonic()
+    sender = getattr(message, "from_user", None)
+    sender_id = sender.id if sender is not None else 0
 
     # Reserve room BEFORE downloading: Telegram reports the size up front, so
     # an oversized photo — or an album whose budget is already spent — costs
-    # neither bandwidth nor memory.
+    # neither bandwidth nor memory. On top of the per-album cap, the global
+    # in-flight budget (albums, bytes, per-user albums) stops a flood of media
+    # groups from exhausting RAM: buffers live for up to _ALBUM_CLEANUP_SECONDS
+    # and are collected before any per-user request slot is taken.
     declared = photo.file_size or 0
+    over_budget = False
     async with _album_lock:
         if key not in _album_images:
-            _album_images[key] = {
-                "images": [],
-                "message": message,
-                "last": 0.0,
-            }
-            _album_total_bytes[key] = 0
-        entry = _album_images[key]
-        if not entry["message"].caption and message.caption:
-            entry["message"] = message
-        total_before = _album_total_bytes.get(key, 0)
+            same_user = sum(
+                1
+                for entry in _album_images.values()
+                if entry.get("user_id") == sender_id
+            )
+            if (
+                len(_album_images) >= _ALBUM_MAX_CONCURRENT
+                or same_user >= _ALBUM_MAX_PER_USER
+                or _album_bytes_in_flight() + declared > _ALBUM_MAX_TOTAL_BYTES
+            ):
+                over_budget = True
+            else:
+                _album_images[key] = {
+                    "images": [],
+                    "message": message,
+                    "last": 0.0,
+                    "user_id": sender_id,
+                }
+                _album_total_bytes[key] = 0
+        if not over_budget:
+            entry = _album_images.get(key)
+            if entry is not None and not entry["message"].caption and message.caption:
+                entry["message"] = message
+            total_before = _album_total_bytes.get(key, 0)
+
+    if over_budget:
+        await safe_answer(message, _ALBUM_BUDGET_NOTICE)
+        return
 
     over_single = bool(declared) and declared > config.max_photo_bytes
     over_album = total_before + declared > config.max_album_bytes
@@ -2111,12 +2195,35 @@ async def _handle_album_photo(message: Message) -> None:
                 )
                 await _touch_album(key, now)
             else:
+                # The declared size can be missing or understated, so the real
+                # byte count is checked again before the buffer is kept.
+                appended = False
+                gone = False
                 async with _album_lock:
                     entry = _album_images.get(key)
-                    if entry is not None:
-                        entry["images"].append((photo.file_id, image_bytes))
-                        entry["last"] = now
-                        _album_total_bytes[key] = _album_total_bytes.get(key, 0) + img_size
+                    if entry is None:
+                        gone = True
+                    else:
+                        others = sum(
+                            value
+                            for other, value in _album_total_bytes.items()
+                            if other != key
+                        )
+                        if (
+                            others + _album_total_bytes.get(key, 0) + img_size
+                            <= _ALBUM_MAX_TOTAL_BYTES
+                        ):
+                            entry["images"].append((photo.file_id, image_bytes))
+                            entry["last"] = now
+                            _album_total_bytes[key] = (
+                                _album_total_bytes.get(key, 0) + img_size
+                            )
+                            appended = True
+                if gone:
+                    return
+                if not appended:
+                    await safe_answer(message, _ALBUM_BUDGET_NOTICE)
+                    await _touch_album(key, now)
 
     await asyncio.sleep(_ALBUM_COLLECT_SECONDS)
     await asyncio.sleep(0)  # yield to let other album handlers update the entry
@@ -2173,12 +2280,8 @@ async def _process_album(
         intent, enhance_ops = "analyze", []
         if caption:
             intent, enhance_ops = await detect_intent(caption, settings["model"])
-            logger.info(
-                "Album intent for %r: %s %s",
-                caption[:100],
-                intent,
-                " ".join(enhance_ops),
-            )
+            # Log the decision only: the caption is user content.
+            logger.info("Album intent: %s %s", intent, " ".join(enhance_ops))
 
         # Enhancement runs locally: it needs neither a vision model nor
         # the generation service, so only the other paths check for vision.

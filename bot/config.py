@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-import os
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -273,15 +274,6 @@ DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
             "шути, когда это уместно. Отвечай на русском языке."
         ),
     },
-    "friend": {
-        "name": "😊 Друг",
-        "prompt": (
-            "Ты — тёплый и дружелюбный собеседник. Держись непринуждённо, тепло "
-            "и поддерживающе, проявляй эмпатию, задавай встречные вопросы и "
-            "делись интересными мыслями. Оставайся честным и уважительным, "
-            "шути, когда это уместно. Отвечай на русском языке."
-        ),
-    },    
     "marvin":{
         "name": "🤖 Марвин",
         "prompt": (
@@ -386,7 +378,71 @@ def _mcp_server_entry(name: str, entry: Any) -> dict[str, Any] | None:
     return server
 
 
-def _load_mcp_servers(inline: str, config_file: str) -> dict[str, dict[str, Any]]:
+def _read_mcp_config_file(path: str, expected_sha256: str = "") -> Any | None:
+    """Load and integrity-check an ``.mcp.json`` file; None when unusable.
+
+    ``MCP_CONFIG_SHA256`` optionally pins the exact file contents: a config
+    that changed (for example through a synced vault) is ignored instead of
+    executed. A group/world-writable file is reported on POSIX.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        log.warning("MCP config file not found: %s", path)
+        return None
+    except OSError as exc:
+        log.warning("Cannot read MCP config %s: %s", path, exc)
+        return None
+
+    expected = (expected_sha256 or "").strip().lower()
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected and digest != expected:
+        log.error(
+            "MCP config %s does not match MCP_CONFIG_SHA256 "
+            "(expected %s, got %s); file-based servers are ignored",
+            path,
+            expected,
+            digest,
+        )
+        return None
+
+    if os.name != "nt":
+        try:
+            if os.stat(path).st_mode & 0o022:
+                log.warning(
+                    "MCP config %s is writable by group/other; keep it out of "
+                    "shared/synced directories or pin MCP_CONFIG_SHA256",
+                    path,
+                )
+        except OSError:
+            pass
+
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log.warning("Cannot parse MCP config %s: %s", path, exc)
+        return None
+
+
+def _is_inside_directory(path: str, directory: str) -> bool:
+    """True when ``path`` is ``directory`` or below it (after resolving both)."""
+    try:
+        root = os.path.realpath(directory)
+        target = os.path.realpath(path)
+        common = os.path.commonpath([root, target])
+        return os.path.normcase(common) == os.path.normcase(root)
+    except (OSError, ValueError):
+        return False
+
+
+def _load_mcp_servers(
+    inline: str,
+    config_file: str,
+    expected_sha256: str = "",
+    allow_unpinned_config: bool = False,
+) -> dict[str, dict[str, Any]]:
     """Load MCP server definitions from a ``.mcp.json`` and/or inline JSON.
 
     The file format is the usual ``{"mcpServers": {...}}`` object (a bare
@@ -394,6 +450,13 @@ def _load_mcp_servers(inline: str, config_file: str) -> dict[str, dict[str, Any]
     object inline and overrides entries with the same name. Invalid JSON and
     malformed entries are skipped with a warning: a broken MCP config must
     never stop the bot from starting.
+
+    ``expected_sha256`` (``MCP_CONFIG_SHA256``) pins the file bytes: when it is
+    set and the file does not match, file-based servers are skipped (inline
+    ``MCP_SERVERS`` entries still apply). A config **outside** the working
+    directory (a synced vault, for example) is only loaded when its hash is
+    pinned or ``allow_unpinned_config`` (``MCP_ALLOW_UNPINNED_CONFIG``) is set:
+    a file another program can rewrite must not become code execution.
     """
     log = logging.getLogger(__name__)
     servers: dict[str, dict[str, Any]] = {}
@@ -403,14 +466,24 @@ def _load_mcp_servers(inline: str, config_file: str) -> dict[str, dict[str, Any]
         # Pointing at the vault directory is a common mistake: accept it.
         if os.path.isdir(path):
             path = os.path.join(path, ".mcp.json")
-        try:
-            with open(path, encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except FileNotFoundError:
-            log.warning("MCP config file not found: %s", path)
-        except (OSError, json.JSONDecodeError) as exc:
-            log.warning("Cannot read MCP config %s: %s", path, exc)
+        pinned = bool((expected_sha256 or "").strip())
+        if (
+            not pinned
+            and not allow_unpinned_config
+            and not _is_inside_directory(path, os.getcwd())
+        ):
+            log.error(
+                "MCP config %s is outside the working directory %s and has no "
+                "MCP_CONFIG_SHA256 pin; file-based servers are ignored. Move "
+                "the config next to the bot, pin its sha256, or set "
+                "MCP_ALLOW_UNPINNED_CONFIG=true.",
+                path,
+                os.getcwd(),
+            )
+            payload = None
         else:
+            payload = _read_mcp_config_file(path, expected_sha256)
+        if payload is not None:
             data = payload.get("mcpServers", payload) if isinstance(payload, dict) else None
             if not isinstance(data, dict):
                 log.warning("MCP config %s has no 'mcpServers' object", path)
@@ -673,6 +746,21 @@ class Config:
     mcp_config_file: str = field(
         default_factory=lambda: _env("MCP_CONFIG_FILE", "MCP_CONFIG")
     )
+    # Optional sha256 of the .mcp.json bytes. When set, a config that changed
+    # (e.g. through a synced vault) is ignored instead of executed.
+    mcp_config_sha256: str = field(
+        default_factory=lambda: _env("MCP_CONFIG_SHA256").lower()
+    )
+    # A bare command name is resolved through PATH (an easy hijack vector).
+    # Absolute paths are required unless this is explicitly enabled.
+    mcp_allow_path_command: bool = field(
+        default_factory=lambda: _env_bool("MCP_ALLOW_PATH_COMMAND", False)
+    )
+    # An .mcp.json outside the working directory (e.g. inside a synced vault)
+    # is not executed unless its sha256 is pinned or this override is set.
+    mcp_allow_unpinned_config: bool = field(
+        default_factory=lambda: _env_bool("MCP_ALLOW_UNPINNED_CONFIG", False)
+    )
     # Inline JSON alternative to the file; entries here override the file.
     mcp_servers_inline: str = field(
         default_factory=lambda: os.getenv("MCP_SERVERS", "").strip()
@@ -744,6 +832,14 @@ class Config:
     # of the user's question.
     telegraph_title_from_question: bool = field(
         default_factory=lambda: _env_bool("TELEGRAPH_TITLE_FROM_QUESTION", False)
+    )
+
+    # --- Logging ---
+    # Full message texts in the AI request logs. Off by default: with texts on,
+    # the logs become a plaintext archive of private conversations. When
+    # enabled, texts are logged at DEBUG level only, with a startup warning.
+    log_prompts: bool = field(
+        default_factory=lambda: _env_bool("LOG_PROMPTS", False)
     )
 
     # --- Slow-request feedback ---
@@ -911,8 +1007,7 @@ class Config:
         if self.progress_delay < 0:
             self.progress_delay = 0.0
         # Telegram tolerates roughly one message edit per second per chat.
-        if self.progress_interval < 0.5:
-            self.progress_interval = 0.5
+        self.progress_interval = max(self.progress_interval, 0.5)
         if self.send_min_interval < 0 or self.send_min_interval > 10:
             self.send_min_interval = 0.0 if self.send_min_interval < 0 else 10.0
         # Telegraph page creation is a courtesy call: bound it tightly.
@@ -925,8 +1020,7 @@ class Config:
             self.stream_edit_interval = 1.0
         elif self.stream_edit_interval > 30.0:
             self.stream_edit_interval = 30.0
-        if self.stream_stall_timeout < 10:
-            self.stream_stall_timeout = 10
+        self.stream_stall_timeout = max(self.stream_stall_timeout, 10)
         # Base64 must fit the ASR API's 10 MB input limit.
         self.voice_max_bytes = min(max(1, self.voice_max_bytes), 7_500_000)
         # System prompt length: at least 16, at most 32768 characters.
@@ -968,7 +1062,10 @@ class Config:
             1_000, min(self.mcp_max_result_chars, 50_000)
         )
         self.mcp_servers = _load_mcp_servers(
-            self.mcp_servers_inline, self.mcp_config_file
+            self.mcp_servers_inline,
+            self.mcp_config_file,
+            self.mcp_config_sha256,
+            self.mcp_allow_unpinned_config,
         )
         # Reminder limits: the caps are the cost guard for scheduled AI
         # requests, and the minimum interval keeps them from machine-gunning

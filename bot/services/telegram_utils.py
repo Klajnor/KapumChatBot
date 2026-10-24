@@ -540,7 +540,10 @@ async def safe_answer(message: Message, text: str, **kwargs) -> bool:
             return True
         except TelegramRetryAfter as exc:
             if attempt >= _MAX_429_RETRIES:
-                logger.error("Rate limit persists; could not send: %s", text[:80])
+                logger.error(
+                    "Rate limit persists; a message could not be sent (%d chars)",
+                    len(text),
+                )
                 return False
             await asyncio.sleep(_retry_delay(exc))
         except TelegramForbiddenError as exc:

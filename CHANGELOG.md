@@ -171,6 +171,12 @@
   now disables rich messages; `test_failed_guest_answer_is_not_retried` accepts
   the rich → markdown → plain fallback chain.
 
+- **Two failing `_fetch_body` tests** — the refusal path returned an empty
+  string and the success path returned the full `Content-Type` including
+  `charset`. `_fetch_body` now returns `None` for the content type on refusal
+  and the bare media type (`text/plain`) on success; the assertions match and
+  the suite is green.
+
 ### Security & robustness audit (fixed)
 - **Systemd unit ran the bot as root (HIGH)** — the unit had no `User=`/
   `Group=`, kept everything in `/root`, and left secret/database permissions as
@@ -194,6 +200,25 @@
   (non-guest) user, has a per-user 30 s cooldown and runs inside the per-user
   concurrency slot; the file (and single-answer exports) is always delivered to
   the requesting user's private chat, never to the group.
+- **Conversation texts in the logs (MEDIUM)** — the AI request payload was
+  logged at INFO with every message (system prompt, history, question) and tool
+  results; search queries, image-intent captions and the first 80 characters of
+  an unsent answer were logged too. Logs now contain metadata only (roles,
+  lengths, media type/size, tool names). `LOG_PROMPTS=true` opts into full texts
+  at DEBUG (with a startup warning); search queries and answer snippets are
+  never logged.
+- **Prompt injection could drive the private-note tools (MEDIUM)** — fetched
+  pages, documents, quoted/forwarded messages and search results are now wrapped
+  in `<untrusted_content>` tags with a system-prompt rule that treats them as
+  data, not instructions. While such content is in the request or the stored
+  history, MCP tools are withheld for that turn, so a page cannot make the model
+  read the admin's notes and exfiltrate them. Tool calls and tool results stay
+  in-memory for the current request only; the database history stores just the
+  user question and the final answer.
+- **Unbounded album buffers (MEDIUM)** — media-group photos are collected
+  before any per-user request slot is taken, so a flood of albums could exhaust
+  RAM. Added global caps (8 albums at once, 200 MB buffered, 2 albums per user)
+  plus a real-byte re-check before a downloaded photo is kept.
 - **MCP servers inherited every bot secret (HIGH)** — `MCPClient.start()` passed
   `os.environ.copy()` to each stdio server, so third-party MCP code received
   `BOT_TOKEN`, `AI_API_KEY`, `SEARCH_API_KEY`, `TELEGRAPH_ACCESS_TOKEN` and
@@ -203,6 +228,16 @@
   unit and end-to-end tests. `${BOT_TOKEN}` / `${AI_API_KEY}` references in the
   MCP config are refused as well, so a tampered `.mcp.json` cannot pull the bot
   credentials into a child process or its command line.
+- **MCP config could become code execution (HIGH)** — `.mcp.json` used to be
+  loaded from anywhere, and a bare `"command": "python"` was resolved through
+  `PATH`; a synced Obsidian/Dropbox vault or a poisoned `PATH` entry therefore
+  chose what the bot executed. Now a bare command is refused unless
+  `MCP_ALLOW_PATH_COMMAND=true`, an `.mcp.json` outside the working directory is
+  ignored unless its bytes are pinned with `MCP_CONFIG_SHA256` (or the operator
+  explicitly sets `MCP_ALLOW_UNPINNED_CONFIG=true`), group/world-writable
+  configs are reported on POSIX, and the README recommends keeping the config
+  and server script in the root-owned app directory. Inline `MCP_SERVERS` (from
+  `.env`) plus an absolute interpreter path are the safe default.
 - **Paid AI call without an access check (HIGH)** — `_route_single_photo` ran
   the `detect_intent` classifier for *any* user, so an unauthorized account
   could farm the paid API by sending captioned photos in a loop (bounded only

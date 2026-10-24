@@ -57,6 +57,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Full prompts are an explicit DEBUG-level opt-in: raise the client logger only,
+# so aiohttp/Telegram libraries do not flood the journal at DEBUG.
+if config.log_prompts:
+    logging.getLogger("bot.services.ai_client").setLevel(logging.DEBUG)
+
 ERROR_REPLY = (
     "⚠️ <b>Something went wrong while preparing the answer.</b>\n\n"
     "The error has been logged. Please try again in a moment — if it keeps "
@@ -113,6 +118,12 @@ async def main() -> None:
     """Entry point: validate config, init DB, start polling."""
     config.validate()
     logger.info("Configuration validated successfully")
+    if config.log_prompts:
+        logger.warning(
+            "LOG_PROMPTS=true: full conversation texts (prompts, history, "
+            "tool results) are written to the DEBUG log. Keep the log files "
+            "private and turn this off when debugging is finished."
+        )
 
     cleanup_task: asyncio.Task[None] | None = None
     reminder_task: asyncio.Task[None] | None = None

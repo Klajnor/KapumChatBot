@@ -5,6 +5,7 @@ a temporary directory and speaks JSON-RPC with the client.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -20,14 +21,18 @@ os.environ.setdefault("AI_API_KEY", "test-key")
 
 from bot.config import _load_mcp_servers, config
 from bot.services.mcp import (
+    MCP_SYSTEM_HINT,
     MCPClient,
+    MCPError,
     MCPServerConfig,
     _child_environment,
     _expand_env,
     _exposed_name,
     _format_tool_result,
     _normalize_schema,
+    apply_mcp_hint,
     mcp_available,
+    remove_mcp_hint,
 )
 
 # A minimal stdio MCP server: initialize, tools/list, tools/call.
@@ -115,9 +120,11 @@ class MCPConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertLogs("bot.config", level="WARNING"):
-                servers = _load_mcp_servers("", str(path))
+                servers = _load_mcp_servers("", str(path), allow_unpinned_config=True)
                 # A directory is accepted too.
-                from_dir = _load_mcp_servers("", tmp)
+                from_dir = _load_mcp_servers(
+                    "", tmp, allow_unpinned_config=True
+                )
             self.assertEqual(set(servers), {"brain"})
             self.assertEqual(servers["brain"]["args"], ["mcp_server.py"])
             self.assertEqual(set(from_dir), {"brain"})
@@ -126,6 +133,7 @@ class MCPConfigTests(unittest.TestCase):
                 overridden = _load_mcp_servers(
                     '{"brain": {"command": "py", "args": ["other.py"]}}',
                     str(path),
+                    allow_unpinned_config=True,
                 )
             self.assertEqual(overridden["brain"]["command"], "py")
             self.assertEqual(overridden["brain"]["args"], ["other.py"])
@@ -135,7 +143,68 @@ class MCPConfigTests(unittest.TestCase):
             path = Path(tmp) / ".mcp.json"
             path.write_text("{not json", encoding="utf-8")
             with self.assertLogs("bot.config", level="WARNING"):
-                self.assertEqual(_load_mcp_servers("", str(path)), {})
+                self.assertEqual(
+                    _load_mcp_servers(
+                        "", str(path), allow_unpinned_config=True
+                    ),
+                    {},
+                )
+
+    def test_unpinned_external_config_is_ignored_by_default(self) -> None:
+        """A config another program can rewrite must not become code execution."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(
+                json.dumps(
+                    {"mcpServers": {"brain": {"command": "/bin/true", "args": []}}}
+                ),
+                encoding="utf-8",
+            )
+            # tempfile is outside the working directory in the test runner.
+            with self.assertLogs("bot.config", level="ERROR"):
+                servers = _load_mcp_servers("", str(path))
+            self.assertEqual(servers, {})
+            # ...unless the operator explicitly trusts unpinned configs.
+            self.assertEqual(
+                set(_load_mcp_servers("", str(path), allow_unpinned_config=True)),
+                {"brain"},
+            )
+
+    def test_config_hash_pin_accepts_matching_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            raw = json.dumps(
+                {"mcpServers": {"brain": {"command": "python", "args": []}}}
+            ).encode("utf-8")
+            path.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            servers = _load_mcp_servers("", str(path), digest)
+        self.assertEqual(set(servers), {"brain"})
+
+    def test_config_hash_pin_rejects_a_modified_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(
+                json.dumps(
+                    {"mcpServers": {"brain": {"command": "python", "args": []}}}
+                ),
+                encoding="utf-8",
+            )
+            with self.assertLogs("bot.config", level="ERROR"):
+                servers = _load_mcp_servers("", str(path), "0" * 64)
+        self.assertEqual(servers, {})
+
+    def test_inline_servers_survive_a_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text('{"mcpServers": {}}', encoding="utf-8")
+            with self.assertLogs("bot.config", level="ERROR"):
+                servers = _load_mcp_servers(
+                    '{"inline": {"command": "/bin/true", "args": []}}',
+                    str(path),
+                    "0" * 64,
+                )
+        self.assertEqual(set(servers), {"inline"})
 
     def test_expand_env(self) -> None:
         old = dict(os.environ)
@@ -204,6 +273,14 @@ class MCPAccessTests(unittest.TestCase):
                 config.mcp_servers,
                 config.admin_ids,
             ) = saved
+
+    def test_mcp_hint_is_applied_once_and_removable(self) -> None:
+        messages = [{"role": "system", "content": "base"}]
+        apply_mcp_hint(messages)
+        apply_mcp_hint(messages)
+        self.assertEqual(messages[0]["content"].count(MCP_SYSTEM_HINT), 1)
+        remove_mcp_hint(messages)
+        self.assertEqual(messages[0]["content"], "base")
 
 
 class MCPEnvironmentTests(unittest.TestCase):
@@ -336,6 +413,28 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.client.close()
         self._tmp.cleanup()
+
+    async def test_relative_command_is_refused_by_default(self) -> None:
+        """A bare ``python`` would be resolved through PATH: fail closed."""
+        client = MCPClient(
+            MCPServerConfig(name="relative", command="python", args=[]),
+            timeout=5,
+        )
+        saved = config.mcp_allow_path_command
+        try:
+            config.mcp_allow_path_command = False
+            with self.assertRaises(MCPError):
+                await client.start()
+        finally:
+            config.mcp_allow_path_command = saved
+            await client.close()
+
+    async def test_absolute_command_still_starts(self) -> None:
+        # The regular handshake test uses ``sys.executable``, an absolute path;
+        # this pins the invariant explicitly.
+        self.assertTrue(os.path.isabs(sys.executable))
+        tools = await self.client.list_tools()
+        self.assertIn("echo", [tool.name for tool in tools])
 
     async def test_handshake_list_and_call(self) -> None:
         tools = await self.client.list_tools()

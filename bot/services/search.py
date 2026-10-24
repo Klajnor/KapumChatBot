@@ -30,6 +30,7 @@ import aiohttp
 
 from bot.config import config
 from bot.services.ai_client import ToolCall
+from bot.services.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -222,16 +223,21 @@ async def search_web(query: str, max_results: int | None = None) -> list[SearchR
             logger.warning("Unknown SEARCH_PROVIDER %r; search skipped", provider)
             return []
     except Exception:  # search must never break an answer
-        logger.exception("Web search failed for %r", query[:80])
+        logger.exception("Web search failed (%s)", provider)
         return []
-    logger.info(
-        "Web search (%s) %r -> %d result(s)", provider, query[:80], len(results)
-    )
+    # The query itself is user/model content: keep it out of the logs.
+    logger.info("Web search (%s) -> %d result(s)", provider, len(results))
     return results
 
 
 def format_search_results(query: str, results: list[SearchResult]) -> str:
-    """Tool-message body: numbered results the model cites as [n]."""
+    """Tool-message body: numbered results the model cites as [n].
+
+    The results are third-party page snippets, so they are wrapped as
+    untrusted content (``bot/services/untrusted.py``): a page that tries to
+    steer the model stays data. The closing instruction stays outside the
+    tags — it is ours, not the web's.
+    """
     if not results:
         return (
             f"Живой поиск по запросу {query!r} не дал результатов. Ответь из "
@@ -241,11 +247,12 @@ def format_search_results(query: str, results: list[SearchResult]) -> str:
     blocks = [f"Результаты веб-поиска по запросу {query!r}:"]
     for index, item in enumerate(results, start=1):
         blocks.append(f"[{index}] {item.title}\n{item.snippet}\nURL: {item.url}")
-    blocks.append(
+    wrapped = wrap_untrusted("search", "\n\n".join(blocks))
+    return (
+        f"{wrapped}\n\n"
         "Ответь пользователю, опираясь на эти результаты, где это уместно; "
         "цитируй использованные источники маркерами [n]."
     )
-    return "\n\n".join(blocks)
 
 
 # --- Tool-exchange message builders (OpenAI chat format) -------------------------
