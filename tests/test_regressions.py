@@ -1456,18 +1456,30 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "web": {
                 "results": [
-                    {"title": "B", "url": "https://b.test", "description": "D"}
+                    {
+                        "title": "B",
+                        "url": "https://b.test",
+                        "description": "D <strong>bold</strong>&amp; more",
+                    }
                 ]
             }
         }
         with (
             patch.object(config, "search_provider", "brave"),
             patch.object(config, "search_api_key", "BSAkey"),
-            patch.object(search, "_request_json", AsyncMock(return_value=payload)),
+            patch.object(
+                search, "_request_json", AsyncMock(return_value=payload)
+            ) as req,
         ):
             results = await search.search_web("q")
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].snippet, "D")
+        # Brave marks matches up with HTML; the model must get plain text.
+        self.assertEqual(results[0].snippet, "D bold & more")
+        # Regression: api.brave.com answers 200 with an HTML page, so every
+        # search failed on json.loads. The API lives on api.search.brave.com.
+        self.assertEqual(
+            req.call_args.args[0], "https://api.search.brave.com/res/v1/web/search"
+        )
 
     async def test_search_failure_returns_empty(self):
         with (

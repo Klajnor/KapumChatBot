@@ -154,6 +154,19 @@
   session management (stats, models, prompt, clear, help, start, image, admin).
 
 ### Fixed
+- **Brave search pointed at the wrong host** — `_search_brave` used
+  `https://api.brave.com/res/v1/web/search`, which answers **200 with an HTML
+  page**, so every `search_web` call died on `json.loads` ("returned invalid
+  JSON"), the tool returned no results and the model answered from its own
+  knowledge. The endpoint is now `api.search.brave.com`. A failed search was
+  invisible to the user, which made it look like the model "did not want" to
+  search.
+- **HTML tags/entities in search snippets** — Brave wraps matched words in
+  `<strong>…</strong>` and other providers escape entities; both are stripped
+  to plain text before the snippets reach the model.
+- **`scripts/check_search.py`** — new probe: config, raw API request
+  (status + `Content-Type`, which is what exposes the wrong-URL failure),
+  `search_web()` and, with `--ask`, whether the model actually calls the tool.
 - **Album race condition** — `_album_images` dictionary is now protected by
   an `asyncio.Lock`, so concurrent album photos from the same chat cannot
   interfere with each other.

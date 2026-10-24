@@ -20,8 +20,10 @@ is SSRF-guarded.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -39,6 +41,17 @@ PROVIDERS = ("tavily", "brave")
 
 # Snippets are trimmed so one search cannot flood the model's context.
 _SNIPPET_CHARS = 700
+
+# Brave wraps matched words in <strong>…</strong>; other providers escape
+# entities. Both are noise (and tags read like markup) inside a tool message.
+_TAGS = re.compile(r"<[^>]{1,64}>")
+
+
+def _clean(text: Any) -> str:
+    """Plain text from a provider's HTML-ish field."""
+    value = html.unescape(str(text or ""))
+    return " ".join(_TAGS.sub(" ", value).split())
+
 
 # Tool exposed to the chat model for live web search.
 SEARCH_TOOL: dict[str, Any] = {
@@ -160,9 +173,9 @@ async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
             continue
         results.append(
             SearchResult(
-                title=str(item.get("title") or item["url"]),
+                title=_clean(item.get("title")) or str(item["url"]),
                 url=str(item["url"]),
-                snippet=str(item.get("content") or "")[:_SNIPPET_CHARS],
+                snippet=_clean(item.get("content"))[:_SNIPPET_CHARS],
             )
         )
         if len(results) >= max_results:
@@ -172,7 +185,7 @@ async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
 
 async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
     """Brave Search API (GET /res/v1/web/search, subscription token header)."""
-    url = config.search_api_url or "https://api.brave.com/res/v1/web/search"
+    url = config.search_api_url or "https://api.search.brave.com/res/v1/web/search"
     data = await _request_json(
         url,
         {
@@ -191,9 +204,9 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
             continue
         results.append(
             SearchResult(
-                title=str(item.get("title") or item["url"]),
+                title=_clean(item.get("title")) or str(item["url"]),
                 url=str(item["url"]),
-                snippet=str(item.get("description") or "")[:_SNIPPET_CHARS],
+                snippet=_clean(item.get("description"))[:_SNIPPET_CHARS],
             )
         )
         if len(results) >= max_results:
