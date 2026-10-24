@@ -3,12 +3,17 @@ from __future__ import annotations
 import html
 
 from aiogram import F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from bot.keyboards.inline import get_model_selection_keyboard
 from bot.services.ai_client import ai_client, is_vision_model
-from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
+from bot.services.telegram_utils import (
+    require_private_chat,
+    safe_answer_callback,
+    safe_edit_text,
+)
 from bot.services.user_service import user_service
 
 router = Router()
@@ -35,6 +40,9 @@ async def cmd_model(message: Message) -> None:
     user = message.from_user
     if user is None:
         return
+    # The selected model is a personal setting: don't expose it in a group.
+    if not await require_private_chat(message, what="/model"):
+        return
 
     async with user_service() as service:
         settings = await service.get_user_settings(user.id)
@@ -49,8 +57,16 @@ async def cb_model_selected(callback: CallbackQuery) -> None:
     """Handle model selection callback."""
     if callback.data is None or callback.from_user is None:
         return
+    # The confirmation names the model, so keep the picker private as well.
+    if callback.message is not None and callback.message.chat.type != ChatType.PRIVATE:
+        await safe_answer_callback(
+            callback,
+            "🔒 Model selection is available in a private chat only.",
+            show_alert=True,
+        )
+        return
 
-    model_id = callback.data.replace("model:", "")
+    model_id = callback.data.removeprefix("model:")
     available = {m["id"]: m["name"] for m in ai_client.available_models()}
 
     if model_id not in available:

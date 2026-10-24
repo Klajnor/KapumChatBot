@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Added
+- **MCP tools / Obsidian «second brain» (admin-only)** — the chat model can
+  use tools exposed by external MCP servers over stdio. Servers are read from a
+  Claude-style `.mcp.json` (`MCP_CONFIG_FILE`, file or directory) or inline
+  `MCP_SERVERS` JSON; inline entries override the file. The main use case is the
+  `brain` server from the ObsidianBrain project (`search_notes`, `get_chunk`,
+  `get_note`, `list_notes`): the model searches and reads personal notes when a
+  question calls for them. Tools are namespaced as `mcp__<server>__<tool>`,
+  executed through `tools/call` in the normal multi-round loop (up to
+  `MCP_MAX_ROUNDS`), and one result is capped at `MCP_MAX_RESULT_CHARS`.
+  **`MCP_ADMIN_ONLY=true` by default** — only `ADMIN_IDS` are offered the tools;
+  everyone else chats exactly as before. `/mcp` (admin) prints server status and
+  tool lists. A server that fails to start never blocks an answer: it is logged,
+  retried after a minute and simply contributes no tools. `${VAR}` /
+  `${VAR:-default}` expansion is supported in command/args/cwd/env. Requires the
+  server's Python to have `mcp<2` (FastMCP was renamed in mcp 2.x).
 - **Conversation export (MD / PDF)** — `/export [md|pdf]` saves the
   conversation (the requesting user's own thread, last `EXPORT_MAX_MESSAGES`
   messages) as a file, and 📄 PDF / 📝 MD buttons under every answer in
@@ -107,6 +122,14 @@
   `async_session_factory() + UserService(session)` boilerplate in handlers.
 
 ### Changed
+- **Allowed users show nicknames, not just IDs** — `/list_users` now prints the
+  name and `@username` next to each ID, `/add_user` and `/remove_user` echo the
+  nickname. `/add_user`/`/remove_user` accept `@username` (or a `t.me/...`
+  link) as well as a numeric ID. The profile is cached on the `allowed_users`
+  row: it is captured when the admin adds the user (via `getChat`, when
+  available), refreshed whenever that user writes to the bot, and shown even
+  if the person has never messaged the bot. Existing SQLite and PostgreSQL
+  databases are migrated in place (three nullable columns).
 - **Default prompts are now Russian** — the default system prompt, all eight
   persona presets (with Russian display names) and the fallback question
   prompts (vision / voice / document / link) are translated to Russian and
@@ -149,6 +172,37 @@
   the rich → markdown → plain fallback chain.
 
 ### Security & robustness audit (fixed)
+- **Systemd unit ran the bot as root (HIGH)** — the unit had no `User=`/
+  `Group=`, kept everything in `/root`, and left secret/database permissions as
+  a manual TODO. It now runs as `brain`, keeps the code `root:root` in `/opt`
+  (read-only for the service), stores mutable data in
+  `StateDirectory=/var/lib/kapum-chatbot`, sets `UMask=0077`, and adds
+  `ProtectHome`, `PrivateDevices`, `ProtectKernel*`, `RestrictAddressFamilies`,
+  `RestrictNamespaces`, `LockPersonality`, `CapabilityBoundingSet=` and
+  `RestartSec=5s`. `.pyc` are disabled (`PYTHONDONTWRITEBYTECODE=1`), so the
+  pre-start `clean_pycache.sh` step is gone. Deployment steps and the required
+  `DATABASE_URL` / `TELEGRAPH_ACCOUNT_FILE` values are in the README.
+- **Personal settings printed in groups (MEDIUM)** — `/stats`, `/prompt`,
+  `/settings` and `/model` echoed the user's system prompt, selected model and
+  usage numbers into any group where the bot is a member. They now answer in
+  private chats only: a group invocation gets a short hint instead, before any
+  database lookup. `/export` invoked in a group keeps working, but only a
+  generic acknowledgement is posted there — the file goes to the user's DM.
+- **`/export` was a free local DoS (MEDIUM)** — the command and its PDF/MD
+  callbacks rendered up to `EXPORT_MAX_MESSAGES` messages for anyone, with no
+  access check and no frequency limit. Export now requires an authorized
+  (non-guest) user, has a per-user 30 s cooldown and runs inside the per-user
+  concurrency slot; the file (and single-answer exports) is always delivered to
+  the requesting user's private chat, never to the group.
+- **MCP servers inherited every bot secret (HIGH)** — `MCPClient.start()` passed
+  `os.environ.copy()` to each stdio server, so third-party MCP code received
+  `BOT_TOKEN`, `AI_API_KEY`, `SEARCH_API_KEY`, `TELEGRAPH_ACCESS_TOKEN` and
+  `DATABASE_URL` (full bot takeover / billing abuse). Child processes now get a
+  minimal allowlist (`PATH`, `HOME`/`USERPROFILE`, locale, `TEMP`/`TMP`, …) plus
+  the server's own explicit `env` block; `_child_environment()` is covered by
+  unit and end-to-end tests. `${BOT_TOKEN}` / `${AI_API_KEY}` references in the
+  MCP config are refused as well, so a tampered `.mcp.json` cannot pull the bot
+  credentials into a child process or its command line.
 - **Paid AI call without an access check (HIGH)** — `_route_single_photo` ran
   the `detect_intent` classifier for *any* user, so an unauthorized account
   could farm the paid API by sending captioned photos in a loop (bounded only

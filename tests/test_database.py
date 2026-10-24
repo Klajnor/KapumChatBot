@@ -244,6 +244,42 @@ class TestUserCRUD(DBTest):
 
         self._loop.run_until_complete(_run())
 
+    def test_allowed_users_profile_cache(self):
+        """Nicknames survive on allowed_users until the user registers."""
+
+        async def _run() -> None:
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                await repo.add_allowed_user(
+                    2001, added_by=1, username="nick", first_name="Nik"
+                )
+                await repo.add_allowed_user(2002, added_by=1)
+                await session.commit()
+
+            # A user who starts the bot refreshes the cached profile.
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                await repo.get_or_create_user(
+                    2002, username="later", first_name="Later"
+                )
+                await session.commit()
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                rows = {
+                    row.telegram_id: row
+                    for row in await repo.get_allowed_users()
+                }
+                self.assertEqual(rows[2001].username, "nick")
+                self.assertEqual(rows[2001].first_name, "Nik")
+                self.assertEqual(rows[2002].username, "later")
+
+                found = await repo.find_user_by_username("@LATER")
+                self.assertIsNotNone(found)
+                self.assertEqual(found.telegram_id, 2002)
+
+        self._loop.run_until_complete(_run())
+
 
 class TestMessages(DBTest):
     """Message history CRUD."""

@@ -63,6 +63,12 @@ class UserRepository:
             if is_admin:
                 user.is_admin = True
 
+        # Keep the allowed-user profile cache in sync, so admins see the
+        # current nickname in /list_users without an extra Telegram request.
+        await self.update_allowed_user_profile(
+            telegram_id, username=username, first_name=first_name, last_name=last_name
+        )
+
         # Guarantee that settings exist (also for legacy rows).
         settings = await self.get_user_settings(telegram_id)
         if settings is None:
@@ -85,6 +91,18 @@ class UserRepository:
     async def get_user(self, telegram_id: int) -> User | None:
         """Get user by Telegram ID."""
         return await self.session.get(User, telegram_id)
+
+    async def find_user_by_username(self, username: str) -> User | None:
+        """Find a registered user by Telegram username (case-insensitive)."""
+        username = username.lstrip("@").strip()
+        if not username:
+            return None
+        result = await self.session.execute(
+            select(User)
+            .where(func.lower(User.username) == username.lower())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def get_guest_messages_used(self, telegram_id: int) -> int:
         """Get the number of free-trial messages used by a guest."""
@@ -185,16 +203,59 @@ class UserRepository:
     # --- Allowed users management -----------------------------------------
 
     async def add_allowed_user(
-        self, telegram_id: int, added_by: int | None = None
+        self,
+        telegram_id: int,
+        added_by: int | None = None,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
     ) -> AllowedUser:
-        """Add a user to the allowed list."""
+        """Add a user to the allowed list, caching their profile when known."""
         existing = await self.session.get(AllowedUser, telegram_id)
         if existing:
+            if username is not None:
+                existing.username = username
+            if first_name is not None:
+                existing.first_name = first_name
+            if last_name is not None:
+                existing.last_name = last_name
+            await self.session.flush()
             return existing
-        allowed = AllowedUser(telegram_id=telegram_id, added_by=added_by)
+        allowed = AllowedUser(
+            telegram_id=telegram_id,
+            added_by=added_by,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+        )
         self.session.add(allowed)
         await self.session.flush()
         return allowed
+
+    async def update_allowed_user_profile(
+        self,
+        telegram_id: int,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
+        """Refresh the cached Telegram profile of an allowed user, if listed."""
+        values = {
+            column: value
+            for column, value in (
+                ("username", username),
+                ("first_name", first_name),
+                ("last_name", last_name),
+            )
+            if value is not None
+        }
+        if not values:
+            return
+        await self.session.execute(
+            update(AllowedUser)
+            .where(AllowedUser.telegram_id == telegram_id)
+            .values(**values)
+        )
 
     async def remove_allowed_user(self, telegram_id: int) -> bool:
         """Remove a user from the allowed list. Returns True if removed."""
@@ -211,6 +272,10 @@ class UserRepository:
             select(AllowedUser).order_by(AllowedUser.added_at.desc())
         )
         return list(result.scalars().all())
+
+    async def get_allowed_user(self, telegram_id: int) -> AllowedUser | None:
+        """Get one allowed user by Telegram ID."""
+        return await self.session.get(AllowedUser, telegram_id)
 
     async def get_all_user_ids(self) -> list[int]:
         """Return the Telegram IDs of every registered user (for broadcasts)."""

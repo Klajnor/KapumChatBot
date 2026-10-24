@@ -725,6 +725,93 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(documents.socket, "getaddrinfo", return_value=public):
             self.assertTrue(documents.is_safe_public_url("http://example.test/"))
 
+    def test_resolve_public_ips_rejects_mixed_answers(self):
+        public = [(2, 1, 6, "", ("93.184.216.34", 0))]
+        mixed = [(2, 1, 6, "", ("93.184.216.34", 0)), (2, 1, 6, "", ("10.0.0.1", 0))]
+        with patch.object(documents.socket, "getaddrinfo", return_value=public):
+            self.assertEqual(
+                documents._resolve_public_ips("example.test"), ["93.184.216.34"]
+            )
+        with patch.object(documents.socket, "getaddrinfo", return_value=mixed):
+            # One private address among the answers poisons the whole host.
+            self.assertIsNone(documents._resolve_public_ips("example.test"))
+
+    def test_pinned_resolver_carries_prevalidated_addresses(self):
+        import socket as socket_module
+
+        resolver = documents._PinnedResolver(["93.184.216.34", "2606:2800:220:1::1"])
+        entries = asyncio.run(resolver.resolve("example.test", 80))
+        self.assertEqual(
+            [entry["host"] for entry in entries],
+            ["93.184.216.34", "2606:2800:220:1::1"],
+        )
+        self.assertEqual(
+            [entry["family"] for entry in entries],
+            [socket_module.AF_INET, socket_module.AF_INET6],
+        )
+        self.assertEqual(entries[0]["port"], 80)
+        self.assertEqual(entries[0]["hostname"], "example.test")
+
+    async def test_fetch_body_refuses_loopback_without_connecting(self):
+        """A loopback URL is refused before any socket work is even set up."""
+        with patch.object(
+            documents.aiohttp,
+            "TCPConnector",
+            side_effect=AssertionError("connector must not be created"),
+        ):
+            body, final_url, content_type = await documents._fetch_body(
+                "http://127.0.0.1:9/secret"
+            )
+        self.assertIsNone(body)
+        self.assertIsNone(content_type)
+
+    async def test_fetch_body_pins_addresses_and_refuses_bad_redirect(self):
+        """End-to-end: a pinned loopback hop works, a redirect to the cloud
+        metadata address (or any non-public host) is refused on its own hop."""
+        from aiohttp import web
+
+        async def ok(_request):
+            return web.Response(text="page body", content_type="text/plain")
+
+        async def redirect(_request):
+            raise web.HTTPFound("http://169.254.169.254/latest/meta-data/")
+
+        app = web.Application()
+        app.router.add_get("/ok", ok)
+        app.router.add_get("/redirect", redirect)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            port = next(iter(runner.addresses))[1]
+
+            real_resolve = documents._resolve_public_ips
+
+            def fake_resolve(host: str) -> list[str] | None:
+                # Pretend the local server's address passed the public-IP
+                # screening (the request is pinned to it by the resolver);
+                # every other host goes through the real check.
+                if host == "127.0.0.1":
+                    return ["127.0.0.1"]
+                return real_resolve(host)
+
+            with patch.object(documents, "_resolve_public_ips", fake_resolve):
+                body, final_url, content_type = await documents._fetch_body(
+                    f"http://127.0.0.1:{port}/ok"
+                )
+                self.assertEqual(body, b"page body")
+                self.assertEqual(content_type, "text/plain")
+                self.assertTrue(final_url.endswith("/ok"))
+
+                # The redirect target must not inherit the first hop's pin.
+                body, final_url, _ = await documents._fetch_body(
+                    f"http://127.0.0.1:{port}/redirect"
+                )
+                self.assertIsNone(body)
+        finally:
+            await runner.cleanup()
+
     async def test_extract_document_text_plain_and_unknown(self):
         text = await documents.extract_document_text("txt", b"hello")
         self.assertEqual(text, "hello")
@@ -1375,7 +1462,10 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat, "search_web", AsyncMock(return_value=fake)) as sw,
             patch.object(chat, "safe_answer", AsyncMock()) as notice,
         ):
-            await chat._resolve_search_round(message, messages, result, [call])
+            await chat._resolve_tool_round(
+                message, messages, result, [call],
+                search_ready=True, search_allowed=True, mcp_allowed=False,
+            )
         sw.assert_awaited_once()
         self.assertEqual(messages[-2]["role"], "assistant")
         self.assertIn("tool_calls", messages[-2])
@@ -1393,7 +1483,10 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat, "search_web", AsyncMock()) as sw,
             patch.object(chat, "safe_answer", AsyncMock()) as notice,
         ):
-            await chat._resolve_search_round(message, messages, result, [call])
+            await chat._resolve_tool_round(
+                message, messages, result, [call],
+                search_ready=True, search_allowed=True, mcp_allowed=False,
+            )
         sw.assert_not_awaited()
         notice.assert_not_awaited()
         self.assertEqual(messages[-1]["role"], "tool")
@@ -1599,15 +1692,17 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_export_without_arg_offers_formats(self):
         message = SimpleNamespace(
             text="/export", from_user=SimpleNamespace(id=1),
-            chat=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1, type="private"),
         )
         with (
             patch.object(config, "enable_export", True),
+            patch.object(export_handler, "_export_denial", AsyncMock(return_value=None)),
             patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
         ):
             await export_handler.cmd_export(message)
         ans.assert_awaited_once()
         self.assertIsNotNone(ans.call_args.kwargs.get("reply_markup"))
+        self.assertIn("private chat", ans.call_args.args[1])
 
     async def test_cmd_export_disabled(self):
         message = SimpleNamespace(
@@ -1624,7 +1719,8 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_export_md_sends_document(self):
         message = SimpleNamespace(
             text="/export md", from_user=SimpleNamespace(id=1),
-            chat=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1, type="private"),
+            bot=SimpleNamespace(),
         )
         rows = [
             SimpleNamespace(role="user", content="q", created_at=None, model=None),
@@ -1638,6 +1734,7 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(config, "enable_export", True),
+            patch.object(export_handler, "_export_denial", AsyncMock(return_value=None)),
             patch.object(export_handler, "user_service", fake_user_service),
             patch.object(
                 export_handler, "_send_document", AsyncMock(return_value=True)
@@ -1645,10 +1742,33 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         ):
             await export_handler.cmd_export(message)
         send.assert_awaited_once()
-        self.assertTrue(send.call_args.args[2].endswith(".md"))
+        # (bot, chat_id, data, filename, caption) — delivered to the user's DM.
+        self.assertEqual(send.call_args.args[1], 1)
+        self.assertTrue(send.call_args.args[3].endswith(".md"))
+
+    async def test_cmd_export_denied_never_renders(self):
+        message = SimpleNamespace(
+            text="/export md", from_user=SimpleNamespace(id=9),
+            chat=SimpleNamespace(id=-100, type="group"),
+        )
+        with (
+            patch.object(config, "enable_export", True),
+            patch.object(
+                export_handler,
+                "_export_denial",
+                AsyncMock(return_value="⛔ Export is available to authorized users only."),
+            ),
+            patch.object(export_handler, "_export_history", AsyncMock()) as history,
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+        ):
+            await export_handler.cmd_export(message)
+        history.assert_not_awaited()
+        self.assertIn("authorized", ans.call_args.args[1])
 
     async def test_export_history_empty_sends_notice(self):
-        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"), bot=SimpleNamespace()
+        )
         service = SimpleNamespace(get_export_history=AsyncMock(return_value=[]))
 
         @asynccontextmanager
@@ -1664,10 +1784,66 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         ans.assert_awaited_once()
         send.assert_not_awaited()
 
+    async def test_group_export_is_delivered_to_dm(self):
+        """A group invocation must post only a generic ack; the file goes to DM."""
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            bot=SimpleNamespace(),
+        )
+        rows = [
+            SimpleNamespace(role="user", content="q", created_at=None, model=None),
+            SimpleNamespace(role="assistant", content="a", created_at=None, model="m"),
+        ]
+        service = SimpleNamespace(get_export_history=AsyncMock(return_value=rows))
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "_send_document", AsyncMock(return_value=True)
+            ) as send,
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+        ):
+            await export_handler._export_history(message, "md", 42)
+        # (bot, chat_id, data, filename, caption): the file targets the user id.
+        self.assertEqual(send.call_args.args[1], 42)
+        self.assertIn("private chat", ans.call_args.args[1])
+
+    async def test_group_export_explains_when_dm_is_unreachable(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            bot=SimpleNamespace(),
+        )
+        rows = [
+            SimpleNamespace(role="user", content="q", created_at=None, model=None),
+            SimpleNamespace(role="assistant", content="a", created_at=None, model="m"),
+        ]
+        service = SimpleNamespace(get_export_history=AsyncMock(return_value=rows))
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "_send_document", AsyncMock(return_value=False)
+            ),
+            patch.object(export_handler, "safe_answer", AsyncMock()) as ans,
+        ):
+            await export_handler._export_history(message, "md", 42)
+        self.assertIn("private chat", ans.call_args.args[1])
+        self.assertIn("/start", ans.call_args.args[1])
+
     async def test_single_answer_export_owner_check(self):
         callback = SimpleNamespace(
             data="expans:md:999", from_user=SimpleNamespace(id=7),
-            message=SimpleNamespace(chat=SimpleNamespace(id=7)),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=7, type="private"), bot=SimpleNamespace()
+            ),
         )
         service = SimpleNamespace(
             get_message_for_export=AsyncMock(return_value=None)
@@ -1679,6 +1855,7 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(config, "enable_export", True),
+            patch.object(export_handler, "_export_denial", AsyncMock(return_value=None)),
             patch.object(export_handler, "user_service", fake_user_service),
             patch.object(
                 export_handler, "safe_answer_callback", AsyncMock()
@@ -1691,7 +1868,7 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         callback = SimpleNamespace(
             data="expans:md:5", from_user=SimpleNamespace(id=7),
             message=SimpleNamespace(
-                chat=SimpleNamespace(id=7), answer_document=AsyncMock()
+                chat=SimpleNamespace(id=7, type="private"), bot=SimpleNamespace()
             ),
         )
         answer_row = SimpleNamespace(
@@ -1712,11 +1889,105 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(config, "enable_export", True),
+            patch.object(export_handler, "_export_denial", AsyncMock(return_value=None)),
             patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "_send_document", AsyncMock(return_value=True)
+            ) as send,
             patch.object(export_handler, "safe_answer_callback", AsyncMock()),
         ):
             await export_handler.cb_export_answer(callback)
-        callback.message.answer_document.assert_awaited_once()
+        send.assert_awaited_once()
+        # Delivered to the user's DM, not to the chat the button lives in.
+        self.assertEqual(send.call_args.args[1], 7)
+
+    def test_export_cooldown_blocks_a_second_render(self):
+        export_handler._export_last.clear()
+        try:
+            export_handler._mark_export(1)
+            self.assertGreater(export_handler._export_wait_seconds(1), 0)
+            self.assertEqual(export_handler._export_wait_seconds(2), 0)
+        finally:
+            export_handler._export_last.clear()
+
+    def test_export_cooldown_registry_is_bounded(self):
+        export_handler._export_last.clear()
+        try:
+            for user_id in range(export_handler._EXPORT_REGISTRY_CAP + 50):
+                export_handler._mark_export(user_id)
+            self.assertLessEqual(
+                len(export_handler._export_last),
+                export_handler._EXPORT_REGISTRY_CAP,
+            )
+        finally:
+            export_handler._export_last.clear()
+
+    async def test_export_denial_requires_authorization(self):
+        from bot.services.access import AccessResult
+
+        denied = AccessResult(allowed=False, role="denied", message="no")
+        fake_service = SimpleNamespace()
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield fake_service
+
+        with (
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "check_access", AsyncMock(return_value=denied)
+            ) as gate,
+        ):
+            reason = await export_handler._export_denial(5, reserve=True)
+        self.assertIn("authorized", reason)
+        gate.assert_awaited_once()
+        self.assertIs(gate.call_args.kwargs.get("consume"), False)
+        self.assertIs(gate.call_args.kwargs.get("require_quota"), False)
+
+    async def test_export_denial_excludes_guests(self):
+        from bot.services.access import AccessResult
+
+        guest = AccessResult(allowed=True, role="guest", remaining=3)
+        fake_service = SimpleNamespace()
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield fake_service
+
+        with (
+            patch.object(export_handler, "user_service", fake_user_service),
+            patch.object(
+                export_handler, "check_access", AsyncMock(return_value=guest)
+            ),
+        ):
+            reason = await export_handler._export_denial(6, reserve=True)
+        self.assertIn("authorized", reason)
+
+    async def test_export_denial_reserves_the_cooldown(self):
+        from bot.services.access import AccessResult
+
+        allowed = AccessResult(allowed=True, role="admin")
+        fake_service = SimpleNamespace()
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield fake_service
+
+        export_handler._export_last.clear()
+        try:
+            with (
+                patch.object(export_handler, "user_service", fake_user_service),
+                patch.object(
+                    export_handler, "check_access", AsyncMock(return_value=allowed)
+                ),
+            ):
+                self.assertIsNone(
+                    await export_handler._export_denial(7, reserve=True)
+                )
+                second = await export_handler._export_denial(7, reserve=True)
+        finally:
+            export_handler._export_last.clear()
+        self.assertIn("Too many exports", second)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.config import config
+from bot.services.telegram_utils import require_private_chat
 from bot.services.user_service import user_service
 
 router = Router()
@@ -18,6 +19,10 @@ async def cmd_stats(message: Message) -> None:
     """Handle /stats command — show usage statistics."""
     user = message.from_user
     if user is None:
+        return
+    # The system prompt and per-chat message counts are personal: never print
+    # them where other group participants can read them.
+    if not await require_private_chat(message, what="/stats"):
         return
 
     async with user_service() as service:

@@ -96,6 +96,30 @@ async def _run_data_migrations(conn: Any) -> None:
         )
 
 
+async def _add_missing_allowed_user_columns_sqlite(conn: Any) -> None:
+    """Add the profile-cache columns to a SQLite database created earlier.
+
+    ``create_all`` never alters existing tables, and SQLite has no
+    ``ADD COLUMN IF NOT EXISTS``, so the current columns are inspected first.
+    """
+    result = await conn.execute(text("PRAGMA table_info(allowed_users)"))
+    existing = {str(row[1]) for row in result.fetchall()}
+    for column in ("username", "first_name", "last_name"):
+        if column in existing:
+            continue
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(f"ALTER TABLE allowed_users ADD COLUMN {column} VARCHAR(128)")
+                )
+        except Exception as exc:  # pragma: no cover - defensive, DB dependent
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Migration skipped (allowed_users.%s): %s", column, exc
+            )
+
+
 async def _run_migrations(conn: Any) -> None:
     """Apply idempotent migrations for databases created by older versions.
 
@@ -105,6 +129,7 @@ async def _run_migrations(conn: Any) -> None:
     is nothing to migrate there.
     """
     if conn.dialect.name == "sqlite":
+        await _add_missing_allowed_user_columns_sqlite(conn)
         return
 
     statements = [
@@ -115,7 +140,14 @@ async def _run_migrations(conn: Any) -> None:
         "CREATE TABLE IF NOT EXISTS allowed_users ("
         "telegram_id BIGINT NOT NULL PRIMARY KEY, "
         "added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
-        "added_by BIGINT)",
+        "added_by BIGINT, "
+        "username VARCHAR(128), "
+        "first_name VARCHAR(128), "
+        "last_name VARCHAR(128))",
+        # Cached Telegram profile on allowed_users (older installations).
+        "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS username VARCHAR(128)",
+        "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS first_name VARCHAR(128)",
+        "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS last_name VARCHAR(128)",
         # daily_usage table + index + unique constraint.
         "CREATE TABLE IF NOT EXISTS daily_usage ("
         "id SERIAL PRIMARY KEY, "

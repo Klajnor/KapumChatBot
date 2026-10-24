@@ -26,8 +26,9 @@ os.environ.setdefault("AI_API_KEY", "test-key")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 
 from bot.config import Config, config
-from bot.handlers import admin, chat
+from bot.handlers import admin, chat, models, prompt, stats
 from bot.services.access import AccessResult
+from bot.services.telegram_utils import require_private_chat
 
 
 class BroadcastAuthTests(unittest.IsolatedAsyncioTestCase):
@@ -638,6 +639,67 @@ class ExportLimitTests(unittest.TestCase):
     def test_sane_export_cap_is_kept(self):
         with patch.dict(os.environ, {"EXPORT_MAX_MESSAGES": "250"}):
             self.assertEqual(Config().export_max_messages, 250)
+
+
+class GroupPrivacyTests(unittest.IsolatedAsyncioTestCase):
+    """Personal settings must never be printed into a group chat."""
+
+    @staticmethod
+    def _group_message() -> SimpleNamespace:
+        return SimpleNamespace(
+            chat=SimpleNamespace(id=-100, type="group"),
+            from_user=SimpleNamespace(id=1),
+            text="/stats",
+            answer=AsyncMock(),
+        )
+
+    async def test_helper_blocks_group_and_explains(self):
+        message = self._group_message()
+        self.assertFalse(await require_private_chat(message, what="/stats"))
+        message.answer.assert_awaited_once()
+        text = message.answer.call_args.args[0]
+        self.assertIn("/stats", text)
+        self.assertIn("private chat", text)
+
+    async def test_helper_allows_private_quietly(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"), answer=AsyncMock()
+        )
+        self.assertTrue(await require_private_chat(message, what="/stats"))
+        message.answer.assert_not_awaited()
+
+    async def test_private_only_commands_never_touch_the_database_in_groups(self):
+        cases = (
+            (stats, "cmd_stats"),
+            (prompt, "cmd_prompt"),
+            (prompt, "cmd_settings"),
+            (models, "cmd_model"),
+        )
+        for module, handler_name in cases:
+            with self.subTest(handler=handler_name):
+                message = self._group_message()
+                with (
+                    patch.object(
+                        module,
+                        "require_private_chat",
+                        AsyncMock(return_value=False),
+                    ) as guard,
+                    patch.object(module, "user_service") as service,
+                ):
+                    await getattr(module, handler_name)(message)
+                guard.assert_awaited_once()
+                service.assert_not_called()
+
+    async def test_model_selection_callback_is_private_only(self):
+        callback = SimpleNamespace(
+            data="model:qwen3.8-flash",
+            from_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(chat=SimpleNamespace(type="group")),
+        )
+        with patch.object(models, "safe_answer_callback", AsyncMock()) as ack:
+            await models.cb_model_selected(callback)
+        ack.assert_awaited_once()
+        self.assertTrue(ack.call_args.kwargs.get("show_alert"))
 
 
 if __name__ == "__main__":

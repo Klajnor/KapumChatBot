@@ -1,0 +1,709 @@
+"""MCP (Model Context Protocol) client: external tools for the chat model.
+
+The bot can connect to one or more MCP servers and offer their tools to the
+model. The primary use case is an Obsidian "second brain" (a ``brain`` server
+that indexes a vault and exposes ``search_notes`` / ``get_chunk`` /
+``get_note`` / ``list_notes``), but nothing here is Obsidian-specific: any
+stdio MCP server from a ``.mcp.json`` works.
+
+Design notes:
+
+* Transport is the MCP **stdio** transport — newline-delimited JSON-RPC 2.0
+  over the server process's stdin/stdout. No SDK dependency is needed on the
+  bot side, so the bot keeps working even when the server itself uses another
+  Python environment.
+* Servers are started lazily, on the first message that needs a tool, and
+  kept alive for later requests. A server that fails to start is retried
+  after a cooldown instead of on every message.
+* A server process receives a **minimal environment** (see
+  :func:`_child_environment`): the bot's own secrets — ``BOT_TOKEN``,
+  ``AI_API_KEY``, ``SEARCH_API_KEY``, ``TELEGRAPH_ACCESS_TOKEN``,
+  ``DATABASE_URL`` — are never inherited by third-party MCP code, and
+  ``${VAR}`` references to them in the config are refused. Anything a server
+  needs beyond the allowlist must be listed explicitly in its ``env``.
+* The feature is **admin-only by default** (``MCP_ADMIN_ONLY``): notes and
+  personal knowledge bases must not leak to other users of the bot.
+
+See README → «🧠 MCP-провайдер „Второй мозг“ (Obsidian)».
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import Any
+
+from bot.config import config
+
+logger = logging.getLogger(__name__)
+
+# Protocol revision advertised by the client. Every FastMCP release in use
+# today negotiates this (2024-11-05) or answers with its own revision.
+PROTOCOL_VERSION = "2024-11-05"
+CLIENT_INFO = {"name": "kapum-chatbot", "version": "1.0"}
+
+# How long a failed server is left alone before another start attempt.
+RETRY_COOLDOWN = 60.0
+
+# Max line size for a JSON-RPC message from a server (one note can be large).
+_MAX_LINE_BYTES = 8 * 1024 * 1024
+
+# OpenAI function names allow only letters, digits, "_" and "-".
+_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+# Appended to the system prompt while MCP tools are offered to an admin.
+MCP_SYSTEM_HINT = (
+    "Тебе доступен «второй мозг» пользователя — база личных заметок Obsidian "
+    "(инструменты с префиксом mcp__). Если вопрос может касаться личных "
+    "заметок, проектов, прошлых решений, документации или сохранённых знаний, "
+    "сначала найди подходящие заметки (search_notes), при необходимости "
+    "прочитай фрагмент (get_chunk) или всю заметку (get_note); если get_note "
+    "не сработал, используй get_chunk. Отвечай, опираясь на найденное, не "
+    "выдумывай содержимое заметок: если поиск ничего не дал, честно скажи об "
+    "этом. Указывай путь заметки, на которую опираешься."
+)
+
+
+class MCPError(RuntimeError):
+    """An MCP server could not be started or returned an error."""
+
+
+@dataclass(slots=True)
+class MCPServerConfig:
+    """One stdio MCP server from ``.mcp.json``."""
+
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str | None = None
+
+
+@dataclass(slots=True)
+class MCPTool:
+    """A tool advertised by a server, plus its namespaced OpenAI name."""
+
+    server: str
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    exposed_name: str = ""
+
+    def openai_schema(self) -> dict[str, Any]:
+        """The tool in OpenAI ``function`` format, with a namespaced name."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.exposed_name or self.name,
+                "description": f"[MCP:{self.server}] {self.description}".strip(),
+                "parameters": _normalize_schema(self.input_schema),
+            },
+        }
+
+
+# Bot credentials that must never reach an MCP server, explicitly or by
+# inheritance (see ``_expand_env`` and ``_child_environment``).
+_SECRET_ENV_NAMES = frozenset({
+    "BOT_TOKEN", "AI_API_KEY", "QWEN_API_KEY", "DASHSCOPE_API_KEY",
+    "SEARCH_API_KEY", "TAVILY_API_KEY", "TELEGRAPH_ACCESS_TOKEN",
+    "DATABASE_URL",
+})
+
+
+def _expand_env(value: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:-default}`` in a config string.
+
+    References to the bot's own credentials are refused (with a warning): the
+    ``.mcp.json`` can live in a synced directory, so a tampered entry must not
+    be able to pull ``BOT_TOKEN`` or an API key into a server's environment or
+    command line. Server-specific secrets belong in the server's ``env`` block.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        if name.upper() in _SECRET_ENV_NAMES:
+            logger.warning(
+                "MCP config references the bot secret %r; expansion refused", name
+            )
+            return default if default is not None else ""
+        return os.getenv(name, default if default is not None else "")
+
+    return _ENV_RE.sub(replace, value)
+
+
+
+
+# --- Subprocess environment --------------------------------------------------
+
+# Only these variables are inherited from the bot's own environment. An MCP
+# server is third-party code: handing it ``os.environ`` would give it the bot
+# token, every AI/search/Telegraph key and the database URL, i.e. full control
+# over the bot and its billing. Server-specific variables (``VAULT_PATH`` …)
+# are passed explicitly through the server's ``env`` block in ``.mcp.json`` —
+# visible, reviewable and scoped to that one server.
+_ENV_ALLOWLIST = frozenset({
+    # POSIX basics and locale/terminal state.
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+})
+
+# Windows processes need these to start at all (system DLLs, temp dirs,
+# per-user app data); none of them carry bot credentials.
+_WINDOWS_ENV_ALLOWLIST = frozenset({
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PSMODULEPATH",
+})
+
+
+def _child_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for an MCP subprocess: allowlisted base + explicit overrides.
+
+    The bot's secrets are deliberately absent: a server that needs another
+    variable declares it in its own ``env`` block (``${VAR}`` expansion is
+    supported there), which keeps every credential hand-off explicit. Overrides
+    are applied last and win over inherited values.
+    """
+    allowed = _ENV_ALLOWLIST
+    if os.name == "nt":
+        allowed = allowed | _WINDOWS_ENV_ALLOWLIST
+
+    environment = {
+        key: value for key, value in os.environ.items() if key.upper() in allowed
+    }
+    environment.update(
+        {
+            str(key): _expand_env(str(value))
+            for key, value in (overrides or {}).items()
+        }
+    )
+    return environment
+
+
+def _sanitize(part: str) -> str:
+    """Make one component safe for an OpenAI function name."""
+    cleaned = _NAME_RE.sub("_", part).strip("_")
+    return cleaned or "tool"
+
+
+def _exposed_name(server: str, tool: str) -> str:
+    """Namespaced tool name: ``mcp__<server>__<tool>`` (max 64 chars)."""
+    name = f"mcp__{_sanitize(server)}__{_sanitize(tool)}"
+    if len(name) <= 64:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{name[:55]}_{digest}"
+
+
+def _normalize_schema(schema: Any) -> dict[str, Any]:
+    """Coerce an MCP ``inputSchema`` into a valid JSON Schema object."""
+    if not isinstance(schema, dict) or not schema:
+        return {"type": "object", "properties": {}}
+    result = dict(schema)
+    result.setdefault("type", "object")
+    if result.get("type") == "object" and not isinstance(
+        result.get("properties"), dict
+    ):
+        result["properties"] = {}
+    return result
+
+
+def _format_tool_result(result: Any) -> str:
+    """Flatten an MCP ``tools/call`` result into text for the model."""
+    if not isinstance(result, dict):
+        return str(result)
+
+    parts: list[str] = []
+    for item in result.get("content") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            text = item.get("text")
+            if text:
+                parts.append(str(text))
+        elif kind == "resource":
+            resource = item.get("resource") or {}
+            value = resource.get("text") or resource.get("uri")
+            if value:
+                parts.append(str(value))
+        elif kind in {"image", "audio"}:
+            parts.append(f"[{kind}]")
+        else:
+            parts.append(json.dumps(item, ensure_ascii=False))
+
+    if not parts and result.get("structuredContent") is not None:
+        parts.append(
+            json.dumps(result["structuredContent"], ensure_ascii=False, indent=2)
+        )
+
+    text = "\n".join(part for part in parts if part).strip() or "(empty result)"
+    if result.get("isError"):
+        text = f"Ошибка инструмента MCP: {text}"
+    return text
+
+
+def mcp_available(telegram_id: int | None) -> bool:
+    """True when MCP tools may be offered to this user.
+
+    With the default ``MCP_ADMIN_ONLY=true`` only IDs from ``ADMIN_IDS`` get
+    the tools; everyone else chats exactly as before.
+    """
+    if not config.enable_mcp or not config.mcp_servers:
+        return False
+    if config.mcp_admin_only:
+        return telegram_id is not None and config.is_admin(telegram_id)
+    return True
+
+
+def apply_mcp_hint(messages: list[dict[str, Any]]) -> None:
+    """Append the "second brain" guidance to the system prompt, once."""
+    for entry in messages:
+        if entry.get("role") != "system":
+            continue
+        content = entry.get("content")
+        if isinstance(content, str) and MCP_SYSTEM_HINT not in content:
+            entry["content"] = f"{content}\n\n{MCP_SYSTEM_HINT}"
+        return
+
+
+class MCPClient:
+    """A single stdio MCP connection (own subprocess and JSON-RPC channel)."""
+
+    def __init__(self, server: MCPServerConfig, timeout: float) -> None:
+        self.server = server
+        self.timeout = timeout
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._next_id = 0
+        self._write_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._tools: list[MCPTool] | None = None
+        self._closed = False
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self) -> None:
+        """Spawn the server (if needed) and complete the MCP handshake."""
+        if self.running:
+            return
+        async with self._start_lock:
+            if self.running or self._closed:
+                return
+            await self._stop()
+
+            environment = _child_environment(self.server.env)
+            command = _expand_env(self.server.command)
+            args = [_expand_env(arg) for arg in self.server.args]
+            cwd = _expand_env(self.server.cwd) if self.server.cwd else None
+            try:
+                self._proc = await asyncio.create_subprocess_exec(
+                    command,
+                    *args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=environment,
+                    cwd=cwd,
+                    limit=_MAX_LINE_BYTES,
+                )
+            except (OSError, ValueError) as exc:
+                raise MCPError(
+                    f"не удалось запустить MCP-сервер {self.server.name!r}: {exc}"
+                ) from exc
+
+            self._reader_task = asyncio.create_task(
+                self._read_stdout(), name=f"mcp-{self.server.name}-stdout"
+            )
+            self._stderr_task = asyncio.create_task(
+                self._read_stderr(), name=f"mcp-{self.server.name}-stderr"
+            )
+
+            try:
+                await self._request(
+                    "initialize",
+                    {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": CLIENT_INFO,
+                    },
+                    # A server that cannot start quickly must not hold up a
+                    # reply for the full tool timeout (60 s by default).
+                    timeout=min(self.timeout, 20.0),
+                )
+                await self._notify("notifications/initialized", {})
+            except Exception:
+                # Do not leave a half-initialized process behind.
+                await self._stop()
+                raise
+            logger.info("MCP server %r started", self.server.name)
+
+    async def list_tools(self) -> list[MCPTool]:
+        """Return the server's tools (all pages of ``tools/list``)."""
+        if self._tools is not None and self.running:
+            return self._tools
+        await self.start()
+        tools: list[MCPTool] = []
+        cursor: str | None = None
+        for _ in range(20):  # pagination guard
+            params: dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+            result = await self._request(
+                "tools/list", params, timeout=min(self.timeout, 20.0)
+            )
+            if not isinstance(result, dict):
+                break
+            for item in result.get("tools") or []:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                name = str(item["name"])
+                tools.append(
+                    MCPTool(
+                        server=self.server.name,
+                        name=name,
+                        description=str(item.get("description") or ""),
+                        input_schema=item.get("inputSchema") or {},
+                        exposed_name=_exposed_name(self.server.name, name),
+                    )
+                )
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        self._tools = tools
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Invoke one tool and flatten the result into text."""
+        await self.start()
+        result = await self._request(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+        )
+        return _format_tool_result(result)
+
+    async def close(self) -> None:
+        """Stop the server process and fail any in-flight request."""
+        self._closed = True
+        await self._stop()
+
+    # --- JSON-RPC plumbing -------------------------------------------------
+
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        if not self.running:
+            raise MCPError(f"MCP-сервер {self.server.name!r} не запущен")
+        self._next_id += 1
+        request_id = self._next_id
+        future: asyncio.Future[Any] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending[request_id] = future
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+            )
+            return await asyncio.wait_for(future, timeout=timeout or self.timeout)
+        except TimeoutError as exc:
+            raise MCPError(
+                f"MCP-сервер {self.server.name!r}: таймаут {method}"
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        await self._send(
+            {"jsonrpc": "2.0", "method": method, "params": params}
+        )
+
+    async def _send(self, payload: dict[str, Any]) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None or proc.returncode is not None:
+            raise MCPError(f"MCP-сервер {self.server.name!r} не запущен")
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        async with self._write_lock:
+            try:
+                proc.stdin.write((line + "\n").encode("utf-8"))
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise MCPError(
+                    f"MCP-сервер {self.server.name!r} закрыл соединение"
+                ) from exc
+
+    async def _read_stdout(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "MCP %r: non-JSON output: %s",
+                        self.server.name,
+                        line[:200],
+                    )
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if "method" in message:
+                    # Server-initiated request/notification (sampling, roots…):
+                    # this client only offers tools, so decline politely.
+                    if "id" in message:
+                        await self._send(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": message["id"],
+                                "error": {
+                                    "code": -32601,
+                                    "message": "method not supported",
+                                },
+                            }
+                        )
+                    continue
+                request_id = message.get("id")
+                if request_id is None:
+                    continue
+                try:
+                    pending_id = int(request_id)
+                except (TypeError, ValueError):
+                    continue
+                future = self._pending.get(pending_id)
+                if future is None or future.done():
+                    continue
+                if "error" in message:
+                    error = message.get("error") or {}
+                    future.set_exception(
+                        MCPError(
+                            f"MCP-сервер {self.server.name!r}: "
+                            f"{error.get('message') or error}"
+                        )
+                    )
+                else:
+                    future.set_result(message.get("result"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport must not crash the bot
+            logger.warning(
+                "MCP %r: stdout reader stopped: %s", self.server.name, exc
+            )
+            self._fail_pending(f"MCP-сервер {self.server.name!r} отключился")
+        finally:
+            self._fail_pending(f"MCP-сервер {self.server.name!r} отключился")
+
+    async def _read_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                raw = await proc.stderr.readline()
+                if not raw:
+                    break
+                logger.debug(
+                    "MCP %r stderr: %s",
+                    self.server.name,
+                    raw.decode("utf-8", "replace").rstrip()[:500],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - stderr is diagnostics only
+            return
+
+    def _fail_pending(self, message: str) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(MCPError(message))
+        self._pending.clear()
+
+    async def _stop(self) -> None:
+        proc = self._proc
+        tasks = [task for task in (self._reader_task, self._stderr_task) if task]
+        self._reader_task = self._stderr_task = None
+        self._proc = None
+        self._tools = None
+
+        if proc is not None and proc.returncode is None:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                with suppress(Exception):
+                    proc.stdin.close()
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except (TimeoutError, ProcessLookupError):
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await proc.wait()
+
+        for task in tasks:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        self._fail_pending("MCP-сервер остановлен")
+
+
+class MCPManager:
+    """All configured MCP servers behind one tool catalog."""
+
+    def __init__(self) -> None:
+        self._clients: dict[str, MCPClient] = {}
+        self._tools: dict[str, tuple[MCPTool, MCPClient]] = {}
+        self._loaded = False
+        self._retry_at = 0.0
+        self._lock = asyncio.Lock()
+
+    def _client(self, name: str) -> MCPClient:
+        client = self._clients.get(name)
+        if client is None:
+            raw = config.mcp_servers[name]
+            server = MCPServerConfig(
+                name=name,
+                command=str(raw.get("command") or ""),
+                args=[str(arg) for arg in raw.get("args") or []],
+                env={
+                    str(key): str(value)
+                    for key, value in (raw.get("env") or {}).items()
+                },
+                cwd=raw.get("cwd"),
+            )
+            client = MCPClient(server, timeout=float(config.mcp_timeout))
+            self._clients[name] = client
+        return client
+
+    async def _load(self, *, force: bool = False) -> None:
+        if not force and (
+            self._loaded
+            or time.monotonic() < self._retry_at
+        ):
+            return
+        async with self._lock:
+            if not force and (
+                self._loaded or time.monotonic() < self._retry_at
+            ):
+                return
+            catalog: dict[str, tuple[MCPTool, MCPClient]] = {}
+            for name in config.mcp_servers:
+                client = self._client(name)
+                try:
+                    tools = await client.list_tools()
+                except Exception as exc:  # noqa: BLE001 - one server must not break the bot
+                    logger.warning("MCP server %r unavailable: %s", name, exc)
+                    continue
+                for tool in tools:
+                    exposed = tool.exposed_name
+                    if exposed in catalog:
+                        digest = hashlib.sha1(
+                            f"{name}:{tool.name}".encode()
+                        ).hexdigest()[:6]
+                        tool.exposed_name = f"{exposed[:57]}_{digest}"
+                        exposed = tool.exposed_name
+                    catalog[exposed] = (tool, client)
+                logger.info("MCP server %r: %d tool(s)", name, len(tools))
+            self._tools = catalog
+            self._loaded = bool(catalog)
+            # Do not respawn a broken server for every single message.
+            self._retry_at = 0.0 if catalog else time.monotonic() + RETRY_COOLDOWN
+
+    async def openai_tools(self) -> list[dict[str, Any]]:
+        """The tool catalog in OpenAI function format (empty on failure)."""
+        await self._load()
+        return [tool.openai_schema() for tool, _ in self._tools.values()]
+
+    def is_mcp_tool(self, name: str) -> bool:
+        """True when ``name`` belongs to a known MCP tool."""
+        return name in self._tools
+
+    def tool_info(self, name: str) -> MCPTool | None:
+        """Metadata for an exposed MCP tool name."""
+        entry = self._tools.get(name)
+        return entry[0] if entry else None
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> str:
+        """Execute a tool call; always returns text, never raises."""
+        if not self._loaded:
+            await self._load()
+        entry = self._tools.get(name)
+        if entry is None:
+            return f"Ошибка: неизвестный MCP-инструмент {name!r}."
+        tool, client = entry
+        logger.info("MCP call: %s.%s", tool.server, tool.name)
+        try:
+            text = await client.call_tool(tool.name, arguments or {})
+        except Exception as exc:  # noqa: BLE001 - tool failure must not kill a reply
+            logger.warning(
+                "MCP call %s.%s failed: %s", tool.server, tool.name, exc
+            )
+            return f"Ошибка MCP-инструмента {tool.name}: {exc}"
+        limit = config.mcp_max_result_chars
+        if len(text) > limit:
+            text = text[:limit] + f"\n…[обрезано {len(text) - limit} символов]"
+        return text
+
+    async def status(self) -> list[dict[str, Any]]:
+        """Per-server diagnostic for the admin ``/mcp`` command."""
+        report: list[dict[str, Any]] = []
+        for name in config.mcp_servers:
+            client = self._client(name)
+            tools: list[str] = []
+            error: str | None = None
+            try:
+                tools = [tool.name for tool in await client.list_tools()]
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                error = str(exc)
+            report.append(
+                {
+                    "name": name,
+                    "running": client.running,
+                    "tools": tools,
+                    "error": error,
+                }
+            )
+        return report
+
+    async def close(self) -> None:
+        """Stop every server (called on bot shutdown)."""
+        for client in list(self._clients.values()):
+            with suppress(Exception):
+                await client.close()
+        self._clients.clear()
+        self._tools.clear()
+        self._loaded = False
+
+
+mcp_manager = MCPManager()

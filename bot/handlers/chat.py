@@ -51,6 +51,11 @@ from bot.services.intent import (
     detect_intent,
     generation_prompt,
 )
+from bot.services.mcp import (
+    apply_mcp_hint,
+    mcp_available,
+    mcp_manager,
+)
 from bot.services.progress import waiting
 from bot.services.rich import (
     RICH_LIMIT,
@@ -895,37 +900,94 @@ async def _single_shot(
     )
 
 
-async def _resolve_search_round(
+def _mcp_notice(calls: list[ToolCall]) -> str:
+    """Short user-facing line describing the pending MCP tool calls."""
+    labels: list[str] = []
+    for call in calls:
+        tool = mcp_manager.tool_info(call.name)
+        label = tool.name if tool else call.name
+        detail = call.arguments.get("query") or call.arguments.get("path")
+        if detail:
+            label = f"{label}: {detail}"
+        labels.append(label)
+    shown = ", ".join(labels)
+    suffix = f": <i>{html.escape(shown[:200])}</i>" if shown else "…"
+    return f"🧠 <b>Second brain</b>{suffix}"
+
+
+async def _resolve_tool_round(
     message: Message,
     messages: list[dict[str, Any]],
     result: ChatResult,
-    search_calls: list[ToolCall],
+    calls: list[ToolCall],
+    *,
+    search_ready: bool,
+    search_allowed: bool,
+    mcp_allowed: bool,
 ) -> None:
-    """Run the model's ``search_web`` calls and append the tool exchange.
+    """Run the model's search/MCP calls and append the tool exchange.
 
-    Adds the assistant turn that requested the searches, one ``tool`` response
+    Adds the assistant turn that requested the calls, one ``tool`` response
     per call (the chat API rejects an assistant turn with unanswered
-    tool_calls), and a short "searching…" notice for the user. ``messages`` is
-    extended in place so the next round sees the results.
+    tool_calls), and a short notice for the user. A call whose round budget is
+    spent still gets an answer explaining that, so every ``tool_call`` is
+    closed. ``messages`` is extended in place so the next round sees the
+    results.
     """
-    messages.append(build_assistant_tool_message(result.content, search_calls))
+    messages.append(build_assistant_tool_message(result.content, calls))
 
-    queries = [str(call.arguments.get("query") or "").strip() for call in search_calls]
-    shown = ", ".join(q for q in queries if q)
+    search_calls = [
+        call for call in calls
+        if call.name == "search_web" and search_ready
+    ]
+    mcp_calls = [call for call in calls if mcp_manager.is_mcp_tool(call.name)]
+
+    notices: list[str] = []
+    queries = [
+        str(call.arguments.get("query") or "").strip() for call in search_calls
+    ]
+    shown = ", ".join(query for query in queries if query)
     if shown:
-        await safe_answer(
-            message,
-            f"🔎 <b>Searching the web:</b> <i>{html.escape(shown[:200])}</i>",
+        notices.append(
+            f"🔎 <b>Searching the web:</b> <i>{html.escape(shown[:200])}</i>"
         )
+    if mcp_calls:
+        notices.append(_mcp_notice(mcp_calls))
+    if notices:
+        await safe_answer(message, "\n".join(notices))
 
-    for call, query in zip(search_calls, queries):
-        max_results = call.arguments.get("max_results")
-        if not isinstance(max_results, int) or isinstance(max_results, bool):
-            max_results = None
-        results = await search_web(query, max_results) if query else []
-        messages.append(
-            build_tool_response(call.id, format_search_results(query, results))
-        )
+    for call in calls:
+        if call.name == "search_web" and search_ready:
+            if not search_allowed:
+                messages.append(
+                    build_tool_response(
+                        call.id,
+                        "Лимит веб-поиска на этот вопрос исчерпан. Ответь из "
+                        "уже собранной информации.",
+                    )
+                )
+                continue
+            query = str(call.arguments.get("query") or "").strip()
+            max_results = call.arguments.get("max_results")
+            if not isinstance(max_results, int) or isinstance(max_results, bool):
+                max_results = None
+            results = await search_web(query, max_results) if query else []
+            messages.append(
+                build_tool_response(call.id, format_search_results(query, results))
+            )
+            continue
+
+        if not mcp_allowed:
+            messages.append(
+                build_tool_response(
+                    call.id,
+                    "Лимит обращений к MCP на этот вопрос исчерпан. Ответь из "
+                    "уже собранной информации.",
+                )
+            )
+            continue
+        output = await mcp_manager.call_tool(call.name, call.arguments)
+        messages.append(build_tool_response(call.id, output))
 
 
 async def _answer_with_ai(
@@ -976,10 +1038,21 @@ async def _answer_with_ai(
     if search_ready:
         tools.append(SEARCH_TOOL)
         apply_search_hint(messages)
+    # MCP tools (the Obsidian "second brain") are exposed to admins only by
+    # default; a server that fails to start simply contributes no tools.
+    mcp_ready = mcp_available(user.id)
+    if mcp_ready:
+        mcp_tools = await mcp_manager.openai_tools()
+        if mcp_tools:
+            tools.extend(mcp_tools)
+            apply_mcp_hint(messages)
+        else:
+            mcp_ready = False
     tools_arg = tools or None
     printer: _StreamPrinter | None = None
     total_elapsed = 0.0
     search_rounds = 0
+    mcp_rounds = 0
     result: ChatResult
 
     async with waiting(message) as notifier:
@@ -1020,26 +1093,51 @@ async def _answer_with_ai(
                 if search_ready
                 else []
             )
-            # Web search is a multi-round tool loop: run the searches and ask
+            mcp_calls = (
+                [
+                    call for call in result.tool_calls
+                    if mcp_manager.is_mcp_tool(call.name)
+                ]
+                if mcp_ready
+                else []
+            )
+            handled_calls = [*search_calls, *mcp_calls]
+            can_search = (
+                bool(search_calls)
+                and search_rounds < config.max_search_rounds
+            )
+            can_mcp = bool(mcp_calls) and mcp_rounds < config.mcp_max_rounds
+            # Search and MCP are multi-round tool loops: run the calls and ask
             # again — unless the same turn also asked for an image/sticker
-            # (those win) or the round budget is spent.
+            # (those win) or every requested tool type spent its budget.
             if (
-                search_calls
+                handled_calls
                 and image_call is None
                 and sticker_call is None
-                and search_rounds < config.max_search_rounds
+                and (can_search or can_mcp)
             ):
-                search_rounds += 1
+                if can_search:
+                    search_rounds += 1
+                if can_mcp:
+                    mcp_rounds += 1
                 if printer is not None:
                     await printer.discard()
                     printer = None
-                await _resolve_search_round(message, messages, result, search_calls)
+                await _resolve_tool_round(
+                    message,
+                    messages,
+                    result,
+                    handled_calls,
+                    search_ready=search_ready,
+                    search_allowed=can_search,
+                    mcp_allowed=can_mcp,
+                )
                 continue
-            if search_calls and not result.content:
-                # Budget spent and the model still only wants to search: one
+            if handled_calls and not result.content:
+                # Budget spent and the model still only wants to use tools: one
                 # final tools-less request so the user gets an answer from the
                 # results already gathered.
-                logger.info("Search round limit reached; forcing a final answer")
+                logger.info("Tool round limit reached; forcing a final answer")
                 result = await _single_shot(messages, model, settings, None)
                 total_elapsed += result.elapsed
             break
@@ -1140,6 +1238,7 @@ async def handle_text(message: Message) -> None:
         if service is None:
             return
 
+        access: AccessResult | None = None
         try:
             access = await _consume_access(message, service)
             if access is None:
@@ -1157,6 +1256,13 @@ async def handle_text(message: Message) -> None:
                 chat_id=message.chat.id, action=ChatAction.TYPING
             )
             await _answer_with_ai(message, service, text, access)
+        except Exception:
+            # A crash after the quota was taken must not bill the user for a
+            # request that never produced an answer; refund_access is a no-op
+            # when nothing was consumed or the unit is already given back.
+            if access is not None:
+                await refund_access(service, user.id, access)
+            raise
         finally:
             await service.session.close()
 
@@ -1205,6 +1311,7 @@ async def _handle_voice(message: Message) -> None:
     if service is None:
         return
 
+    access: AccessResult | None = None
     try:
         access = await _consume_access(message, service)
         if access is None:
@@ -1249,6 +1356,10 @@ async def _handle_voice(message: Message) -> None:
             chat_id=message.chat.id, action=ChatAction.TYPING
         )
         await _answer_with_ai(message, service, transcript, access)
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -1308,6 +1419,7 @@ async def _handle_document(message: Message) -> None:
     service = await _open_registered(message)
     if service is None:
         return
+    access: AccessResult | None = None
     try:
         access = await _consume_access(message, service)
         if access is None:
@@ -1354,6 +1466,10 @@ async def _handle_document(message: Message) -> None:
             doc.file_name or "document", extracted, caption
         )
         await _answer_with_ai(message, service, combined, access)
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -1450,6 +1566,7 @@ async def _handle_photo(
     if service is None:
         return
 
+    access: AccessResult | None = None
     try:
         settings = await service.get_user_settings(user.id)
 
@@ -1577,6 +1694,10 @@ async def _handle_photo(
         hint = guest_hint(access)
         if hint:
             await safe_answer(message, hint)
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -1610,6 +1731,7 @@ async def _handle_vision_and_generate(
     if service is None:
         return
 
+    access: AccessResult | None = None
     try:
         access = await _consume_access(message, service)
         if access is None:
@@ -1731,6 +1853,10 @@ async def _handle_vision_and_generate(
         if hint:
             await safe_answer(message, hint)
 
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -1824,6 +1950,7 @@ async def _run_enhancement(
     request, refund_access gives it back when nothing could be delivered.
     """
     service = await _open_registered_user(user)
+    access: AccessResult | None = None
     try:
         access = await check_access(service, user.id)
         if not access.allowed:
@@ -1909,6 +2036,10 @@ async def _run_enhancement(
         if hint:
             await safe_answer(target, hint)
 
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -2031,6 +2162,7 @@ async def _process_album(
     if service is None:
         return
 
+    access: AccessResult | None = None
     try:
         access = await _consume_access(message, service)
         if access is None:
@@ -2284,6 +2416,10 @@ async def _process_album(
         if hint:
             await safe_answer(message, hint)
 
+    except Exception:
+        if access is not None:
+            await refund_access(service, user.id, access)
+        raise
     finally:
         await service.session.close()
 
@@ -2438,6 +2574,7 @@ async def cb_resend_with_model(callback: CallbackQuery) -> None:
             await safe_answer(origin, limits.BUSY_MESSAGE)
             return
         service = await _open_registered_user(callback.from_user)
+        access: AccessResult | None = None
         try:
             access = await check_access(service, callback.from_user.id)
             if not access.allowed:
@@ -2451,6 +2588,10 @@ async def cb_resend_with_model(callback: CallbackQuery) -> None:
                 user=callback.from_user,
                 model_override=model_id,
             )
+        except Exception:
+            if access is not None:
+                await refund_access(service, callback.from_user.id, access)
+            raise
         finally:
             await service.session.close()
 

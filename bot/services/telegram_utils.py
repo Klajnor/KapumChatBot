@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any
 
+from aiogram.enums import ChatType
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
@@ -16,8 +17,6 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from bot.bot import get_bot_id, get_bot_username
 from bot.config import DEFAULT_TIMING_FORMAT, DEFAULT_TIMING_FORMAT_TOKENS, config
-from bot.services.markdown import render, split_chunks
-from bot.services.science import normalize_formulas
 from bot.services.formulas import (
     MAX_FORMULA_IMAGES,
     MAX_TABLE_IMAGES,
@@ -26,6 +25,8 @@ from bot.services.formulas import (
     render_table,
     split_blocks,
 )
+from bot.services.markdown import render, split_chunks
+from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
 
@@ -548,4 +549,20 @@ async def safe_answer(message: Message, text: str, **kwargs) -> bool:
         except Exception as exc:  # noqa: BLE001 - a reply must not be lost
             logger.error("Could not send the message: %s", exc)
             return False
+    return False
+
+
+async def require_private_chat(message: Message, *, what: str = "This command") -> bool:
+    """True in a private chat; otherwise explain and return False.
+
+    Commands that print personal settings or conversation content must not run
+    in groups — the reply would be visible to every participant.
+    """
+    if message.chat.type == ChatType.PRIVATE:
+        return True
+    await safe_answer(
+        message,
+        f"🔒 <b>{what} is available in a private chat only.</b>\n\n"
+        "Send it to me in a direct message.",
+    )
     return False

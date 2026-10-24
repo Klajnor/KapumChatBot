@@ -88,6 +88,11 @@ class AllowedUser(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Cached Telegram profile so /list_users can show a nickname even before
+    # the user has written to the bot (and therefore has no ``users`` row).
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class DailyUsage(Base):

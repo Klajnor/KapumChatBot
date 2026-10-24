@@ -8,7 +8,11 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.config import config
 from bot.keyboards.inline import get_persona_keyboard
-from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
+from bot.services.telegram_utils import (
+    require_private_chat,
+    safe_answer_callback,
+    safe_edit_text,
+)
 from bot.services.user_service import user_service
 
 router = Router()
@@ -19,6 +23,9 @@ async def cmd_prompt(message: Message) -> None:
     """Handle /prompt command — view or set system prompt."""
     user = message.from_user
     if user is None:
+        return
+    # A system prompt is personal (and may contain private context).
+    if not await require_private_chat(message, what="/prompt"):
         return
 
     # Extract prompt text if provided
@@ -132,6 +139,9 @@ async def cmd_settings(message: Message) -> None:
     """Handle /settings command — show current settings."""
     user = message.from_user
     if user is None:
+        return
+    # Prints the system prompt: private chat only, like /prompt.
+    if not await require_private_chat(message, what="/settings"):
         return
 
     async with user_service() as service:

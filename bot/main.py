@@ -32,6 +32,7 @@ from bot.handlers.chat import _album_cleanup
 from bot.services import telegraph
 from bot.services.ai_client import ai_client, ffmpeg_available
 from bot.services.health import start_health_server, stop_health_server
+from bot.services.mcp import mcp_manager
 from bot.services.reminders import cancel_pending_fires, reminder_scheduler_loop
 from bot.services.telegram_utils import safe_answer_guest
 
@@ -157,6 +158,19 @@ async def main() -> None:
                 "ENABLE_VOICE=false to silence the feature."
             )
 
+        if config.enable_mcp and config.mcp_servers:
+            logger.info(
+                "MCP: %d server(s) configured (%s), admin-only=%s",
+                len(config.mcp_servers),
+                ", ".join(config.mcp_servers),
+                config.mcp_admin_only,
+            )
+        elif config.enable_mcp:
+            logger.info(
+                "MCP is enabled but no servers are configured "
+                "(set MCP_CONFIG_FILE or MCP_SERVERS)"
+            )
+
         logger.info(
             "Starting bot polling (guest access: %s, guest mode: %s)",
             config.allow_guest_access,
@@ -176,6 +190,7 @@ async def main() -> None:
         # they still touch the database (disable/reschedule on failure).
         await cancel_pending_fires()
         await stop_health_server(health_runner)
+        await mcp_manager.close()
         await ai_client.close()
         await telegraph.close()
         await bot.session.close()

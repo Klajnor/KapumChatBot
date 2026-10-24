@@ -1,24 +1,51 @@
 [Unit]
-Description=Chat Bot
-After=syslog.target network.target
+Description=Kapum ChatBot
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/KapumChatBot
-# Перед каждым запуском убираем устаревший кэш байт-кода проекта: старые .pyc
-# после загрузки кода или смены версии Python могут заставить бота исполнять
-# прежний код. "-" в начале = ошибка очистки не блокирует запуск; /bin/bash
-# указан явно, т.к. при загрузке с Windows бит +x у скрипта теряется.
-# Без -p скрипт чистил бы весь проект, включая .venv (медленнее на каждом
-# рестарте).
-ExecStartPre=-/bin/bash /root/KapumChatBot/scripts/clean_pycache.sh -p /root/KapumChatBot/bot
-ExecStart=/root/KapumChatBot/.venv/bin/python -m bot.main
+User=brain
+Group=brain
+UMask=0077
+WorkingDirectory=/opt/KapumChatBot
+# Бот не пишет .pyc: отдельная очистка __pycache__ перед запуском не нужна,
+# а каталог с кодом может оставаться недоступным на запись для сервиса.
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Каталоги данных и кэша создаются systemd с владельцем brain:
+#   /var/lib/kapum-chatbot   — chat_bot.db (+ WAL) и telegraph_account.json
+#   /var/cache/kapum-chatbot — кэш шрифтов matplotlib
+# В .env на сервере укажите абсолютные пути:
+#   DATABASE_URL=sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db
+#   TELEGRAPH_ACCOUNT_FILE=/var/lib/kapum-chatbot/telegraph_account.json
+StateDirectory=kapum-chatbot
+StateDirectoryMode=0700
+CacheDirectory=kapum-chatbot
+CacheDirectoryMode=0700
+Environment=MPLCONFIGDIR=/var/cache/kapum-chatbot/matplotlib
+# При некоторых случаях разработчик может случайно скопировать кеш со своей машины, на всякий случай сотру его
+ExecStartPre=-/bin/bash /opt/KapumChatBot/scripts/clean_pycache.sh -p /opt/KapumChatBot/bot
+ExecStart=/opt/KapumChatBot/.venv/bin/python -m bot.main
 Restart=always
-# Hardening. Better still: create a dedicated user, move the project out of
-# /root and set User=/Group= here (then chmod 600 .env and chat_bot.db).
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Ограничения. Код в /opt/KapumChatBot остаётся root:root (сервис только
+# читает); запись разрешена в StateDirectory/CacheDirectory. Если хранилище
+# Obsidian для MCP лежит в /home, замените ProtectHome=true на false.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

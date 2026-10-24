@@ -10,10 +10,10 @@ guarded, so the bot runs without them and degrades gracefully:
 
 URL fetching is SSRF-guarded: only ``http(s)`` URLs whose host resolves to a
 public IP are fetched, redirects are followed manually and validated hop by
-hop, and downloads are size-capped. Note that DNS is resolved once for the
-check and again by aiohttp for the request, so a malicious authoritative DNS
-server could theoretically race the two (rebinding); acceptable here because
-only whitelisted users can trigger a fetch.
+hop, and downloads are size-capped. Each hop is resolved once, screened, and
+the request is then pinned to exactly the validated addresses (a custom
+resolver), so a rebinding DNS answer between the check and the request cannot
+redirect it to an internal host.
 """
 
 from __future__ import annotations
@@ -236,24 +236,33 @@ def is_safe_public_url(url: str) -> bool:
     host = parsed.hostname
     if not host:
         return False
-    try:
-        return _ip_is_public(ipaddress.ip_address(host))
-    except ValueError:
-        pass  # a hostname, not a literal IP — resolve it
+    return _resolve_public_ips(host) is not None
+
+
+def _resolve_public_ips(host: str) -> list[str] | None:
+    """All public IP addresses of ``host``, or None when any answer is unsafe.
+
+    One private, loopback, link-local or otherwise reserved address among the
+    answers rejects the whole host. Blocking DNS resolution makes this
+    synchronous-CPU, so async callers should use ``asyncio.to_thread``.
+    """
     try:
         infos = socket.getaddrinfo(host, None)
     except (socket.gaierror, UnicodeError, OSError):
-        return False
+        return None
     if not infos:
-        return False
+        return None
+    ips: list[str] = []
     for info in infos:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except (ValueError, IndexError):
-            return False
+            return None
         if not _ip_is_public(ip):
-            return False
-    return True
+            return None
+        if str(ip) not in ips:
+            ips.append(str(ip))
+    return ips
 
 
 # --- HTML extraction ---------------------------------------------------------
@@ -383,54 +392,118 @@ class FetchedPage:
     text: str
 
 
+class _PinnedResolver(aiohttp.resolver.AbstractResolver):
+    """DNS resolver that answers with the pre-validated addresses only.
+
+    aiohttp would resolve the hostname again on its own, and a malicious
+    authoritative DNS server could answer that second lookup with an internal
+    address (DNS rebinding). Pinning the addresses that passed the safety
+    check closes the window; TLS still validates the certificate against the
+    hostname, which the URL keeps.
+    """
+
+    def __init__(self, ips: list[str]) -> None:
+        self._ips = ips
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        del family  # per-address: v6 answers must carry AF_INET6
+        return [
+            {
+                "hostname": host,
+                "host": ip,
+                "port": port,
+                "family": (
+                    socket.AF_INET6
+                    if ipaddress.ip_address(ip).version == 6
+                    else socket.AF_INET
+                ),
+                "proto": 0,
+                "flags": socket.AI_NUMERICHOST,
+            }
+            for ip in self._ips
+        ]
+
+    async def close(self) -> None:
+        return None
+
+
 async def _fetch_body(url: str) -> tuple[bytes | None, str, str]:
     """GET ``url`` following redirects manually; validate every hop.
 
     Returns ``(body, final_url, content_type)``; body is None on any refusal
     or failure. ``allow_redirects=False`` is deliberate: aiohttp would follow
     a redirect to an internal address without giving us a chance to check it.
+    Every hop (including the first URL) is resolved once, screened for public
+    addresses, and the request is pinned to exactly those addresses.
     """
     timeout = aiohttp.ClientTimeout(total=config.link_fetch_timeout)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for _ in range(_MAX_REDIRECTS + 1):
-                async with session.get(
-                    url, headers=_FETCH_HEADERS, allow_redirects=False
-                ) as resp:
-                    if resp.status in (301, 302, 303, 307, 308):
-                        location = resp.headers.get("Location")
-                        if not location:
+        for _ in range(_MAX_REDIRECTS + 1):
+            try:
+                parsed = urlsplit(url)
+            except ValueError:
+                return None, url, ""
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                logger.warning(
+                    "Refusing a non-http(s) or hostless URL: %s",
+                    parsed.netloc or url,
+                )
+                return None, url, ""
+            ips = await asyncio.to_thread(_resolve_public_ips, parsed.hostname)
+            if not ips:
+                logger.warning(
+                    "Refusing a host without public addresses: %s", parsed.netloc
+                )
+                return None, url, ""
+            connector = aiohttp.TCPConnector(resolver=_PinnedResolver(ips))
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=timeout, connector=connector
+                ) as session:
+                    async with session.get(
+                        url, headers=_FETCH_HEADERS, allow_redirects=False
+                    ) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("Location")
+                            if not location:
+                                return None, url, ""
+                            url = urljoin(url, location)
+                            continue
+                        if resp.status != 200:
+                            logger.info("URL fetch got HTTP %s", resp.status)
                             return None, url, ""
-                        url = urljoin(url, location)
-                        if not await asyncio.to_thread(is_safe_public_url, url):
-                            logger.warning(
-                                "Refusing a redirect to a non-public URL: %s",
-                                urlsplit(url).netloc,
+                        content_type = (
+                            (resp.headers.get("Content-Type") or "").lower()
+                        )
+                        allowed = (
+                            content_type.startswith(
+                                (
+                                    "text/",
+                                    "application/json",
+                                    "application/xml",
+                                    "application/pdf",
+                                )
+                            )
+                            or "xhtml" in content_type
+                            or not content_type
+                        )
+                        if not allowed:
+                            logger.info(
+                                "Skipping non-text content type %r", content_type
                             )
                             return None, url, ""
-                        continue
-                    if resp.status != 200:
-                        logger.info("URL fetch got HTTP %s", resp.status)
-                        return None, url, ""
-                    content_type = (resp.headers.get("Content-Type") or "").lower()
-                    allowed = (
-                        content_type.startswith(
-                            ("text/", "application/json", "application/xml", "application/pdf")
-                        )
-                        or "xhtml" in content_type
-                        or not content_type
-                    )
-                    if not allowed:
-                        logger.info("Skipping non-text content type %r", content_type)
-                        return None, url, ""
-                    declared = resp.content_length
-                    if declared is not None and declared > _MAX_FETCH_BYTES:
-                        logger.info("Page is too large (%d bytes)", declared)
-                        return None, url, ""
-                    body = await resp.content.read(_MAX_FETCH_BYTES + 1)
-                    if len(body) > _MAX_FETCH_BYTES:
-                        return None, url, ""
-                    return body, str(resp.url), content_type
+                        declared = resp.content_length
+                        if declared is not None and declared > _MAX_FETCH_BYTES:
+                            logger.info("Page is too large (%d bytes)", declared)
+                            return None, url, ""
+                        body = await resp.content.read(_MAX_FETCH_BYTES + 1)
+                        if len(body) > _MAX_FETCH_BYTES:
+                            return None, url, ""
+                        return body, str(resp.url), content_type
+            finally:
+                await connector.close()
     except (TimeoutError, aiohttp.ClientError, OSError) as exc:
         logger.warning("URL fetch failed for %s: %s", urlsplit(url).netloc, exc)
         return None, url, ""

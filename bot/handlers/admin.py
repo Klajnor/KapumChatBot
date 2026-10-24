@@ -8,12 +8,18 @@ import logging
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.bot import bot
 from bot.config import config
+from bot.services.mcp import mcp_manager
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
 
@@ -39,10 +45,85 @@ def _admin_required(func):
     return wrapper
 
 
+def _parse_target(raw: str) -> tuple[int | None, str | None]:
+    """Split a command argument into a numeric ID or a ``@username`` hint."""
+    value = raw.strip()
+    if not value:
+        return None, None
+    # Ignore anything after the first token ("@nick note" still means @nick).
+    value = value.split()[0]
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix) :]
+            break
+    value = value.lstrip("@").strip()
+    if value.isdigit():
+        return int(value), None
+    return None, value or None
+
+
+def _name_html(
+    first_name: str | None,
+    last_name: str | None,
+    username: str | None,
+    empty: str = "—",
+) -> str:
+    """Human-readable, HTML-escaped name with the ``@username`` in brackets."""
+    full_name = " ".join(
+        html.escape(part) for part in (first_name, last_name) if part
+    )
+    handle = f"@{html.escape(username)}" if username else ""
+    if full_name and handle:
+        return f"{full_name} ({handle})"
+    if full_name:
+        return full_name
+    if handle:
+        return handle
+    return empty
+
+
+async def _fetch_profile(telegram_id: int) -> dict[str, str]:
+    """Best-effort Telegram profile lookup for a user ID.
+
+    ``getChat`` only works when the bot has already seen the user; failures
+    are expected and must never break the admin command.
+    """
+    try:
+        chat = await bot.get_chat(telegram_id)
+    except TelegramAPIError as exc:
+        logger.debug("Profile lookup for %s failed: %s", telegram_id, exc)
+        return {}
+    return {
+        key: value
+        for key, value in (
+            ("username", getattr(chat, "username", None)),
+            ("first_name", getattr(chat, "first_name", None)),
+            ("last_name", getattr(chat, "last_name", None)),
+        )
+        if value
+    }
+
+
+async def _resolve_target(raw: str) -> tuple[int | None, str | None]:
+    """Resolve ``/<cmd>``'s argument to (telegram_id, error message)."""
+    target_id, username_hint = _parse_target(raw)
+    if target_id is not None or username_hint is None:
+        return target_id, None
+    async with user_service() as service:
+        target_id = await service.find_user_by_username(username_hint)
+    if target_id is not None:
+        return target_id, None
+    return None, (
+        f"❌ <b>User @{html.escape(username_hint)} not found.</b>\n\n"
+        "The bot only knows users who have already written to it. "
+        "Ask them to send /start, then retry — or add them by numeric ID."
+    )
+
+
 @router.message(Command("add_user"))
 @_admin_required
 async def cmd_add_user(message: Message) -> None:
-    """Handle /add_user &lt;id&gt; — add a user by ID to the allowed list."""
+    """Handle /add_user &lt;id|@username&gt; — allow a user to query the bot."""
     user = message.from_user
     if user is None:
         return
@@ -52,17 +133,21 @@ async def cmd_add_user(message: Message) -> None:
 
     if len(parts) < 2:
         await message.answer(
-            "❌ <b>Usage:</b> <code>/add_user &lt;telegram_id&gt;</code>\n\n"
-            "Example: <code>/add_user 123456789</code>"
+            "❌ <b>Usage:</b> <code>/add_user &lt;telegram_id|@username&gt;</code>\n\n"
+            "Examples: <code>/add_user 123456789</code>, "
+            "<code>/add_user @nickname</code>"
         )
         return
 
-    try:
-        target_id = int(parts[1].strip())
-    except ValueError:
+    target_id, error = await _resolve_target(parts[1])
+    if target_id is None:
         await message.answer(
-            "❌ <b>Invalid ID.</b> Please provide a valid numeric Telegram ID.\n\n"
-            "Example: <code>/add_user 123456789</code>"
+            error
+            or (
+                "❌ <b>Invalid ID.</b> Please provide a numeric Telegram ID "
+                "or an @username.\n\n"
+                "Example: <code>/add_user 123456789</code>"
+            )
         )
         return
 
@@ -70,12 +155,24 @@ async def cmd_add_user(message: Message) -> None:
         await message.answer("⚠️ <b>Admins already have access.</b> No need to add them manually.")
         return
 
+    profile = await _fetch_profile(target_id)
     async with user_service() as service:
-        await service.add_allowed_user(telegram_id=target_id, added_by=user.id)
+        await service.add_allowed_user(
+            telegram_id=target_id, added_by=user.id, **profile
+        )
+        allowed = await service.get_allowed_user(target_id)
 
+    label = (
+        _name_html(
+            allowed["first_name"], allowed["last_name"], allowed["username"], "unknown"
+        )
+        if allowed
+        else "unknown"
+    )
     await message.answer(
         f"✅ <b>User added to allowed list.</b>\n\n"
         f"👤 <b>ID:</b> <code>{target_id}</code>\n"
+        f"🏷 <b>Nickname:</b> {label}\n"
         f"📊 <b>Daily limit:</b> {config.daily_limit} questions"
     )
 
@@ -83,33 +180,41 @@ async def cmd_add_user(message: Message) -> None:
 @router.message(Command("remove_user"))
 @_admin_required
 async def cmd_remove_user(message: Message) -> None:
-    """Handle /remove_user &lt;id&gt; — remove a user from the allowed list."""
+    """Handle /remove_user &lt;id|@username&gt; — revoke a user's access."""
     text = message.text or ""
     parts = text.split(maxsplit=1)
 
     if len(parts) < 2:
         await message.answer(
-            "❌ <b>Usage:</b> <code>/remove_user &lt;telegram_id&gt;</code>\n\n"
+            "❌ <b>Usage:</b> <code>/remove_user &lt;telegram_id|@username&gt;</code>\n\n"
             "Example: <code>/remove_user 123456789</code>"
         )
         return
 
-    try:
-        target_id = int(parts[1].strip())
-    except ValueError:
+    target_id, error = await _resolve_target(parts[1])
+    if target_id is None:
         await message.answer(
-            "❌ <b>Invalid ID.</b> Please provide a valid numeric Telegram ID.\n\n"
-            "Example: <code>/remove_user 123456789</code>"
+            error
+            or (
+                "❌ <b>Invalid ID.</b> Please provide a numeric Telegram ID "
+                "or an @username.\n\n"
+                "Example: <code>/remove_user 123456789</code>"
+            )
         )
         return
 
     async with user_service() as service:
+        allowed = await service.get_allowed_user(target_id)
         removed = await service.remove_allowed_user(target_id)
 
     if removed:
+        first_name = allowed["first_name"] if allowed else None
+        last_name = allowed["last_name"] if allowed else None
+        username = allowed["username"] if allowed else None
         await message.answer(
             f"✅ <b>User removed from allowed list.</b>\n\n"
-            f"👤 <b>ID:</b> <code>{target_id}</code>"
+            f"👤 <b>ID:</b> <code>{target_id}</code>\n"
+            f"🏷 <b>Nickname:</b> {_name_html(first_name, last_name, username)}"
         )
     else:
         await message.answer(
@@ -137,7 +242,7 @@ async def cmd_list_users(message: Message) -> None:
     if not allowed_users:
         await message.answer(
             "📭 <b>Allowed users list is empty.</b>\n\n"
-            "Use <code>/add_user &lt;id&gt;</code> to add users."
+            "Use <code>/add_user &lt;id|@username&gt;</code> to add users."
         )
         return
 
@@ -145,6 +250,22 @@ async def cmd_list_users(message: Message) -> None:
     total_pages = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
     page = min(page, total_pages - 1)
     subset = allowed_users[page * USERS_PER_PAGE : (page + 1) * USERS_PER_PAGE]
+
+    # Entries added before profile caching only have an ID. Refresh those
+    # lazily; getChat works for every user the bot has already seen.
+    missing_profiles = [
+        au for au in subset if not au["username"] and not au["first_name"]
+    ]
+    if missing_profiles:
+        async with user_service() as service:
+            for au in missing_profiles:
+                profile = await _fetch_profile(au["telegram_id"])
+                if not profile:
+                    continue
+                await service.update_allowed_user_profile(
+                    au["telegram_id"], **profile
+                )
+                au.update(profile)
 
     lines = [
         (
@@ -154,16 +275,13 @@ async def cmd_list_users(message: Message) -> None:
     ]
     start_num = page * USERS_PER_PAGE
     for i, au in enumerate(subset, start_num + 1):
-        name_parts = []
-        if au["first_name"]:
-            name_parts.append(html.escape(au["first_name"]))
-        if au["username"]:
-            name_parts.append(f"@{html.escape(au['username'])}")
-        name_str = f" ({' '.join(name_parts)})" if name_parts else ""
+        name_str = _name_html(
+            au["first_name"], au["last_name"], au["username"], "unknown"
+        )
 
         added_at_str = au["added_at"].strftime("%Y-%m-%d %H:%M") if au["added_at"] else "?"
         lines.append(
-            f"{i}. <code>{au['telegram_id']}</code>{name_str}\n"
+            f"{i}. <code>{au['telegram_id']}</code> — {name_str}\n"
             f"   🕐 Added: {added_at_str}"
         )
 
@@ -221,6 +339,51 @@ async def cmd_admin_stats(message: Message) -> None:
     lines.append(f"\n👥 <b>Total active users:</b> {len(sorted_users)}")
     lines.append(f"📝 <b>Total queries:</b> {sum(us['total'] for us in sorted_users)}")
 
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("mcp"))
+@_admin_required
+async def cmd_mcp(message: Message) -> None:
+    """Handle /mcp — show configured MCP servers, their status and tools."""
+    if not config.enable_mcp:
+        await message.answer(
+            "ℹ️ <b>MCP is disabled.</b>\n\n"
+            "Set <code>MCP_ENABLED=true</code> in <code>.env</code>."
+        )
+        return
+    if not config.mcp_servers:
+        await message.answer(
+            "ℹ️ <b>No MCP servers configured.</b>\n\n"
+            "Point <code>MCP_CONFIG_FILE</code> at a <code>.mcp.json</code> "
+            "file (or put the JSON into <code>MCP_SERVERS</code>) and restart "
+            "the bot."
+        )
+        return
+
+    report = await mcp_manager.status()
+    lines = ["🧠 <b>MCP servers</b>", ""]
+    for entry in report:
+        icon = "🟢" if entry["running"] else "🔴"
+        tools = entry["tools"]
+        lines.append(
+            f"{icon} <b>{html.escape(entry['name'])}</b> — "
+            f"{len(tools)} tool(s)"
+        )
+        if entry["error"]:
+            lines.append(
+                f"   ⚠️ <i>{html.escape(entry['error'][:300])}</i>"
+            )
+        for name in tools[:15]:
+            lines.append(f"   • <code>{html.escape(str(name))}</code>")
+        if len(tools) > 15:
+            lines.append(f"   … +{len(tools) - 15} more")
+    lines.append("")
+    lines.append(f"🔐 Admin-only: <b>{'yes' if config.mcp_admin_only else 'no'}</b>")
+    if config.mcp_config_file:
+        lines.append(
+            f"📄 Config: <code>{html.escape(config.mcp_config_file)}</code>"
+        )
     await message.answer("\n".join(lines))
 
 

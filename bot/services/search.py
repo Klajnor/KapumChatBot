@@ -205,7 +205,9 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
 
 async def search_web(query: str, max_results: int | None = None) -> list[SearchResult]:
     """Run one web search; returns [] on any failure (never raises)."""
-    query = (query or "").strip()
+    # The query comes from the model's tool call: cap it so a degenerate
+    # answer cannot turn into an oversized request URL.
+    query = (query or "").strip()[:512]
     if not query:
         return []
     limit = max_results if isinstance(max_results, int) else config.search_max_results

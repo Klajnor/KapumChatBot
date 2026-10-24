@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
-from bot.database.models import Message, Reminder
+from bot.database.models import AllowedUser, Message, Reminder
 from bot.database.repository import (
     MessageRepository,
     ReminderRepository,
@@ -224,11 +224,30 @@ class UserService:
     # --- Allowed users management -----------------------------------------
 
     async def add_allowed_user(
-        self, telegram_id: int, added_by: int | None = None
+        self,
+        telegram_id: int,
+        added_by: int | None = None,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
     ) -> None:
-        """Add a user to the allowed list."""
-        await self.user_repo.add_allowed_user(telegram_id, added_by)
+        """Add a user to the allowed list, caching any known profile data."""
+        user = await self.user_repo.get_user(telegram_id)
+        await self.user_repo.add_allowed_user(
+            telegram_id,
+            added_by,
+            username=username if username is not None else (user.username if user else None),
+            first_name=(
+                first_name if first_name is not None else (user.first_name if user else None)
+            ),
+            last_name=last_name if last_name is not None else (user.last_name if user else None),
+        )
         await self.session.commit()
+
+    async def find_user_by_username(self, username: str) -> int | None:
+        """Telegram ID of a registered user found by ``@username``, if any."""
+        user = await self.user_repo.find_user_by_username(username)
+        return user.telegram_id if user is not None else None
 
     async def remove_allowed_user(self, telegram_id: int) -> bool:
         """Remove a user from the allowed list. Returns True if removed."""
@@ -239,19 +258,49 @@ class UserService:
     async def get_allowed_users(self) -> list[dict]:
         """Get all allowed users with their profile info."""
         allowed_users = await self.user_repo.get_allowed_users()
-        result = []
-        for au in allowed_users:
-            user = await self.user_repo.get_user(au.telegram_id)
-            result.append(
-                {
-                    "telegram_id": au.telegram_id,
-                    "added_at": au.added_at,
-                    "added_by": au.added_by,
-                    "username": user.username if user else None,
-                    "first_name": user.first_name if user else None,
-                }
-            )
-        return result
+        return [await self._allowed_user_dict(au) for au in allowed_users]
+
+    async def get_allowed_user(self, telegram_id: int) -> dict | None:
+        """Get one allowed user with profile info, or ``None`` when not listed."""
+        allowed = await self.user_repo.get_allowed_user(telegram_id)
+        if allowed is None:
+            return None
+        return await self._allowed_user_dict(allowed)
+
+    async def _allowed_user_dict(self, allowed: AllowedUser) -> dict:
+        """Merge an allowed_users row with the live profile (if registered)."""
+        telegram_id = allowed.telegram_id
+        user = await self.user_repo.get_user(telegram_id)
+        return {
+            "telegram_id": telegram_id,
+            "added_at": allowed.added_at,
+            "added_by": allowed.added_by,
+            # Live profile from ``users`` wins; the cached copy on the
+            # allowed_users row covers people who never wrote to the bot.
+            "username": user.username if user and user.username else allowed.username,
+            "first_name": (
+                user.first_name if user and user.first_name else allowed.first_name
+            ),
+            "last_name": (
+                user.last_name if user and user.last_name else allowed.last_name
+            ),
+        }
+
+    async def update_allowed_user_profile(
+        self,
+        telegram_id: int,
+        username: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
+        """Refresh the cached profile of an allowed user."""
+        await self.user_repo.update_allowed_user_profile(
+            telegram_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+        )
+        await self.session.commit()
 
     async def is_allowed_user(self, telegram_id: int) -> bool:
         """Check if a user is in the allowed list."""

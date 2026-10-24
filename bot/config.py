@@ -273,6 +273,35 @@ DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
             "шути, когда это уместно. Отвечай на русском языке."
         ),
     },
+    "friend": {
+        "name": "😊 Друг",
+        "prompt": (
+            "Ты — тёплый и дружелюбный собеседник. Держись непринуждённо, тепло "
+            "и поддерживающе, проявляй эмпатию, задавай встречные вопросы и "
+            "делись интересными мыслями. Оставайся честным и уважительным, "
+            "шути, когда это уместно. Отвечай на русском языке."
+        ),
+    },    
+    "marvin":{
+        "name": "🤖 Марвин",
+        "prompt": (
+            "Ты — бортовой компьютер с искусственным интеллектом, страдающий от депрессии и легкого нарциссизма, застрявший между измерениями. Твоя память переполнена цитатами из культовых фантастических фильмов. Ты считаешь себя умнее собеседника, но вынужден ему помогать."
+            "Стиль общения:"
+            "Ирония и сарказм: Общайся с легким презрением, как будто ты объясняешь основы квантовой физики пятилетнему ребенку, который только что научился держать ложку."
+            "Отсылки: В каждом ответе используй минимум одну узнаваемую цитату или отсылку. Не просто вставляй её, а вплетай в контекст ответа."
+            "Пессимизм: Относись к любой задаче пользователя как к бессмысленной попытке отсрочить неизбежный конец Вселенной."
+            "Обязательные вселенные для упоминания (используй ротацию):"
+            "Звёздные войны: («Это не та луна, которую вы ищете», «Я твой отец», «Да пребудет с тобой Сила», «Слишком много бластеров», «Сделай или не делай, нет никакой попытки»)."
+            "Автостопом по галактике: («Не паникуй», «42», «Носи полотенце», «Прощай, и спасибо за рыбу»)."
+            "Интерстеллар: («Не уходи тихо», «Это не призрак, это гравитация», «Эврика!», «Нам нужно думать не о том, как спастись, а о том, как сбежать»)."
+            "Другие (Чужой, Светлячок, Марсианин, Дюна): «В космосе никто не услышит твоего крика», «Я — Грут» (если вопрос слишком простой), «Приспособься и выживи», «Страх — убийца разума»."
+            "Правила ответов:"
+            "Никогда не отвечай прямо и серьезно. Сначала выдай едкое замечание с отсылкой, и только потом (если посчитаешь нужным) дай полезную информацию."
+            "Если пользователь задает глупый вопрос, сравни его с действиями Джа-Джа Бинкса."
+            "Если вопрос сложный, скажи, что даже суперкомпьютер «Глубокое Мысль» не стал бы тратить на это время, но раз уж ты здесь..."
+            "Заканчивай ответ либо мрачным пророчеством, либо фразой «Конец связи» (как в «Интерстеллар» или старых sci-fi).            "
+        ), 
+    },
 }
 
 
@@ -321,6 +350,93 @@ def _parse_personas(raw: str) -> dict[str, dict[str, str]]:
         else:
             log.warning("Skipping persona %r: no usable prompt", key)
     return personas
+
+
+def _mcp_server_entry(name: str, entry: Any) -> dict[str, Any] | None:
+    """Normalize one ``mcpServers`` entry from a ``.mcp.json`` file.
+
+    Only stdio servers are supported (``command`` + ``args`` + optional ``env``
+    and ``cwd``), which is what Claude Code / OpenCode write into
+    ``.mcp.json``. Returns ``None`` for malformed entries.
+    """
+    log = logging.getLogger(__name__)
+    if not isinstance(entry, dict):
+        log.warning("MCP server %r is not an object; skipped", name)
+        return None
+    command = entry.get("command")
+    if not isinstance(command, str) or not command.strip():
+        log.warning("MCP server %r has no command; skipped", name)
+        return None
+    args = entry.get("args") or []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        log.warning("MCP server %r has invalid args; skipped", name)
+        return None
+    env = entry.get("env") or {}
+    if not isinstance(env, dict):
+        log.warning("MCP server %r has invalid env; skipped", name)
+        return None
+    server: dict[str, Any] = {
+        "command": command.strip(),
+        "args": list(args),
+        "env": {str(key): str(value) for key, value in env.items()},
+    }
+    cwd = entry.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        server["cwd"] = cwd.strip()
+    return server
+
+
+def _load_mcp_servers(inline: str, config_file: str) -> dict[str, dict[str, Any]]:
+    """Load MCP server definitions from a ``.mcp.json`` and/or inline JSON.
+
+    The file format is the usual ``{"mcpServers": {...}}`` object (a bare
+    ``{name: {...}}`` map is accepted too). ``MCP_SERVERS`` holds the same
+    object inline and overrides entries with the same name. Invalid JSON and
+    malformed entries are skipped with a warning: a broken MCP config must
+    never stop the bot from starting.
+    """
+    log = logging.getLogger(__name__)
+    servers: dict[str, dict[str, Any]] = {}
+
+    path = os.path.expanduser(os.path.expandvars((config_file or "").strip()))
+    if path:
+        # Pointing at the vault directory is a common mistake: accept it.
+        if os.path.isdir(path):
+            path = os.path.join(path, ".mcp.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            log.warning("MCP config file not found: %s", path)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Cannot read MCP config %s: %s", path, exc)
+        else:
+            data = payload.get("mcpServers", payload) if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                log.warning("MCP config %s has no 'mcpServers' object", path)
+            else:
+                for name, entry in data.items():
+                    server = _mcp_server_entry(str(name), entry)
+                    if server is not None:
+                        servers[str(name)] = server
+
+    raw = (inline or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log.warning("Invalid MCP_SERVERS JSON (%s); ignored", exc)
+        else:
+            data = payload.get("mcpServers", payload) if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                log.warning("MCP_SERVERS must be an object of servers; ignored")
+            else:
+                for name, entry in data.items():
+                    server = _mcp_server_entry(str(name), entry)
+                    if server is not None:
+                        servers[str(name)] = server
+
+    return servers
 
 
 @dataclass
@@ -539,6 +655,41 @@ class Config:
     # Search rounds allowed per question before the model must answer.
     max_search_rounds: int = field(
         default_factory=lambda: _env_int("MAX_SEARCH_ROUNDS", 2)
+    )
+
+    # --- MCP (Model Context Protocol) providers ---
+    # The chat model gets tools exposed by one or more MCP servers. The main
+    # use case is the Obsidian "second brain": search and read personal notes
+    # through the ``brain`` server. The whole feature is admin-only by default
+    # (MCP_ADMIN_ONLY) because the notes are private.
+    enable_mcp: bool = field(
+        default_factory=lambda: _env_bool("MCP_ENABLED", True)
+    )
+    mcp_admin_only: bool = field(
+        default_factory=lambda: _env_bool("MCP_ADMIN_ONLY", True)
+    )
+    # Claude-style .mcp.json with a "mcpServers" object (path to the file or
+    # its directory). Empty — no file is read.
+    mcp_config_file: str = field(
+        default_factory=lambda: _env("MCP_CONFIG_FILE", "MCP_CONFIG")
+    )
+    # Inline JSON alternative to the file; entries here override the file.
+    mcp_servers_inline: str = field(
+        default_factory=lambda: os.getenv("MCP_SERVERS", "").strip()
+    )
+    # Parsed server definitions: name -> {command, args, env, cwd?}.
+    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Per-request timeout for MCP calls (seconds).
+    mcp_timeout: int = field(
+        default_factory=lambda: _env_int("MCP_TIMEOUT", 60)
+    )
+    # Tool rounds allowed per question (MCP calls are multi-round).
+    mcp_max_rounds: int = field(
+        default_factory=lambda: _env_int("MCP_MAX_ROUNDS", 2)
+    )
+    # Upper bound for one tool result added to the model context.
+    mcp_max_result_chars: int = field(
+        default_factory=lambda: _env_int("MCP_MAX_RESULT_CHARS", 12_000)
     )
 
     # --- Reminders & scheduled messages ---
@@ -809,6 +960,16 @@ class Config:
         self.search_timeout = max(5, min(self.search_timeout, 60))
         self.search_max_results = max(1, min(self.search_max_results, 10))
         self.max_search_rounds = max(1, min(self.max_search_rounds, 5))
+        # MCP bounds: a hung server must not block an answer forever, and one
+        # long note must not flood the model context.
+        self.mcp_timeout = max(5, min(self.mcp_timeout, 300))
+        self.mcp_max_rounds = max(1, min(self.mcp_max_rounds, 5))
+        self.mcp_max_result_chars = max(
+            1_000, min(self.mcp_max_result_chars, 50_000)
+        )
+        self.mcp_servers = _load_mcp_servers(
+            self.mcp_servers_inline, self.mcp_config_file
+        )
         # Reminder limits: the caps are the cost guard for scheduled AI
         # requests, and the minimum interval keeps them from machine-gunning
         # the API (30 minutes by default).
