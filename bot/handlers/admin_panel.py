@@ -567,14 +567,18 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
     state = "on" if config.enable_digest else "off (ENABLE_DIGEST=false)"
     lines = [
         "📰 <b>Channel digest</b>",
-        f"Daily at <b>{html.escape(config.digest_time)}</b> "
-        f"({html.escape(config.reminder_timezone or 'UTC')}) — {state}",
+        (
+            f"Daily at <b>{html.escape(config.digest_time)}</b> "
+            f"({html.escape(config.reminder_timezone or 'UTC')}) — {state}"
+        ),
         f"🤖 Model: <code>{html.escape(model['name'])}</code>",
         f"📝 Prompt{' (custom)' if custom else ' (default)'}:\n<blockquote>{preview}</blockquote>",
         f"📡 Channels: <b>{len(channels)}</b>",
-        "<i>The bot must be an admin of the channel to read posts and publish "
-        f"the summary. Under {config.digest_min_messages} messages up to "
-        f"{config.digest_context_messages} earlier ones are added as context.</i>",
+        (
+            "<i>The bot must be an admin of the channel to read posts and publish "
+            f"the summary. Under {config.digest_min_messages} messages up to "
+            f"{config.digest_context_messages} earlier ones are added as context.</i>"
+        ),
     ]
     if notice:
         lines.append(f"\n{notice}")

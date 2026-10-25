@@ -19,7 +19,6 @@ from bot.handlers import (
     admin_panel,
     chat,
     clear,
-    digest as digest_handler,
     export,
     guest,
     help,
@@ -29,6 +28,9 @@ from bot.handlers import (
     reminders,
     start,
     stats,
+)
+from bot.handlers import (
+    digest as digest_handler,
 )
 from bot.handlers.chat import _album_cleanup
 from bot.services import telegraph

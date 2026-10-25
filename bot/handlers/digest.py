@@ -39,7 +39,7 @@ async def _record(message: Message, *, edited: bool = False) -> None:
             message.edit_date if edited and message.edit_date else message.date,
             edited=edited,
         )
-    except Exception:  # noqa: BLE001 - observing must never break the bot
+    except Exception:
         logger.exception("Could not store a message for the digest")
 
 

@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 
 from aiogram.exceptions import TelegramAPIError
 
-from bot.bot import bot
 from bot.config import config
 from bot.database.repository import DigestRepository
 from bot.database.session import async_session_factory
@@ -252,7 +251,7 @@ async def _digest_channel(
             report.error = "could not post the summary"
     except TelegramAPIError as exc:
         report.error = f"could not post: {exc}"
-    except Exception as exc:  # noqa: BLE001 - one channel must not stop the others
+    except Exception as exc:
         logger.exception("Digest delivery to %s failed", chat_id)
         report.error = f"could not post: {exc}"
 
@@ -328,7 +327,7 @@ async def run_digest(notify: int | None = None) -> DigestResult:
         for chat_id, title in await list_channels():
             try:
                 report = await _digest_channel(chat_id, title, until, model, prompt)
-            except Exception as exc:  # noqa: BLE001 - keep going with the other channels
+            except Exception as exc:
                 logger.exception("Digest for channel %s failed", chat_id)
                 report = ChannelReport(chat_id=chat_id, title=title, error=str(exc)[:200])
             result.reports.append(report)
