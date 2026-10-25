@@ -553,8 +553,17 @@ async def on_admin_input(message: Message) -> None:
 
 # --- Channel digest ----------------------------------------------------------------
 
-MAX_PROMPT_CHARS = 3000
+# Both screens show the whole prompt; with the other lines they must fit one
+# Telegram message (4096 characters, HTML escaping included).
+MAX_PROMPT_CHARS = 2000
+_SHOWN_PROMPT_CHARS = 2400  # only older, longer saved prompts get clipped
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
+
+
+def _clip_prompt(prompt: str) -> str:
+    if len(prompt) <= _SHOWN_PROMPT_CHARS:
+        return prompt
+    return prompt[:_SHOWN_PROMPT_CHARS] + "…"
 
 
 async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
@@ -563,7 +572,7 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
     model = config.resolve_model(model_id)
     prompt = await digest.get_prompt()
     custom = prompt != digest.DEFAULT_DIGEST_PROMPT
-    preview = html.escape(prompt if len(prompt) <= 400 else prompt[:400] + "…")
+    preview = html.escape(_clip_prompt(prompt))
     state = "on" if config.enable_digest else "off (ENABLE_DIGEST=false)"
     lines = [
         "📰 <b>Channel digest</b>",
@@ -668,7 +677,7 @@ async def _digest_action(
         await _show(
             callback,
             "✏️ <b>Digest prompt</b>\n\nCurrent:\n"
-            f"<blockquote>{html.escape((await digest.get_prompt())[:1500])}</blockquote>\n"
+            f"<blockquote>{html.escape(_clip_prompt(await digest.get_prompt()))}</blockquote>\n"
             f"Send the new system prompt (up to {MAX_PROMPT_CHARS} characters).",
             _digest_cancel(),
         )
