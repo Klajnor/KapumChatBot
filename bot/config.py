@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,32 +50,40 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y", "да"}
 
 
-# Default catalog for the /models menu. Override it in .env without touching
-# the code (see AI_MODELS below).
+# Number of selectable model slots (MODEL_1_* ... MODEL_6_*) in .env.
+MODEL_SLOTS = 6
+
+# Built-in catalog used only when .env defines no MODEL_<n>_* set at all. The
+# internal id equals the provider's model id; the provider URL is AI_BASE_URL.
 DEFAULT_AI_MODELS: list[dict[str, Any]] = [
-    {"id": "qwen3.8-max", "name": "Qwen 3.8 Max", "vision": True},
-    {"id": "qwen3.8-flash", "name": "Qwen 3.8 Flash", "vision": True},
-    {"id": "qwen3.8-omni-flash", "name": "Qwen 3.8 Omni Flash", "vision": True},
-    {"id": "qwen3.5-ocr", "name": "Qwen 3.5 OCR", "vision": True},
-    {"id": "deepseek-v4-pro-0813", "name": "DeepSeek V4 Pro", "vision": False},
-    {"id": "deepseek-v4.1-flash-1017", "name": "DeepSeek V4.1 Flash", "vision": True},
+    {"id": "qwen3.8-max", "name": "Qwen 3.8 Max", "model": "qwen3.8-max", "vision": True},
+    {"id": "qwen3.8-flash", "name": "Qwen 3.8 Flash", "model": "qwen3.8-flash", "vision": True},
 ]
 
-# Emergency models used only when the whole AI_MODELS list failed (no answer,
-# quota exhausted, provider error). They are never shown by /models and cannot
-# be selected by users — the fallback chain is purely automatic. Same format as
-# DEFAULT_AI_MODELS, and AI_FALLBACK_MODELS overrides this list.
-#
-# Picked for speed, stability and generous rate limits: flash-tier models
-# answer fastest and have the highest request/token quotas in the plan.
-DEFAULT_AI_FALLBACK_MODELS: list[dict[str, Any]] = [
-    {"id": "qwen3.6-flash", "name": "Qwen 3.6 Flash", "vision": True},
-    {"id": "qwen3.7-plus", "name": "Qwen 3.7 Plus", "vision": True},
-    {"id": "deepseek-v4-flash-0731", "name": "DeepSeek V4 Flash", "vision": False},
-]
+_TRUE_FLAGS = {"1", "true", "yes", "on", "y", "vision", "да"}
 
-_VISION_FLAGS = {"vision", "image", "multimodal", "yes", "true", "1"}
-_NO_VISION_FLAGS = {"novision", "no-vision", "text", "no", "false", "0"}
+
+def _model_set(prefix: str, *, default_vision: bool = False) -> dict[str, Any] | None:
+    """Read one model set (``<prefix>NAME/ID/URL/MODEL/VISION/API_KEY``).
+
+    Returns ``None`` when the set is not filled in (no internal id or no
+    provider model id). An empty URL / API key means "use AI_BASE_URL /
+    AI_API_KEY", which is resolved by the caller.
+    """
+    internal_id = os.getenv(f"{prefix}ID", "").strip()
+    provider_model = os.getenv(f"{prefix}MODEL", "").strip()
+    if not internal_id or not provider_model:
+        return None
+    vision_raw = os.getenv(f"{prefix}VISION", "").strip().lower()
+    return {
+        "id": internal_id,
+        "name": os.getenv(f"{prefix}NAME", "").strip() or internal_id,
+        "base_url": os.getenv(f"{prefix}URL", "").strip().rstrip("/"),
+        "model": provider_model,
+        "vision": vision_raw in _TRUE_FLAGS if vision_raw else default_vision,
+        "api_key": os.getenv(f"{prefix}API_KEY", "").strip(),
+    }
+
 
 # Notice shown while a slow AI request is still running (see PROGRESS_TEXT).
 # Placeholders: {spinner} — animated frame, {seconds} — elapsed whole seconds.
@@ -138,40 +145,6 @@ FORMULA_STYLE_HINT = (
     "LaTeX inside; put plain text or Unicode formulas in table cells. Keep code "
     "inside code fences."
 )
-
-
-def _parse_models(raw: str) -> list[dict[str, Any]]:
-    """Parse the ``AI_MODELS`` environment value into a model catalog.
-
-    Entries are separated by commas and/or newlines and have the form::
-
-        model-id
-        model-id:Display Name
-        model-id:Display Name:vision      # image-capable
-        model-id:Display Name:novision    # text-only
-
-    Without the third field, vision support is detected automatically from the
-    model id (Qwen-VL / Omni / OCR and the Qwen3.5+ families).
-    """
-    models: list[dict[str, Any]] = []
-    for entry in re.split(r"[\n,]+", raw or ""):
-        entry = entry.strip()
-        if not entry or entry.startswith("#"):
-            continue
-        parts = [part.strip() for part in entry.split(":")]
-        model_id = parts[0]
-        if not model_id:
-            continue
-        name = parts[1] if len(parts) > 1 and parts[1] else model_id
-        vision: bool | None = None
-        if len(parts) > 2 and parts[2]:
-            flag = parts[2].lower()
-            if flag in _VISION_FLAGS:
-                vision = True
-            elif flag in _NO_VISION_FLAGS:
-                vision = False
-        models.append({"id": model_id, "name": name, "vision": vision})
-    return models
 
 
 # The canonical default system prompt (Russian, with an explicit instruction
@@ -541,11 +514,13 @@ class Config:
             default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         )
     )
-    # Model catalog for the /models menu, parsed from AI_MODELS (see .env).
-    # Falls back to DEFAULT_AI_MODELS when the variable is absent or empty.
+    # Model catalog for the /models menu, built from the MODEL_1_* ... MODEL_6_*
+    # sets in .env. Falls back to DEFAULT_AI_MODELS when no set is filled in.
+    # Every entry: id (internal), name, base_url, model (provider id), vision,
+    # api_key.
     ai_models: list[dict[str, Any]] = field(default_factory=list)
-    # Emergency models tried after every AI_MODELS entry failed. Parsed from
-    # AI_FALLBACK_MODELS; never offered to users (see DEFAULT_AI_FALLBACK_MODELS).
+    # The FALLBACK_MODEL_* set (zero or one entry): tried only after the
+    # requested model and every model after it failed. Never shown to users.
     ai_fallback_models: list[dict[str, Any]] = field(default_factory=list)
 
     # --- Database ---
@@ -559,7 +534,7 @@ class Config:
 
     # --- Defaults ---
     default_model: str = field(
-        default_factory=lambda: os.getenv("DEFAULT_MODEL", "qwen3.8-flash").strip()
+        default_factory=lambda: os.getenv("DEFAULT_MODEL", "").strip()
     )
     default_system_prompt: str = field(
         default_factory=lambda: os.getenv(
@@ -1114,9 +1089,28 @@ class Config:
         # worker thread instead of failing gracefully.
         self.export_max_messages = max(10, min(self.export_max_messages, 5000))
 
-        self.ai_models = _parse_models(os.getenv("AI_MODELS", "")) or [
-            dict(model) for model in DEFAULT_AI_MODELS
+        self.ai_models = [
+            spec
+            for slot in range(1, MODEL_SLOTS + 1)
+            if (spec := _model_set(f"MODEL_{slot}_", default_vision=False))
         ]
+        # Duplicate internal ids would make the user's choice ambiguous.
+        seen_ids: set[str] = set()
+        self.ai_models = [
+            spec
+            for spec in self.ai_models
+            if not (spec["id"] in seen_ids or seen_ids.add(spec["id"]))
+        ]
+        if not self.ai_models:
+            self.ai_models = [dict(model) for model in DEFAULT_AI_MODELS]
+        fallback = _model_set("FALLBACK_MODEL_")
+        self.ai_fallback_models = [fallback] if fallback else []
+        # Empty URL / key in a set -> the global provider settings.
+        for spec in (*self.ai_models, *self.ai_fallback_models):
+            spec["base_url"] = spec.get("base_url") or self.ai_base_url.rstrip("/")
+            spec["api_key"] = spec.get("api_key") or self.ai_api_key
+        if not self.default_model:
+            self.default_model = self.ai_models[0]["id"]
 
         self.personas = _parse_personas(os.getenv("PERSONAS", ""))
 
@@ -1129,9 +1123,20 @@ class Config:
             and self.default_system_prompt != DEFAULT_SYSTEM_PROMPT_TEXT
         ):
             assistant["prompt"] = self.default_system_prompt
-        self.ai_fallback_models = _parse_models(
-            os.getenv("AI_FALLBACK_MODELS", "")
-        ) or [dict(model) for model in DEFAULT_AI_FALLBACK_MODELS]
+
+    def resolve_model(self, model_id: str | None) -> dict[str, Any]:
+        """The settings set for a user's internal model id.
+
+        An id without a set (stale choice from the database, removed slot,
+        empty value) resolves to the default model's set.
+        """
+        for spec in (*self.ai_models, *self.ai_fallback_models):
+            if spec["id"] == model_id:
+                return spec
+        for spec in self.ai_models:
+            if spec["id"] == self.default_model:
+                return spec
+        return self.ai_models[0]
 
     def is_owner(self, telegram_id: int) -> bool:
         """True for IDs from ``ADMIN_IDS``: they can never be demoted or blocked."""

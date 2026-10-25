@@ -438,11 +438,11 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             with_usage = format_timing(
-                2.0, model="qwen3.8-flash",
+                2.0, model="unlisted-model",
                 tokens=165, input_tokens=120, output_tokens=45,
             )
             without_usage = format_timing(1.5, model="qwen-image-3.0-pro")
-        self.assertEqual(with_usage, "⏱️ 2.0 s · qwen3.8-flash · ↑120 ↓45 tok")
+        self.assertEqual(with_usage, "⏱️ 2.0 s · unlisted-model · ↑120 ↓45 tok")
         # Image generation reports no usage: the plain format is kept.
         self.assertEqual(without_usage, "⏱️ 1.5 s · qwen-image-3.0-pro")
 
@@ -557,19 +557,50 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
 # --- Automatic model fallback -------------------------------------------
 
-    def test_fallback_models_are_parsed_and_separate_from_catalog(self):
-        with patch.dict(
-            os.environ,
-            {
-                "AI_FALLBACK_MODELS": "fast-a:Fast A:vision,fast-b:Fast B:novision",
-                "AI_MODELS": "main-a:Main A:vision",
-            },
-        ):
+    def test_model_sets_are_read_from_env(self):
+        env = {
+            f"{prefix}{field}": ""
+            for prefix in [f"MODEL_{n}_" for n in range(1, 7)] + ["FALLBACK_MODEL_"]
+            for field in ("NAME", "ID", "URL", "MODEL", "VISION", "API_KEY")
+        }
+        env |= {
+            "AI_BASE_URL": "https://main.example/v1",
+            "AI_API_KEY": "main-key",
+            "MODEL_1_NAME": "Main A",
+            "MODEL_1_ID": "main-a",
+            "MODEL_1_URL": "https://other.example/v1/",
+            "MODEL_1_MODEL": "provider-a",
+            "MODEL_1_VISION": "true",
+            "MODEL_1_API_KEY": "other-key",
+            "MODEL_2_ID": "main-b",
+            "MODEL_2_MODEL": "provider-b",
+            "MODEL_3_ID": "",
+            "MODEL_3_MODEL": "ignored",
+            "FALLBACK_MODEL_NAME": "Rescue",
+            "FALLBACK_MODEL_ID": "rescue",
+            "FALLBACK_MODEL_MODEL": "provider-rescue",
+            "FALLBACK_MODEL_VISION": "false",
+            "DEFAULT_MODEL": "main-b",
+        }
+        with patch.dict(os.environ, env):
             settings = Config()
-        self.assertEqual([m["id"] for m in settings.ai_fallback_models], ["fast-a", "fast-b"])
-        self.assertTrue(settings.ai_fallback_models[0]["vision"])
-        self.assertFalse(settings.ai_fallback_models[1]["vision"])
-        self.assertEqual([m["id"] for m in settings.ai_models], ["main-a"])
+        self.assertEqual([m["id"] for m in settings.ai_models], ["main-a", "main-b"])
+        first, second = settings.ai_models
+        self.assertEqual(first["base_url"], "https://other.example/v1")
+        self.assertEqual(first["api_key"], "other-key")
+        self.assertEqual(first["model"], "provider-a")
+        self.assertTrue(first["vision"])
+        # Empty URL / key / name inherit the global settings.
+        self.assertEqual(second["base_url"], "https://main.example/v1")
+        self.assertEqual(second["api_key"], "main-key")
+        self.assertEqual(second["name"], "main-b")
+        self.assertFalse(second["vision"])
+        self.assertEqual([m["id"] for m in settings.ai_fallback_models], ["rescue"])
+        self.assertFalse(settings.ai_fallback_models[0]["vision"])
+        # Unknown id (e.g. a stale database value) -> the default model's set.
+        self.assertEqual(settings.resolve_model("gone")["id"], "main-b")
+        self.assertEqual(settings.resolve_model("main-a")["id"], "main-a")
+        self.assertEqual(settings.resolve_model("rescue")["id"], "rescue")
 
     async def test_fallback_chain_walks_catalog_then_emergency_models(self):
         client = AIClient(api_key="test-key")
@@ -588,8 +619,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(client.model_chain("m2"), ["m2", "m3", "f1", "f2"])
             self.assertEqual(client.model_chain("m3"), ["m3", "f1", "f2"])
-            # Unknown primary -> the whole catalog, then fallbacks.
-            self.assertEqual(client.model_chain("x"), ["x", "m1", "m2", "m3", "f1", "f2"])
+            # Unknown primary -> the default model, then what follows it.
+            with patch.object(config, "default_model", "m2"):
+                self.assertEqual(client.model_chain("x"), ["m2", "m3", "f1", "f2"])
             # Vision requests skip text-only models.
             self.assertEqual(
                 client.model_chain("m2", require_vision=True), ["m2", "f1"]

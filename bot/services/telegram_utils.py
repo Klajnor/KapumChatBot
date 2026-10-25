@@ -91,6 +91,16 @@ def _retry_delay(exc: Exception) -> float:
 # --- Timing footer ---------------------------------------------------------
 
 
+def _model_label(model: str | None) -> str:
+    """Display name of a configured model id; any other value is shown as is."""
+    if not model:
+        return config.resolve_model(None).get("name") or config.default_model
+    for spec in (*config.ai_models, *config.ai_fallback_models):
+        if spec["id"] == model:
+            return spec.get("name") or model
+    return model
+
+
 def format_timing(
     elapsed: float | None,
     *,
@@ -118,7 +128,7 @@ def format_timing(
         template = config.timing_format or DEFAULT_TIMING_FORMAT
     values = {
         "seconds": f"{elapsed:.1f}",
-        "model": model or config.default_model,
+        "model": _model_label(model),
         "tokens": tokens if tokens is not None else "—",
         "input": input_tokens if input_tokens is not None else "—",
         "output": output_tokens if output_tokens is not None else "—",

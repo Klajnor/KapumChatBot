@@ -248,36 +248,21 @@ def _log_request_payload(request_id: str, endpoint: str, payload: dict[str, Any]
         )
 
 
-# Model catalog for the /models menu. It lives in the ``AI_MODELS`` environment
-# variable (see .env) so it can be updated without touching the code; the
-# built-in fallback is ``bot.config.DEFAULT_AI_MODELS``.
+# Model catalog for the /models menu. It lives in the MODEL_1_* ... MODEL_6_*
+# and FALLBACK_MODEL_* sets of the .env file (see ``bot.config``): internal id,
+# display name, provider URL, provider model id and the vision flag.
 #
-# Entries the account cannot use are hidden at startup (``GET /models``), and
-# models flagged/detected as vision-capable can analyze images.
-
-# Substrings used to detect multimodal (image input) models.
-_VISION_MARKERS = ("-vl", "vl-", "omni", "vision", "ocr")
-# Qwen3.5 and later flagship / plus / flash models accept images (and video).
-_QWEN_MULTIMODAL_RE = re.compile(r"^qwen3\.[5-9]-(?:max|plus|flash)")
+# Sets the account cannot use are hidden at startup (``GET /models`` of each
+# provider).
 
 
 def is_vision_model(model: str) -> bool:
-    """Return True if ``model`` supports image input (vision).
+    """Return True if the model with this internal id accepts images.
 
-    An explicit ``:vision`` / ``:novision`` flag in ``AI_MODELS`` always wins.
-    Otherwise the id is matched against the Qwen-VL / Omni / OCR families and
-    the Qwen3.5+ flagship, plus and flash models, which are multimodal.
+    The flag comes from the model's ``MODEL_<n>_VISION`` setting; an unknown id
+    is treated like the default model.
     """
-    lowered = (model or "").lower()
-    for entry in (*config.ai_models, *config.ai_fallback_models):
-        if str(entry.get("id", "")).lower() == lowered:
-            flag = entry.get("vision")
-            if flag is not None:
-                return bool(flag)
-            break
-    if any(marker in lowered for marker in _VISION_MARKERS):
-        return True
-    return bool(_QWEN_MULTIMODAL_RE.match(lowered))
+    return bool(config.resolve_model(model).get("vision"))
 
 
 # Tool exposed to the chat model so it can answer with a generated image.
@@ -543,8 +528,9 @@ class AIClient:
         # Downloads use their own session: presigned storage URLs reject the
         # API's Authorization header (see ``download_image``).
         self._download_session: aiohttp.ClientSession | None = None
-        # Model IDs reported as available by the API (``None`` = unknown).
-        self._available_ids: set[str] | None = None
+        # Provider model IDs reported as available, per provider base URL
+        # (a missing / ``None`` entry = unknown).
+        self._available_ids: dict[str, set[str] | None] = {}
 
     # --- Session management ------------------------------------------------
 
@@ -589,17 +575,20 @@ class AIClient:
 
     # --- Model catalog -----------------------------------------------------
 
-    async def list_models(self) -> set[str] | None:
+    async def list_models(
+        self, base_url: str | None = None, api_key: str | None = None
+    ) -> set[str] | None:
         """Return the set of model IDs available to this API key.
 
-        Uses the OpenAI-compatible ``GET {base_url}/models`` endpoint. Returns
-        ``None`` when the request fails so callers can fall back gracefully.
+        Uses the OpenAI-compatible ``GET {base_url}/models`` endpoint of the
+        given provider (default: ``AI_BASE_URL``). Returns ``None`` when the
+        request fails so callers can fall back gracefully.
         """
-        url = f"{self.base_url}/models"
+        url = f"{(base_url or self.base_url).rstrip('/')}/models"
         logger.info("AI API request: method=GET path=/models")
         try:
             session = await self._get_session()
-            async with session.get(url) as resp:
+            async with session.get(url, headers=self._auth_headers(api_key)) as resp:
                 body = await resp.text()
                 if resp.status != 200:
                     logger.warning(
@@ -620,50 +609,69 @@ class AIClient:
         }
         return ids or None
 
+    def _auth_headers(self, api_key: str | None) -> dict[str, str] | None:
+        """Per-request Authorization override for a model's own provider key."""
+        if not api_key or api_key == self.api_key:
+            return None
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _route(self, model_id: str | None) -> tuple[str, dict[str, str] | None]:
+        """``(chat/completions URL, header override)`` for an internal model id."""
+        spec = config.resolve_model(model_id)
+        base = (spec.get("base_url") or self.base_url).rstrip("/")
+        return f"{base}/chat/completions", self._auth_headers(spec.get("api_key"))
+
     async def refresh_available_models(self) -> list[dict[str, Any]]:
-        """Fetch the live model list and cache the curated, available subset."""
-        self._available_ids = await self.list_models()
+        """Fetch every provider's live model list and cache the usable subset."""
+        providers = {
+            (spec.get("base_url", ""), spec.get("api_key", ""))
+            for spec in (*config.ai_models, *config.ai_fallback_models)
+        }
+        self._available_ids = {}
+        for base_url, api_key in providers:
+            self._available_ids[base_url] = await self.list_models(base_url, api_key)
         return self.available_models()
+
+    def _provider_has(self, spec: dict[str, Any]) -> bool | None:
+        """Whether the provider lists the model: True/False/``None`` (unknown)."""
+        ids = self._available_ids.get(spec.get("base_url", ""))
+        if not ids:
+            return None
+        return spec.get("model", spec["id"]) in ids
 
     def available_models(self) -> list[dict[str, Any]]:
         """Catalog models, filtered to those the account can actually use."""
         catalog = config.ai_models
-        if not self._available_ids:
-            return list(catalog)
-        filtered = [m for m in catalog if m["id"] in self._available_ids]
+        filtered = [m for m in catalog if self._provider_has(m) is not False]
         return filtered or list(catalog)
 
     def is_model_available(self, model: str) -> bool | None:
-        """Availability of ``model``: True/False, or ``None`` when unknown."""
-        if self._available_ids is None:
-            return None
-        return model in self._available_ids
+        """Availability of an internal model id: True/False, or ``None`` if unknown."""
+        return self._provider_has(config.resolve_model(model))
 
     def model_chain(self, model: str | None, *, require_vision: bool = False) -> list[str]:
-        """Ordered models to try for one request.
+        """Ordered internal model ids to try for one request.
 
-        Starts with the requested model, then every entry *after* it in the
-        ``AI_MODELS`` list, and finally the emergency ``AI_FALLBACK_MODELS``.
-        Unavailable catalog entries (failed ``GET /models``) are skipped, as
-        are non-vision models when ``require_vision`` is set. The requested
-        model is always first so the caller's choice is honoured.
+        Starts with the requested model (an id without settings is replaced by
+        the default model), then every catalog entry *after* it, and finally
+        the ``FALLBACK_MODEL_*`` model. Models the provider does not list are
+        skipped, as are non-vision models when ``require_vision`` is set. The
+        requested model is always first so the caller's choice is honoured.
         """
-        primary = model or config.default_model
-        catalog = [str(entry.get("id", "")) for entry in config.ai_models]
+        primary = config.resolve_model(model)["id"]
+        catalog = [spec["id"] for spec in config.ai_models]
         following = (
             catalog[catalog.index(primary) + 1 :] if primary in catalog else catalog
         )
         candidates = [primary, *following]
-        candidates.extend(
-            str(entry.get("id", "")) for entry in config.ai_fallback_models
-        )
+        candidates.extend(spec["id"] for spec in config.ai_fallback_models)
 
         chain: list[str] = []
         for model_id in candidates:
             if not model_id or model_id in chain:
                 continue
             if model_id != primary:
-                if self._available_ids and model_id not in self._available_ids:
+                if self._provider_has(config.resolve_model(model_id)) is False:
                     continue
                 if require_vision and not is_vision_model(model_id):
                     continue
@@ -702,7 +710,9 @@ class AIClient:
             payload = self._chat_payload(
                 messages, attempt_model, temperature, max_tokens
             )
-            status, data, _elapsed = await self._post_chat(payload, retries=2)
+            status, data, _elapsed = await self._post_chat(
+                payload, retries=2, model_id=attempt_model
+            )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
                 if content:
@@ -746,7 +756,9 @@ class AIClient:
             )
             payload["tools"] = tools if tools is not None else [IMAGE_TOOL]
 
-            status, data, _elapsed = await self._post_chat(payload, retries=2)
+            status, data, _elapsed = await self._post_chat(
+                payload, retries=2, model_id=attempt_model
+            )
             if status == 200 and data is not None:
                 result = self._parse_result(data)
                 if result.content or result.tool_calls:
@@ -758,7 +770,9 @@ class AIClient:
             # same model without it, but only for a tool-shaped rejection.
             if status in {400, 404, 422}:
                 payload.pop("tools", None)
-                status, data, _elapsed = await self._post_chat(payload, retries=2)
+                status, data, _elapsed = await self._post_chat(
+                payload, retries=2, model_id=attempt_model
+            )
                 if status == 200 and data is not None:
                     content = self._finalize(self._extract_content(data))
                     if content:
@@ -820,7 +834,9 @@ class AIClient:
                 temperature,
                 max_tokens,
             )
-            status, data, _elapsed = await self._post_chat(payload, retries=2)
+            status, data, _elapsed = await self._post_chat(
+                payload, retries=2, model_id=attempt_model
+            )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
                 if content:
@@ -895,7 +911,7 @@ class AIClient:
             if tools:
                 payload["tools"] = list(tools)
             try:
-                result = await self._stream_attempt(payload, on_delta)
+                result = await self._stream_attempt(payload, on_delta, attempt_model)
             except AIStreamError as exc:
                 last_error = exc
                 logger.warning(
@@ -925,7 +941,10 @@ class AIClient:
         raise last_error or AIStreamError("no model produced an answer")
 
     async def _stream_attempt(
-        self, payload: dict[str, Any], on_delta: Any = None
+        self,
+        payload: dict[str, Any],
+        on_delta: Any = None,
+        model_id: str | None = None,
     ) -> ChatResult:
         """One streaming request; raises :class:`AIStreamError` on failure."""
         request_id = uuid4().hex[:12]
@@ -938,7 +957,7 @@ class AIClient:
         saw_done = False
         malformed = 0
 
-        async for line in self._stream_lines(payload):
+        async for line in self._stream_lines(payload, model_id):
             if not line.startswith("data:"):
                 continue  # SSE comments, heartbeats, blank lines
             data = line[len("data:") :].strip()
@@ -1018,16 +1037,20 @@ class AIClient:
             usage=usage,
         )
 
-    async def _stream_lines(self, payload: dict[str, Any]) -> AsyncIterator[str]:
+    async def _stream_lines(
+        self, payload: dict[str, Any], model_id: str | None = None
+    ) -> AsyncIterator[str]:
         """POST the streaming request and yield its raw SSE lines."""
-        target = f"{self.base_url}/chat/completions"
+        target, headers = self._route(model_id)
         timeout = aiohttp.ClientTimeout(
             total=config.request_timeout,
             sock_read=max(10, config.stream_stall_timeout),
         )
         try:
             session = await self._get_session()
-            async with session.post(target, json=payload, timeout=timeout) as resp:
+            async with session.post(
+                target, json=payload, timeout=timeout, headers=headers
+            ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     logger.error(
@@ -1557,7 +1580,7 @@ class AIClient:
         max_tokens: int | None,
     ) -> dict[str, Any]:
         return {
-            "model": model or config.default_model,
+            "model": (spec := config.resolve_model(model)).get("model", spec["id"]),
             "messages": AIClient._with_style_hint(messages),
             "temperature": (
                 config.default_temperature if temperature is None else temperature
@@ -1622,6 +1645,7 @@ class AIClient:
         timeout: int | None = None,
         retries: int = 3,
         fail_fast_on_quota: bool = True,
+        model_id: str | None = None,
     ) -> tuple[int | None, dict[str, Any] | None, float]:
         """POST a JSON payload with retry on transient errors.
 
@@ -1631,7 +1655,12 @@ class AIClient:
         the chat fallback chain can switch models; set it to ``False`` for
         requests without an alternative model (e.g. image generation).
         """
-        target = url or f"{self.base_url}/chat/completions"
+        if url:
+            target, headers = url, None
+        elif model_id:
+            target, headers = self._route(model_id)
+        else:
+            target, headers = f"{self.base_url}/chat/completions", None
         request_timeout = aiohttp.ClientTimeout(total=timeout or config.request_timeout)
         started = time.monotonic()
         request_id = uuid4().hex[:12]
@@ -1648,7 +1677,7 @@ class AIClient:
                 logger.info("AI API send id=%s attempt=%s/%s", request_id, attempt, retries)
                 session = await self._get_session()
                 async with session.post(
-                    target, json=payload, timeout=request_timeout
+                    target, json=payload, timeout=request_timeout, headers=headers
                 ) as resp:
                     body = await resp.text()
                     logger.info(
