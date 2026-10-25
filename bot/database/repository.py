@@ -11,7 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import config
 from bot.database.models import (
     AllowedUser,
+    AppSetting,
+    ChannelMessage,
     DailyUsage,
+    DigestChannel,
     Message,
     Reminder,
     User,
@@ -663,3 +666,162 @@ class ReminderRepository:
             .values(enabled=False)
         )
         await self.session.flush()
+
+
+class DigestRepository:
+    """Settings, digest channels and the observed channel messages."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    # --- Runtime settings ----------------------------------------------------
+
+    async def get_setting(self, key: str) -> str | None:
+        row = await self.session.get(AppSetting, key)
+        return row.value if row is not None else None
+
+    async def set_setting(self, key: str, value: str | None) -> None:
+        """Store a setting; ``None`` removes it (the default applies again)."""
+        row = await self.session.get(AppSetting, key)
+        if value is None:
+            if row is not None:
+                await self.session.delete(row)
+        elif row is None:
+            self.session.add(AppSetting(key=key, value=value))
+        else:
+            row.value = value
+        await self.session.flush()
+
+    # --- Channels ------------------------------------------------------------
+
+    async def list_channels(self) -> list[DigestChannel]:
+        result = await self.session.execute(
+            select(DigestChannel).order_by(DigestChannel.added_at, DigestChannel.chat_id)
+        )
+        return list(result.scalars().all())
+
+    async def get_channel(self, chat_id: int) -> DigestChannel | None:
+        return await self.session.get(DigestChannel, chat_id)
+
+    async def add_channel(
+        self, chat_id: int, title: str, added_by: int | None
+    ) -> DigestChannel:
+        channel = await self.session.get(DigestChannel, chat_id)
+        if channel is None:
+            channel = DigestChannel(chat_id=chat_id, title=title, added_by=added_by)
+            self.session.add(channel)
+        else:
+            channel.title = title
+        await self.session.flush()
+        return channel
+
+    async def remove_channel(self, chat_id: int) -> bool:
+        channel = await self.session.get(DigestChannel, chat_id)
+        if channel is None:
+            return False
+        await self.session.delete(channel)
+        await self.session.execute(
+            delete(ChannelMessage).where(ChannelMessage.chat_id == chat_id)
+        )
+        await self.session.flush()
+        return True
+
+    async def mark_digest(self, chat_id: int, at: datetime.datetime) -> None:
+        await self.session.execute(
+            update(DigestChannel)
+            .where(DigestChannel.chat_id == chat_id)
+            .values(last_digest_at=at)
+        )
+
+    # --- Observed messages ---------------------------------------------------
+
+    async def add_channel_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        author: str,
+        text: str,
+        created_at: datetime.datetime,
+    ) -> bool:
+        """Store one message; a repeated (chat, message) pair is ignored."""
+        exists = await self.session.execute(
+            select(ChannelMessage.id).where(
+                ChannelMessage.chat_id == chat_id,
+                ChannelMessage.message_id == message_id,
+            )
+        )
+        if exists.first() is not None:
+            return False
+        self.session.add(
+            ChannelMessage(
+                chat_id=chat_id,
+                message_id=message_id,
+                author=author[:128],
+                text=text,
+                created_at=created_at,
+            )
+        )
+        await self.session.flush()
+        return True
+
+    async def update_channel_message(
+        self, chat_id: int, message_id: int, text: str
+    ) -> None:
+        """Keep the text of an edited post current."""
+        await self.session.execute(
+            update(ChannelMessage)
+            .where(
+                ChannelMessage.chat_id == chat_id,
+                ChannelMessage.message_id == message_id,
+            )
+            .values(text=text)
+        )
+
+    async def messages_between(
+        self, chat_id: int, since: datetime.datetime, until: datetime.datetime
+    ) -> list[ChannelMessage]:
+        """Messages in ``(since, until]``, oldest first."""
+        result = await self.session.execute(
+            select(ChannelMessage)
+            .where(
+                ChannelMessage.chat_id == chat_id,
+                ChannelMessage.created_at > since,
+                ChannelMessage.created_at <= until,
+            )
+            .order_by(ChannelMessage.created_at, ChannelMessage.id)
+        )
+        return list(result.scalars().all())
+
+    async def messages_up_to(
+        self, chat_id: int, until: datetime.datetime, limit: int
+    ) -> list[ChannelMessage]:
+        """The ``limit`` newest messages at or before ``until``, oldest first."""
+        result = await self.session.execute(
+            select(ChannelMessage)
+            .where(
+                ChannelMessage.chat_id == chat_id,
+                ChannelMessage.created_at <= until,
+            )
+            .order_by(ChannelMessage.created_at.desc(), ChannelMessage.id.desc())
+            .limit(limit)
+        )
+        return list(reversed(result.scalars().all()))
+
+    async def prune_messages(
+        self, chat_id: int, older_than: datetime.datetime, keep_latest: int
+    ) -> int:
+        """Delete old messages, always keeping the ``keep_latest`` newest ones."""
+        keep = (
+            select(ChannelMessage.id)
+            .where(ChannelMessage.chat_id == chat_id)
+            .order_by(ChannelMessage.created_at.desc(), ChannelMessage.id.desc())
+            .limit(keep_latest)
+        )
+        result = await self.session.execute(
+            delete(ChannelMessage).where(
+                ChannelMessage.chat_id == chat_id,
+                ChannelMessage.created_at < older_than,
+                ChannelMessage.id.not_in(keep),
+            )
+        )
+        return result.rowcount or 0

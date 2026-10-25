@@ -147,3 +147,48 @@ class Reminder(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class AppSetting(Base):
+    """Runtime settings edited from the admin menu (key → text value)."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class DigestChannel(Base):
+    """A channel (or group) that gets a daily summary of its messages."""
+
+    __tablename__ = "digest_channels"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    title: Mapped[str] = mapped_column(String(256), default="")
+    added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    added_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # End of the window covered by the previous summary (NULL = never).
+    last_digest_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ChannelMessage(Base):
+    """A text message observed in a digest channel (input for the summary)."""
+
+    __tablename__ = "channel_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    author: Mapped[str] = mapped_column(String(128), default="")
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "message_id", name="uq_channel_message"),
+    )

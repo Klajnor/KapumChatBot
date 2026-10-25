@@ -816,6 +816,32 @@ class Config:
         default_factory=lambda: _env_float("REMINDER_CHECK_INTERVAL", 20)
     )
 
+    # --- Channel digest ---
+    # Once a day the bot summarises the messages of the channels chosen in
+    # /admin → Digest and posts the summary to the channel itself; admins then
+    # get the per-channel token statistics. The model and the prompt are set
+    # in the admin menu. The time is local to REMINDER_TIMEZONE.
+    enable_digest: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_DIGEST", True)
+    )
+    digest_time: str = field(
+        default_factory=lambda: _env("DIGEST_TIME", default="21:00")
+    )
+    # Fewer messages than this in the window → add older ones as context.
+    digest_min_messages: int = field(
+        default_factory=lambda: _env_int("DIGEST_MIN_MESSAGES", 40)
+    )
+    digest_context_messages: int = field(
+        default_factory=lambda: _env_int("DIGEST_CONTEXT_MESSAGES", 20)
+    )
+    # Input cap per channel (characters); the oldest messages are dropped first.
+    digest_max_input_chars: int = field(
+        default_factory=lambda: _env_int("DIGEST_MAX_INPUT_CHARS", 60000)
+    )
+    digest_max_tokens: int = field(
+        default_factory=lambda: _env_int("DIGEST_MAX_TOKENS", 1500)
+    )
+
     # --- History export ---
     # /export saves the conversation as a Markdown or PDF file; the 📄/📝
     # buttons under each answer export that single answer. PDF needs the

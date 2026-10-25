@@ -5,6 +5,7 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-10-25
+- **Ежедневное саммари каналов.** `/admin → Digest`: список каналов, модель и промпт саммари (хранятся в БД); раз в сутки `DIGEST_TIME` бот суммаризирует сообщения канала (при менее 40 сообщениях добавляет до 20 более ранних), публикует саммари в канал и присылает админам статистику токенов вход/выход по каждому каналу; `services/digest.py`, `handlers/digest.py`.
 - **Настройки моделей: у каждой модели свой провайдер.** Шесть слотов `MODEL_1..6_*` вместо `AI_MODELS` и `AI_FALLBACK_MODELS` (`NAME`, `ID`, `URL`, `MODEL`, `VISION`, `API_KEY`); отдельная резервная модель `FALLBACK_MODEL_*`; `DEFAULT_MODEL` задаётся внутренним id; переписаны `config.py` и `ai_client.py`.
 - **Админ-панель, OCR для PDF, YouTube, Office-документы, управление напоминаниями.** `/admin` с inline-меню и уровнями доступа guest/user/admin/owner, блокировка; OCR сканов PDF через vision-модель; субтитры YouTube через yt-dlp; анализ XLSX и PPTX; пауза, возобновление и удаление напоминаний кнопками.
 
@@ -48,6 +49,18 @@
 ### [Unreleased]
 
 ### Added
+- **Daily channel digest** — channels are chosen in `/admin → Digest`; the bot
+  stores their text posts (it must be a channel admin), and once a day at
+  `DIGEST_TIME` (in `REMINDER_TIMEZONE`) summarises everything since the previous
+  summary (24 h on the first run). With fewer than `DIGEST_MIN_MESSAGES` (40)
+  messages up to `DIGEST_CONTEXT_MESSAGES` (20) earlier ones are added as
+  context. The summary is posted to the channel; every admin then gets the
+  input/output token counts per channel. The summary model and prompt are
+  stored in the new `app_settings` table and edited in the admin menu without a
+  restart. New tables `app_settings`, `digest_channels`, `channel_messages` are
+  created automatically. Channel text is framed as `<untrusted_content>`.
+  A failed post keeps the window open; posts older than 7 days are pruned.
+  `ENABLE_DIGEST=false` turns the feature off.
 - **OCR for scanned PDFs** — a PDF without a text layer is no longer rejected:
   its first `PDF_OCR_MAX_PAGES` pages (default 5, hard max 20) are rendered to
   JPEG and transcribed by a vision model, one call per page (3 in parallel).

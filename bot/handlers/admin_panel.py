@@ -26,8 +26,10 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.bot import bot, get_bot_id
 from bot.config import config
 from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
+from bot.services import digest
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
 
@@ -114,8 +116,9 @@ def _home_markup() -> InlineKeyboardMarkup:
     b.button(text="👥 Users", callback_data="adm:list:a:0")
     b.button(text="📊 Statistics", callback_data="adm:stats")
     b.button(text="➕ Add user", callback_data="adm:add")
+    b.button(text="📰 Digest", callback_data="adm:dg")
     b.button(text="✖ Close", callback_data="adm:close")
-    b.adjust(2, 2)
+    b.adjust(2, 2, 1)
     return b.as_markup()
 
 
@@ -325,6 +328,9 @@ async def cb_admin(callback: CallbackQuery) -> None:
             "(the user must have written to the bot once).",
             _cancel_markup(),
         )
+    elif action.startswith("dg"):
+        await _digest_action(callback, actor, action, parts)
+        return
     elif target is not None:
         await _user_action(callback, actor, action, target, parts)
         return
@@ -498,6 +504,10 @@ async def on_admin_input(message: Message) -> None:
     kind, target = _awaiting.pop(actor)
     text = (message.text or "").strip()
 
+    if kind in ("dgadd", "dgprompt"):
+        await _digest_input(message, actor, kind, text)
+        return
+
     if kind == "add":
         found, error = await _resolve_target(text)
         if found is None:
@@ -539,3 +549,191 @@ async def on_admin_input(message: Message) -> None:
 
     card, markup = await _render_card(actor, target, notice)
     await message.answer(card, reply_markup=markup)
+
+
+# --- Channel digest ----------------------------------------------------------------
+
+MAX_PROMPT_CHARS = 3000
+_CHANNEL_TYPES = ("channel", "supergroup", "group")
+
+
+async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    channels = await digest.list_channels()
+    model_id = await digest.get_model()
+    model = config.resolve_model(model_id)
+    prompt = await digest.get_prompt()
+    custom = prompt != digest.DEFAULT_DIGEST_PROMPT
+    preview = html.escape(prompt if len(prompt) <= 400 else prompt[:400] + "…")
+    state = "on" if config.enable_digest else "off (ENABLE_DIGEST=false)"
+    lines = [
+        "📰 <b>Channel digest</b>",
+        f"Daily at <b>{html.escape(config.digest_time)}</b> "
+        f"({html.escape(config.reminder_timezone or 'UTC')}) — {state}",
+        f"🤖 Model: <code>{html.escape(model['name'])}</code>",
+        f"📝 Prompt{' (custom)' if custom else ' (default)'}:\n<blockquote>{preview}</blockquote>",
+        f"📡 Channels: <b>{len(channels)}</b>",
+        "<i>The bot must be an admin of the channel to read posts and publish "
+        f"the summary. Under {config.digest_min_messages} messages up to "
+        f"{config.digest_context_messages} earlier ones are added as context.</i>",
+    ]
+    if notice:
+        lines.append(f"\n{notice}")
+
+    b = InlineKeyboardBuilder()
+    for chat_id, title in channels:
+        label = (title or str(chat_id))[:30]
+        b.row(_button(f"📡 {label}", f"adm:dgc:{chat_id}"))
+    b.row(_button("➕ Add channel", "adm:dga"), _button("▶️ Run now", "adm:dgrun"))
+    b.row(_button("🤖 Model", "adm:dgm"), _button("✏️ Prompt", "adm:dgp"))
+    if custom:
+        b.row(_button("♻️ Default prompt", "adm:dgd"))
+    b.row(_button("🏠 Menu", "adm:home"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def _digest_show(callback: CallbackQuery, notice: str = "") -> None:
+    text, markup = await _digest_screen(notice)
+    await _show(callback, text, markup)
+
+
+def _digest_cancel() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✖ Cancel", callback_data="adm:dg")
+    return b.as_markup()
+
+
+async def _digest_action(
+    callback: CallbackQuery, actor: int, action: str, parts: list[str]
+) -> None:
+    arg = parts[2] if len(parts) > 2 else ""
+    if action == "dg":
+        await _digest_show(callback)
+    elif action == "dga":
+        _awaiting[actor] = ("dgadd", None)
+        await _show(
+            callback,
+            "➕ <b>Add channel</b>\n\nForward any post from the channel, or send its "
+            "numeric ID (<code>-100…</code>) or <code>@username</code>.\n"
+            "Add the bot to the channel as an admin first.",
+            _digest_cancel(),
+        )
+    elif action == "dgc":
+        try:
+            chat_id = int(arg)
+        except ValueError:
+            await safe_answer_callback(callback)
+            return
+        title = dict(await digest.list_channels()).get(chat_id)
+        if title is None:
+            await _digest_show(callback, "ℹ️ Channel not found.")
+        else:
+            b = InlineKeyboardBuilder()
+            b.row(_button("🗑 Remove", f"adm:dgx:{chat_id}"), _button("◀ Digest", "adm:dg"))
+            await _show(
+                callback,
+                f"📡 <b>{html.escape(title or str(chat_id))}</b>\n<code>{chat_id}</code>\n\n"
+                "Removing it also deletes the stored messages.",
+                b.as_markup(),
+            )
+    elif action == "dgx":
+        try:
+            removed = await digest.remove_channel(int(arg))
+        except ValueError:
+            await safe_answer_callback(callback)
+            return
+        await _digest_show(callback, "🗑 Channel removed." if removed else "ℹ️ Not found.")
+    elif action == "dgm":
+        current = await digest.get_model()
+        b = InlineKeyboardBuilder()
+        for index, model in enumerate(config.ai_models):
+            mark = "✅ " if model["id"] == current else ""
+            b.button(text=f"{mark}{model['name']}", callback_data=f"adm:dgs:{index}")
+        b.adjust(1)
+        b.row(_button("◀ Digest", "adm:dg"))
+        await _show(callback, "🤖 <b>Model for the digest</b>", b.as_markup())
+    elif action == "dgs":
+        try:
+            model = config.ai_models[int(arg)]
+        except (ValueError, IndexError):
+            await safe_answer_callback(callback)
+            return
+        await digest.set_setting(digest.SETTING_MODEL, model["id"])
+        await _digest_show(callback, f"🤖 Model set: <code>{html.escape(model['name'])}</code>")
+    elif action == "dgp":
+        _awaiting[actor] = ("dgprompt", None)
+        await _show(
+            callback,
+            "✏️ <b>Digest prompt</b>\n\nCurrent:\n"
+            f"<blockquote>{html.escape((await digest.get_prompt())[:1500])}</blockquote>\n"
+            f"Send the new system prompt (up to {MAX_PROMPT_CHARS} characters).",
+            _digest_cancel(),
+        )
+    elif action == "dgd":
+        await digest.set_setting(digest.SETTING_PROMPT, None)
+        await _digest_show(callback, "♻️ Prompt reset to the default.")
+    elif action == "dgrun":
+        await safe_answer_callback(callback, "Running…")
+        result = await digest.run_digest(notify=actor)
+        if result.skipped:
+            notice = "⏳ A digest run is already in progress."
+        elif not result.reports:
+            notice = "ℹ️ No channels yet."
+        else:
+            posted = sum(r.posted for r in result.reports)
+            notice = f"✅ Done: {posted}/{len(result.reports)} channel(s) posted."
+        await _digest_show(callback, notice)
+        return
+    await safe_answer_callback(callback)
+
+
+async def _resolve_channel(message: Message, text: str) -> tuple[Any, str]:
+    """Chat object from a forwarded post, a numeric ID or a @username."""
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    ref: Any
+    if chat is not None:
+        ref = chat.id
+    elif text.lstrip("-").isdigit():
+        ref = int(text)
+    elif text.startswith("@") and len(text) > 1:
+        ref = text.split()[0]
+    else:
+        return None, "❌ Forward a post from the channel, or send its ID / @username."
+    try:
+        found = await bot.get_chat(ref)
+    except Exception:  # noqa: BLE001 - unknown chat, bot not a member, bad ID
+        return None, "❌ Telegram does not know this chat, or the bot cannot see it."
+    if found.type not in _CHANNEL_TYPES:
+        return None, "❌ This is not a channel or group."
+    return found, ""
+
+
+async def _digest_input(message: Message, actor: int, kind: str, text: str) -> None:
+    if kind == "dgprompt":
+        if not text or len(text) > MAX_PROMPT_CHARS:
+            _awaiting[actor] = ("dgprompt", None)
+            await message.answer(
+                f"❌ Send a prompt of 1–{MAX_PROMPT_CHARS} characters.",
+                reply_markup=_digest_cancel(),
+            )
+            return
+        await digest.set_setting(digest.SETTING_PROMPT, text)
+        screen, markup = await _digest_screen("✅ Prompt saved.")
+        await message.answer(screen, reply_markup=markup)
+        return
+
+    chat, error = await _resolve_channel(message, text)
+    if chat is None:
+        _awaiting[actor] = ("dgadd", None)
+        await message.answer(error, reply_markup=_digest_cancel())
+        return
+    await digest.add_channel(chat.id, chat.title or chat.username or str(chat.id), actor)
+    notice = f"✅ Added: <b>{html.escape(chat.title or str(chat.id))}</b>"
+    try:
+        member = await bot.get_chat_member(chat.id, get_bot_id())
+        if member.status not in ("administrator", "creator"):
+            raise ValueError
+    except Exception:  # noqa: BLE001 - not a member / not an admin
+        notice += "\n⚠️ The bot is not an admin there yet — it will not see posts."
+    screen, markup = await _digest_screen(notice)
+    await message.answer(screen, reply_markup=markup)

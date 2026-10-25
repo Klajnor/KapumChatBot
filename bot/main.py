@@ -19,6 +19,7 @@ from bot.handlers import (
     admin_panel,
     chat,
     clear,
+    digest as digest_handler,
     export,
     guest,
     help,
@@ -32,6 +33,7 @@ from bot.handlers import (
 from bot.handlers.chat import _album_cleanup
 from bot.services import telegraph
 from bot.services.ai_client import ai_client, ffmpeg_available
+from bot.services.digest import digest_scheduler_loop
 from bot.services.health import start_health_server, stop_health_server
 from bot.services.mcp import mcp_manager
 from bot.services.reminders import cancel_pending_fires, reminder_scheduler_loop
@@ -39,6 +41,8 @@ from bot.services.telegram_utils import safe_answer_guest
 from bot.services.user_service import user_service
 
 # Order matters: command routers are registered before the catch-all chat router.
+# The digest router only observes channel/group posts and passes them on.
+dp.include_router(digest_handler.router)
 dp.include_router(start.router)
 dp.include_router(help.router)
 dp.include_router(models.router)
@@ -130,6 +134,7 @@ async def main() -> None:
 
     cleanup_task: asyncio.Task[None] | None = None
     reminder_task: asyncio.Task[None] | None = None
+    digest_task: asyncio.Task[None] | None = None
     health_runner = None
     try:
         await init_db()
@@ -150,6 +155,10 @@ async def main() -> None:
         # Start the reminder scheduler (fires due reminders / AI requests).
         if config.enable_reminders:
             reminder_task = asyncio.create_task(reminder_scheduler_loop())
+
+        # Daily channel digest (channels, model and prompt: /admin → Digest).
+        if config.enable_digest:
+            digest_task = asyncio.create_task(digest_scheduler_loop())
 
         # Hide curated models the account cannot access via the API.
         available = await ai_client.refresh_available_models()
@@ -196,7 +205,7 @@ async def main() -> None:
 
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        for task in (cleanup_task, reminder_task):
+        for task in (cleanup_task, reminder_task, digest_task):
             if task is not None:
                 task.cancel()
                 try:
