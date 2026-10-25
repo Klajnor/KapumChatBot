@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 SETTING_MODEL = "digest_model"
 SETTING_PROMPT = "digest_prompt"
+SETTING_TIME = "digest_time"  # "HH:MM"; overrides DIGEST_TIME
 SETTING_LAST_RUN = "digest_last_run"  # local date (ISO) of the last scheduled run
 
 DEFAULT_DIGEST_PROMPT = (
@@ -95,6 +96,31 @@ async def get_prompt() -> str:
     async with async_session_factory() as session:
         stored = await DigestRepository(session).get_setting(SETTING_PROMPT)
     return stored or DEFAULT_DIGEST_PROMPT
+
+
+def parse_time(value: str | None) -> datetime.time | None:
+    """``HH:MM`` (also ``H:MM``) → time of day; ``None`` when malformed."""
+    try:
+        hour, minute = (value or "").strip().split(":")
+        return datetime.time(int(hour), int(minute))
+    except ValueError:
+        return None
+
+
+async def get_time() -> datetime.time:
+    """Local time of the daily run: admin menu setting, else ``DIGEST_TIME``."""
+    async with async_session_factory() as session:
+        stored = await DigestRepository(session).get_setting(SETTING_TIME)
+    parsed = parse_time(stored) or parse_time(config.digest_time)
+    if parsed is None:
+        logger.warning("Invalid DIGEST_TIME %r; using 21:00", config.digest_time)
+        return datetime.time(21, 0)
+    return parsed
+
+
+async def get_setting(key: str) -> str | None:
+    async with async_session_factory() as session:
+        return await DigestRepository(session).get_setting(key)
 
 
 async def set_setting(key: str, value: str | None) -> None:
@@ -268,7 +294,7 @@ async def _digest_channel(
 # --- Statistics -----------------------------------------------------------------------
 
 
-def _tok(value: int | None) -> str:
+def format_tokens(value: int | None) -> str:
     return "n/a" if value is None else f"{value:,}".replace(",", " ")
 
 
@@ -287,11 +313,11 @@ def format_stats(reports: list[ChannelReport]) -> str:
         context = f" (+{r.context} context)" if r.context else ""
         lines.append(
             f"• {name}: {r.messages} msg{context} · "
-            f"↑ {_tok(r.input_tokens)} ↓ {_tok(r.output_tokens)} tok · "
+            f"↑ {format_tokens(r.input_tokens)} ↓ {format_tokens(r.output_tokens)} tok · "
             f"<code>{html.escape(r.model)}</code>{mark}"
         )
     if len([r for r in reports if r.input_tokens or r.output_tokens]) > 1:
-        lines.append(f"\nΣ ↑ {_tok(total_in)} ↓ {_tok(total_out)} tok")
+        lines.append(f"\nΣ ↑ {format_tokens(total_in)} ↓ {format_tokens(total_out)} tok")
     return "\n".join(lines)
 
 
@@ -341,19 +367,10 @@ async def run_digest(notify: int | None = None) -> DigestResult:
 # --- Scheduler ----------------------------------------------------------------------------------
 
 
-def _parse_time() -> datetime.time:
-    try:
-        hour, minute = config.digest_time.strip().split(":")
-        return datetime.time(int(hour), int(minute))
-    except (ValueError, AttributeError):
-        logger.warning("Invalid DIGEST_TIME %r; using 21:00", config.digest_time)
-        return datetime.time(21, 0)
-
-
 async def _scheduled_run_due() -> bool:
     """Claim today's scheduled run (stored before it starts, like reminders)."""
     now = datetime.datetime.now(datetime.UTC).astimezone(get_timezone())
-    if now.time() < _parse_time():
+    if now.time() < await get_time():
         return False
     today = now.date().isoformat()
     async with async_session_factory() as session:
@@ -368,7 +385,8 @@ async def _scheduled_run_due() -> bool:
 async def digest_scheduler_loop() -> None:
     """Background task: run the digest once per local day at ``DIGEST_TIME``."""
     logger.info(
-        "Digest scheduler started (daily at %s, timezone %s)",
+        "Digest scheduler started (daily at %s unless changed in the admin menu, "
+        "timezone %s)",
         config.digest_time,
         config.reminder_timezone or "UTC",
     )

@@ -161,6 +161,33 @@ class TestDigest(DBTest):
 
         self._run(go)
 
+    def test_run_time_setting_overrides_the_env_default(self):
+        async def go() -> None:
+            with patch.object(digest.config, "digest_time", "21:00"):
+                self.assertEqual(await digest.get_time(), datetime.time(21, 0))
+                await digest.set_setting(digest.SETTING_TIME, "08:30")
+                self.assertEqual(await digest.get_time(), datetime.time(8, 30))
+                await digest.set_setting(digest.SETTING_TIME, None)
+                self.assertEqual(await digest.get_time(), datetime.time(21, 0))
+            self.assertIsNone(digest.parse_time("25:00"))
+            self.assertIsNone(digest.parse_time("soon"))
+
+        self._run(go)
+
+    def test_manual_run_notice_explains_each_channel(self):
+        from bot.handlers.admin_panel import _run_notice
+
+        reports = [
+            digest.ChannelReport(1, "A", 5, 0, 100, 20, "m", True),
+            digest.ChannelReport(2, "B", error="no new messages"),
+            digest.ChannelReport(3, "C", error="boom"),
+        ]
+        text = _run_notice(digest.DigestResult(reports))
+        self.assertIn("A: 5 msg", text)
+        self.assertIn("no new messages", text)
+        self.assertIn("boom", text)
+        self.assertIn("already in progress", _run_notice(digest.DigestResult(skipped=True)))
+
     def test_stats_report_both_directions_and_total(self):
         reports = [
             digest.ChannelReport(CHAT, "News", 5, 2, 1200, 300, "m", True),

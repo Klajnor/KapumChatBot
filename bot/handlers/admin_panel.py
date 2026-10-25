@@ -504,7 +504,7 @@ async def on_admin_input(message: Message) -> None:
     kind, target = _awaiting.pop(actor)
     text = (message.text or "").strip()
 
-    if kind in ("dgadd", "dgprompt"):
+    if kind in ("dgadd", "dgprompt", "dgtime"):
         await _digest_input(message, actor, kind, text)
         return
 
@@ -560,6 +560,49 @@ _SHOWN_PROMPT_CHARS = 2400  # only older, longer saved prompts get clipped
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
 
 
+def _run_notice(result: digest.DigestResult) -> str:
+    """One line per channel: what the manual run did."""
+    if result.skipped:
+        return "⏳ A digest run is already in progress."
+    if not result.reports:
+        return "ℹ️ No channels yet — add one first."
+    lines = ["<b>Run finished:</b>"]
+    for r in result.reports:
+        name = html.escape(r.title or str(r.chat_id))
+        if r.posted:
+            lines.append(
+                f"✅ {name}: {r.messages} msg, ↑ {digest.format_tokens(r.input_tokens)} "
+                f"↓ {digest.format_tokens(r.output_tokens)} tok"
+            )
+        elif r.error == "no new messages":
+            lines.append(
+                f"➖ {name}: no new messages since the last summary "
+                "(is the bot an admin there?)"
+            )
+        else:
+            lines.append(f"⚠️ {name}: {html.escape(r.error or 'not posted')}")
+    return "\n".join(lines)
+
+
+async def _show_time(callback: CallbackQuery) -> None:
+    current = await digest.get_time()
+    b = InlineKeyboardBuilder()
+    for hour in range(24):
+        mark = "✅ " if (current.hour, current.minute) == (hour, 0) else ""
+        b.button(text=f"{mark}{hour:02d}:00", callback_data=f"adm:dgh:{hour}")
+    b.adjust(6)
+    b.row(_button("✏️ Custom HH:MM", "adm:dgti"))
+    if await digest.get_setting(digest.SETTING_TIME) is not None:
+        b.row(_button("♻️ Default", "adm:dgtd"))
+    b.row(_button("◀ Digest", "adm:dg"))
+    await _show(
+        callback,
+        f"🕒 <b>Daily run time</b> ({html.escape(config.reminder_timezone or 'UTC')})\n\n"
+        f"Now: <b>{current:%H:%M}</b>. Pick an hour or enter an exact time.",
+        b.as_markup(),
+    )
+
+
 def _clip_prompt(prompt: str) -> str:
     if len(prompt) <= _SHOWN_PROMPT_CHARS:
         return prompt
@@ -574,10 +617,12 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
     custom = prompt != digest.DEFAULT_DIGEST_PROMPT
     preview = html.escape(_clip_prompt(prompt))
     state = "on" if config.enable_digest else "off (ENABLE_DIGEST=false)"
+    run_at = await digest.get_time()
+    time_custom = await digest.get_setting(digest.SETTING_TIME) is not None
     lines = [
         "📰 <b>Channel digest</b>",
         (
-            f"Daily at <b>{html.escape(config.digest_time)}</b> "
+            f"🕒 Daily at <b>{run_at:%H:%M}</b>{' (custom)' if time_custom else ''} "
             f"({html.escape(config.reminder_timezone or 'UTC')}) — {state}"
         ),
         f"🤖 Model: <code>{html.escape(model['name'])}</code>",
@@ -598,6 +643,7 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
         b.row(_button(f"📡 {label}", f"adm:dgc:{chat_id}"))
     b.row(_button("➕ Add channel", "adm:dga"), _button("▶️ Run now", "adm:dgrun"))
     b.row(_button("🤖 Model", "adm:dgm"), _button("✏️ Prompt", "adm:dgp"))
+    b.row(_button("🕒 Time", "adm:dgt"))
     if custom:
         b.row(_button("♻️ Default prompt", "adm:dgd"))
     b.row(_button("🏠 Menu", "adm:home"))
@@ -684,17 +730,35 @@ async def _digest_action(
     elif action == "dgd":
         await digest.set_setting(digest.SETTING_PROMPT, None)
         await _digest_show(callback, "♻️ Prompt reset to the default.")
+    elif action == "dgt":
+        await _show_time(callback)
+    elif action == "dgh":
+        if not arg.isdigit() or not 0 <= int(arg) <= 23:
+            await safe_answer_callback(callback)
+            return
+        await digest.set_setting(digest.SETTING_TIME, f"{int(arg):02d}:00")
+        await _digest_show(callback, f"🕒 Daily run set to {int(arg):02d}:00.")
+    elif action == "dgti":
+        _awaiting[actor] = ("dgtime", None)
+        await _show(
+            callback,
+            "✏️ <b>Run time</b>\n\nSend the time as <code>HH:MM</code> "
+            f"({html.escape(config.reminder_timezone or 'UTC')}), e.g. <code>08:30</code>.",
+            _digest_cancel(),
+        )
+    elif action == "dgtd":
+        await digest.set_setting(digest.SETTING_TIME, None)
+        await _digest_show(callback, "♻️ Run time reset to the default.")
     elif action == "dgrun":
         await safe_answer_callback(callback, "Running…")
-        result = await digest.run_digest(notify=actor)
-        if result.skipped:
-            notice = "⏳ A digest run is already in progress."
-        elif not result.reports:
-            notice = "ℹ️ No channels yet."
-        else:
-            posted = sum(r.posted for r in result.reports)
-            notice = f"✅ Done: {posted}/{len(result.reports)} channel(s) posted."
-        await _digest_show(callback, notice)
+        await _show(callback, "⏳ <b>Digest is running…</b>", InlineKeyboardMarkup(inline_keyboard=[]))
+        try:
+            result = await digest.run_digest(notify=actor)
+        except Exception:
+            logger.exception("Manual digest run failed")
+            await _digest_show(callback, "❌ The run failed, see the log.")
+            return
+        await _digest_show(callback, _run_notice(result))
         return
     await safe_answer_callback(callback)
 
@@ -722,6 +786,19 @@ async def _resolve_channel(message: Message, text: str) -> tuple[Any, str]:
 
 
 async def _digest_input(message: Message, actor: int, kind: str, text: str) -> None:
+    if kind == "dgtime":
+        parsed = digest.parse_time(text)
+        if parsed is None:
+            _awaiting[actor] = ("dgtime", None)
+            await message.answer(
+                "❌ Send the time as HH:MM, e.g. 08:30.", reply_markup=_digest_cancel()
+            )
+            return
+        await digest.set_setting(digest.SETTING_TIME, f"{parsed:%H:%M}")
+        screen, markup = await _digest_screen(f"🕒 Daily run set to {parsed:%H:%M}.")
+        await message.answer(screen, reply_markup=markup)
+        return
+
     if kind == "dgprompt":
         if not text or len(text) > MAX_PROMPT_CHARS:
             _awaiting[actor] = ("dgprompt", None)
