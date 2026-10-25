@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 SETTING_MODEL = "digest_model"
 SETTING_PROMPT = "digest_prompt"
+SETTING_MODIFIER = "digest_modifier"
+SETTING_TEMPERATURE = "digest_temperature"
+SETTING_VARY = "digest_vary"  # "1" / "0"; overrides DIGEST_VARY_PROMPT
 SETTING_TIME = "digest_time"  # "HH:MM"; overrides DIGEST_TIME
 SETTING_LAST_RUN = "digest_last_run"  # local date (ISO) of the last scheduled run
 
@@ -50,6 +53,17 @@ DEFAULT_DIGEST_PROMPT = (
     "пунктами. Не выдумывай того, чего нет в сообщениях. Блок «Контекст» — это "
     "более ранние сообщения: используй его только для понимания, не пересказывай."
 )
+
+DEFAULT_MODIFIER_PROMPT = (
+    "Перепиши приведённый ниже промпт другими словами, сохранив суть и общие правила: "
+    "язык ответа, формат, ограничения и порядок работы. Не добавляй новых требований "
+    "и не убирай существующие. Каждый раз выбирай другие формулировки, порядок "
+    "предложений и тон. Верни только текст нового промпта — без пояснений, заголовков "
+    "и кавычек."
+)
+# A reworded prompt outside these bounds (characters) is discarded as broken.
+_MIN_REWORDED = 40
+_MAX_REWORDED = 4000
 
 # A message stored for the summary is clipped, so one huge post cannot eat the budget.
 _MAX_MESSAGE_CHARS = 1500
@@ -101,6 +115,41 @@ async def get_prompt() -> str:
     async with async_session_factory() as session:
         stored = await DigestRepository(session).get_setting(SETTING_PROMPT)
     return stored or DEFAULT_DIGEST_PROMPT
+
+
+async def get_modifier() -> str:
+    """The prompt that rewords the digest prompt before each run."""
+    async with async_session_factory() as session:
+        stored = await DigestRepository(session).get_setting(SETTING_MODIFIER)
+    return stored or DEFAULT_MODIFIER_PROMPT
+
+
+async def get_temperature() -> float:
+    """Temperature of both digest requests: admin menu setting, else the env default."""
+    async with async_session_factory() as session:
+        stored = await DigestRepository(session).get_setting(SETTING_TEMPERATURE)
+    parsed = parse_temperature(stored)
+    return _clamp_temperature(config.digest_temperature) if parsed is None else parsed
+
+
+async def get_vary() -> bool:
+    """Whether the prompt is reworded before each run."""
+    async with async_session_factory() as session:
+        stored = await DigestRepository(session).get_setting(SETTING_VARY)
+    return config.digest_vary_prompt if stored is None else stored == "1"
+
+
+def _clamp_temperature(value: float) -> float:
+    return max(0.0, min(2.0, value))
+
+
+def parse_temperature(value: str | None) -> float | None:
+    """``0``..``2`` (comma or dot) → temperature; ``None`` if malformed or out of range."""
+    try:
+        number = float((value or "").strip().replace(",", "."))
+    except ValueError:
+        return None
+    return number if 0.0 <= number <= 2.0 else None
 
 
 def parse_time(value: str | None) -> datetime.time | None:
@@ -240,15 +289,87 @@ def build_input(
     return wrap_untrusted("channel", "\n\n".join(parts))
 
 
-async def _ask(text: str, model: str, prompt: str) -> ChatResult:
-    """One summary request with the digest's system prompt."""
+@dataclass(slots=True)
+class Answer:
+    """Summary text with the tokens of *all* requests that produced it."""
+
+    content: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    model: str = ""
+    prompt: str = ""  # the system prompt the summary was written with
+    varied: bool = False  # the prompt was reworded by the modifier
+
+
+def _add(a: int | None, b: int | None) -> int | None:
+    return None if a is None and b is None else (a or 0) + (b or 0)
+
+
+async def _vary_prompt(
+    prompt: str, model: str, temperature: float
+) -> tuple[str, ChatResult | None]:
+    """Reword ``prompt`` with the modifier prompt; the original if that fails.
+
+    Returns the prompt to use and the modifier's result (for its token usage).
+    """
+    modifier = await get_modifier()
     request = [
-        {"role": "system", "content": prompt},
+        {"role": "system", "content": modifier},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        result = await ai_client.chat_completion_result(
+            request,
+            model=model,
+            temperature=temperature,
+            max_tokens=config.digest_max_tokens,
+        )
+    except Exception:
+        logger.exception("Prompt modifier request failed; using the prompt as is")
+        return prompt, None
+    reworded = (result.content or "").strip()
+    if not _MIN_REWORDED <= len(reworded) <= max(_MAX_REWORDED, 2 * len(prompt)):
+        logger.warning(
+            "Prompt modifier returned %d characters; using the prompt as is", len(reworded)
+        )
+        return prompt, result
+    logger.debug("Digest prompt reworded: %s", reworded)
+    return reworded, result
+
+
+async def _ask(text: str, model: str, prompt: str) -> Answer:
+    """Summarise ``text``: reword the prompt first (when enabled), then ask.
+
+    Two requests in that order — the modifier, then the reworded prompt with
+    the messages — both with the digest temperature.
+    """
+    temperature = await get_temperature()
+    used, modifier_result = prompt, None
+    varied = await get_vary()
+    if varied:
+        used, modifier_result = await _vary_prompt(prompt, model, temperature)
+        varied = used != prompt
+
+    request = [
+        {"role": "system", "content": used},
         {"role": "user", "content": text},
     ]
     apply_untrusted_hint(request)
-    return await ai_client.chat_completion_result(
-        request, model=model, temperature=0.3, max_tokens=config.digest_max_tokens
+    result = await ai_client.chat_completion_result(
+        request,
+        model=model,
+        temperature=temperature,
+        max_tokens=config.digest_max_tokens,
+    )
+    return Answer(
+        content=result.content,
+        input_tokens=_add(result.input_tokens, modifier_result and modifier_result.input_tokens),
+        output_tokens=_add(
+            result.output_tokens, modifier_result and modifier_result.output_tokens
+        ),
+        model=result.model or "",
+        prompt=used,
+        varied=varied,
     )
 
 
@@ -270,6 +391,12 @@ async def run_test(samples: list, admin_id: int) -> ChannelReport:
         report.error = "the model returned no answer"
         return report
     report.posted = await _deliver(admin_id, f"🧪 **Тестовое саммари**\n\n{result.content}")
+    if result.varied:
+        await notify_admins(
+            "🎲 <b>Prompt used (reworded)</b>\n"
+            f"<blockquote>{html.escape(result.prompt[:3500])}</blockquote>",
+            only=admin_id,
+        )
     if not report.posted:
         report.error = "could not send the summary"
     await notify_admins(format_stats([report]), only=admin_id)

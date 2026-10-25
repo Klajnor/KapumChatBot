@@ -43,8 +43,10 @@ class TestDigest(DBTest):
 
         async def fake(messages, **kwargs):
             seen["messages"] = messages
+            seen.setdefault("calls", []).append((messages, kwargs))
+            is_modifier = messages[0]["content"] == digest.DEFAULT_MODIFIER_PROMPT
             return ChatResult(
-                content="summary",
+                content="a reworded prompt that is long enough to be accepted" if is_modifier else "summary",
                 usage={"prompt_tokens": 120, "completion_tokens": 30},
                 model="m",
             )
@@ -80,7 +82,7 @@ class TestDigest(DBTest):
                 until = NOW
                 report = await digest._digest_channel(CHAT, "News", until, "m", "p")
             self.assertEqual((report.messages, report.context), (5, 20))
-            self.assertEqual((report.input_tokens, report.output_tokens), (120, 30))
+            self.assertEqual((report.input_tokens, report.output_tokens), (240, 60))  # modifier + summary
             self.assertTrue(report.posted)
             body = seen["messages"][1]["content"]
             self.assertIn("<untrusted_content", body)
@@ -119,6 +121,65 @@ class TestDigest(DBTest):
             self.assertTrue(second.recent_only)
             self.assertEqual((second.messages, second.context), (3, 0))
             self.assertTrue(second.posted)
+
+        self._run(go)
+
+    def test_modifier_runs_first_and_its_prompt_is_used(self):
+        async def go() -> None:
+            await self._seed([1])
+            seen, fake = self._fake_ai()
+            with (
+                patch.object(digest.ai_client, "chat_completion_result", fake),
+                patch.object(digest, "_send_markdown", AsyncMock(return_value=True)),
+                patch.object(digest, "send_rich_to", AsyncMock(return_value=True)),
+            ):
+                await digest.set_setting(digest.SETTING_TEMPERATURE, "1.3")
+                await digest._digest_channel(CHAT, "News", NOW, "m", "base prompt")
+            first, second = seen["calls"]
+            self.assertEqual(first[0][1]["content"], "base prompt")  # modifier sees the prompt
+            self.assertIn("reworded", second[0][0]["content"])  # summary uses the new one
+            self.assertIn("post 1", second[0][1]["content"])
+            self.assertEqual(first[1]["temperature"], 1.3)
+            self.assertEqual(second[1]["temperature"], 1.3)
+
+        self._run(go)
+
+    def test_failed_modifier_falls_back_and_vary_can_be_switched_off(self):
+        async def go() -> None:
+            await self._seed([1])
+            seen, fake = self._fake_ai()
+
+            async def broken(messages, **kwargs):
+                if messages[0]["content"] == digest.DEFAULT_MODIFIER_PROMPT:
+                    raise RuntimeError("down")
+                return await fake(messages, **kwargs)
+
+            with (
+                patch.object(digest.ai_client, "chat_completion_result", broken),
+                patch.object(digest, "_send_markdown", AsyncMock(return_value=True)),
+                patch.object(digest, "send_rich_to", AsyncMock(return_value=True)),
+            ):
+                report = await digest._digest_channel(CHAT, "News", NOW, "m", "base prompt")
+            self.assertTrue(report.posted)
+            self.assertTrue(seen["messages"][0]["content"].startswith("base prompt"))
+
+            seen.clear()
+            await digest.set_setting(digest.SETTING_VARY, "0")
+            with patch.object(digest.ai_client, "chat_completion_result", fake):
+                answer = await digest._ask("text", "m", "base prompt")
+            self.assertEqual(len(seen["calls"]), 1)
+            self.assertFalse(answer.varied)
+
+        self._run(go)
+
+    def test_temperature_setting(self):
+        async def go() -> None:
+            self.assertEqual(await digest.get_temperature(), 1.0)
+            await digest.set_setting(digest.SETTING_TEMPERATURE, "0.4")
+            self.assertEqual(await digest.get_temperature(), 0.4)
+            self.assertEqual(digest.parse_temperature("1,5"), 1.5)
+            self.assertIsNone(digest.parse_temperature("3"))
+            self.assertIsNone(digest.parse_temperature("hot"))
 
         self._run(go)
 

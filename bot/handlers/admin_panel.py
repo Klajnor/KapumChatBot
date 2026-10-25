@@ -509,7 +509,7 @@ async def on_admin_input(message: Message) -> None:
     kind, target = _awaiting.pop(actor)
     text = (message.text or "").strip()
 
-    if kind in ("dgadd", "dgprompt", "dgtime"):
+    if kind in ("dgadd", "dgprompt", "dgtime", "dgmod", "dgtemp"):
         await _digest_input(message, actor, kind, text)
         return
 
@@ -560,6 +560,7 @@ async def on_admin_input(message: Message) -> None:
 
 # Both screens show the whole prompt; with the other lines they must fit one
 # Telegram message (4096 characters, HTML escaping included).
+_TEMPERATURES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
 MAX_PROMPT_CHARS = 2000
 _SHOWN_PROMPT_CHARS = 2400  # only older, longer saved prompts get clipped
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
@@ -623,6 +624,9 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
     custom = prompt != digest.DEFAULT_DIGEST_PROMPT
     preview = html.escape(_clip_prompt(prompt))
     state = "on" if config.enable_digest else "off (ENABLE_DIGEST=false)"
+    vary = await digest.get_vary()
+    temperature = await digest.get_temperature()
+    modifier_custom = await digest.get_modifier() != digest.DEFAULT_MODIFIER_PROMPT
     run_at = await digest.get_time()
     time_custom = await digest.get_setting(digest.SETTING_TIME) is not None
     lines = [
@@ -632,6 +636,11 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
             f"({html.escape(config.reminder_timezone or 'UTC')}) — {state}"
         ),
         f"🤖 Model: <code>{html.escape(model['name'])}</code>",
+        (
+            f"🎲 Prompt variation: <b>{'on' if vary else 'off'}</b>"
+            f"{' (custom modifier)' if modifier_custom else ''} · "
+            f"🌡 Temperature: <b>{temperature:g}</b>"
+        ),
         f"📝 Prompt{' (custom)' if custom else ' (default)'}:\n<blockquote>{preview}</blockquote>",
         f"📡 Channels: <b>{len(channels)}</b>",
         (
@@ -650,8 +659,15 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
     b.row(_button("➕ Add channel", "adm:dga"), _button("▶️ Run now", "adm:dgrun"))
     b.row(_button("🤖 Model", "adm:dgm"), _button("✏️ Prompt", "adm:dgp"))
     b.row(_button("🕒 Time", "adm:dgt"), _button("🧪 Test", "adm:dgq"))
+    b.row(
+        _button(f"🎲 Variation: {'on' if vary else 'off'}", "adm:dgv"),
+        _button(f"🌡 Temp {temperature:g}", "adm:dgk"),
+    )
+    b.row(_button("🎲 Modifier prompt", "adm:dgmp"))
     if custom:
         b.row(_button("♻️ Default prompt", "adm:dgd"))
+    if modifier_custom:
+        b.row(_button("♻️ Default modifier", "adm:dgmd"))
     b.row(_button("🏠 Menu", "adm:home"))
     return "\n".join(lines), b.as_markup()
 
@@ -736,6 +752,61 @@ async def _digest_action(
     elif action == "dgd":
         await digest.set_setting(digest.SETTING_PROMPT, None)
         await _digest_show(callback, "♻️ Prompt reset to the default.")
+    elif action == "dgv":
+        enabled = not await digest.get_vary()
+        await digest.set_setting(digest.SETTING_VARY, "1" if enabled else "0")
+        await _digest_show(
+            callback, "🎲 Prompt variation is " + ("on." if enabled else "off.")
+        )
+    elif action == "dgmp":
+        _awaiting[actor] = ("dgmod", None)
+        await _show(
+            callback,
+            "🎲 <b>Modifier prompt</b>\n\n"
+            "Before every run the digest prompt is sent to the model together with "
+            "this instruction, and the reworded prompt is used for the summary.\n\n"
+            "Current:\n"
+            f"<blockquote>{html.escape(_clip_prompt(await digest.get_modifier()))}</blockquote>\n"
+            f"Send the new modifier prompt (up to {MAX_PROMPT_CHARS} characters).",
+            _digest_cancel(),
+        )
+    elif action == "dgmd":
+        await digest.set_setting(digest.SETTING_MODIFIER, None)
+        await _digest_show(callback, "♻️ Modifier prompt reset to the default.")
+    elif action == "dgk":
+        current = await digest.get_temperature()
+        b = InlineKeyboardBuilder()
+        for index, value in enumerate(_TEMPERATURES):
+            mark = "✅ " if abs(value - current) < 1e-9 else ""
+            b.button(text=f"{mark}{value:g}", callback_data=f"adm:dgkv:{index}")
+        b.adjust(4)
+        b.row(_button("✏️ Custom", "adm:dgki"), _button("♻️ Default", "adm:dgkd"))
+        b.row(_button("◀ Digest", "adm:dg"))
+        await _show(
+            callback,
+            f"🌡 <b>Temperature</b>: {current:g}\n\n"
+            "Used by both requests (the prompt rewrite and the summary). Lower is "
+            "steadier, higher is more varied. Range 0–2.",
+            b.as_markup(),
+        )
+    elif action == "dgkv":
+        try:
+            value = _TEMPERATURES[int(arg)]
+        except (ValueError, IndexError):
+            await safe_answer_callback(callback)
+            return
+        await digest.set_setting(digest.SETTING_TEMPERATURE, f"{value:g}")
+        await _digest_show(callback, f"🌡 Temperature set to {value:g}.")
+    elif action == "dgki":
+        _awaiting[actor] = ("dgtemp", None)
+        await _show(
+            callback,
+            "🌡 <b>Temperature</b>\n\nSend a number from 0 to 2, e.g. <code>0.8</code>.",
+            _digest_cancel(),
+        )
+    elif action == "dgkd":
+        await digest.set_setting(digest.SETTING_TEMPERATURE, None)
+        await _digest_show(callback, "♻️ Temperature reset to the default.")
     elif action in ("dgq", "dgqr"):
         await _digest_test_action(callback, actor, action)
         return
@@ -808,16 +879,30 @@ async def _digest_input(message: Message, actor: int, kind: str, text: str) -> N
         await message.answer(screen, reply_markup=markup)
         return
 
-    if kind == "dgprompt":
+    if kind in ("dgprompt", "dgmod"):
         if not text or len(text) > MAX_PROMPT_CHARS:
-            _awaiting[actor] = ("dgprompt", None)
+            _awaiting[actor] = (kind, None)
             await message.answer(
                 f"❌ Send a prompt of 1–{MAX_PROMPT_CHARS} characters.",
                 reply_markup=_digest_cancel(),
             )
             return
-        await digest.set_setting(digest.SETTING_PROMPT, text)
+        key = digest.SETTING_PROMPT if kind == "dgprompt" else digest.SETTING_MODIFIER
+        await digest.set_setting(key, text)
         screen, markup = await _digest_screen("✅ Prompt saved.")
+        await message.answer(screen, reply_markup=markup)
+        return
+
+    if kind == "dgtemp":
+        value = digest.parse_temperature(text)
+        if value is None:
+            _awaiting[actor] = ("dgtemp", None)
+            await message.answer(
+                "❌ Send a number from 0 to 2, e.g. 0.8.", reply_markup=_digest_cancel()
+            )
+            return
+        await digest.set_setting(digest.SETTING_TEMPERATURE, f"{value:g}")
+        screen, markup = await _digest_screen(f"🌡 Temperature set to {value:g}.")
         await message.answer(screen, reply_markup=markup)
         return
 

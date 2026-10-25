@@ -102,3 +102,16 @@ class TestDigestTestButton(DBTest):
             run.assert_not_awaited()  # nothing collected yet
 
         self._run(go)
+
+    def test_digest_screen_renders_within_the_telegram_limit(self):
+        async def go() -> None:
+            await digest.set_setting(digest.SETTING_PROMPT, "x" * panel.MAX_PROMPT_CHARS)
+            await digest.set_setting(digest.SETTING_MODIFIER, "y" * panel.MAX_PROMPT_CHARS)
+            text, markup = await panel._digest_screen("notice")
+            self.assertLess(len(text), 4096)
+            self.assertIn("Prompt variation", text)
+            buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+            for expected in ("adm:dgv", "adm:dgk", "adm:dgmp", "adm:dgmd"):
+                self.assertIn(expected, buttons)
+
+        self._run(go)

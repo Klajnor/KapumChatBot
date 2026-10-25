@@ -841,6 +841,15 @@ class Config:
     digest_max_tokens: int = field(
         default_factory=lambda: _env_int("DIGEST_MAX_TOKENS", 1500)
     )
+    # Sampling temperature of both digest requests (the admin menu overrides it).
+    digest_temperature: float = field(
+        default_factory=lambda: _env_float("DIGEST_TEMPERATURE", 1.0)
+    )
+    # Rewrite the digest prompt with the modifier prompt before every run, so
+    # the summaries do not read identically day after day.
+    digest_vary_prompt: bool = field(
+        default_factory=lambda: _env_bool("DIGEST_VARY_PROMPT", True)
+    )
 
     # --- History export ---
     # /export saves the conversation as a Markdown or PDF file; the 📄/📝
