@@ -1,4 +1,4 @@
-"""Reminder commands: /remind, /reminders, /delreminder.
+"""Reminder commands: /remind, /reminders (inline controls), /delreminder.
 
 Creating a reminder is free (no daily quota is consumed), but only admins and
 whitelisted users may create them — guests cannot. The number of one-time and
@@ -14,9 +14,15 @@ import datetime
 import html
 import logging
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import config
 from bot.database.models import Reminder
@@ -28,7 +34,11 @@ from bot.services.reminders import (
     parse_reminder,
     remind_usage,
 )
-from bot.services.telegram_utils import safe_answer
+from bot.services.telegram_utils import (
+    safe_answer,
+    safe_answer_callback,
+    safe_edit_text,
+)
 from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
@@ -82,7 +92,7 @@ def _confirmation(reminder_id: int, parsed: ParsedReminder) -> str:
             "model and the answer is delivered here."
         )
     lines.append("")
-    lines.append("Manage: /reminders · /delreminder " + str(reminder_id))
+    lines.append("Manage: /reminders (pause / resume / delete buttons) · /delreminder " + str(reminder_id))
     return "\n".join(lines)
 
 
@@ -161,18 +171,19 @@ async def cmd_remind(message: Message) -> None:
     await safe_answer(message, _confirmation(reminder_id, parsed))
 
 
-@router.message(Command("reminders"))
-async def cmd_reminders(message: Message) -> None:
-    """List the user's active reminders."""
-    user = message.from_user
-    if user is None:
-        return
-    if not config.enable_reminders:
-        await safe_answer(message, "⚠️ Reminders are disabled on this bot.")
-        return
+PER_PAGE = 6
 
+
+async def _render_list(
+    user_id: int, page: int = 0
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The /reminders text and its control keyboard (None markup when empty).
+
+    Every callback carries the owner id so that, in a group, only the person
+    who opened the list can press its buttons.
+    """
     async with user_service() as service:
-        reminders = await service.list_reminders(user.id)
+        reminders = await service.list_reminders(user_id)
         # Snapshot the rows into plain data inside the session.
         rows = [
             {
@@ -181,42 +192,157 @@ async def cmd_reminders(message: Message) -> None:
                 "fire_at": r.fire_at,
                 "schedule": r.schedule,
                 "ai_mode": r.ai_mode,
+                "enabled": r.enabled,
             }
             for r in reminders
         ]
 
     if not rows:
-        await safe_answer(
-            message,
+        return (
             "📭 <b>No active reminders.</b>\n\n"
             "Create one with /remind — the full format list is in /help.",
+            None,
         )
-        return
+
+    pages = (len(rows) + PER_PAGE - 1) // PER_PAGE
+    page = max(0, min(page, pages - 1))
+    shown = rows[page * PER_PAGE : (page + 1) * PER_PAGE]
 
     one_time = sum(1 for row in rows if row["schedule"] is None)
     recurring = len(rows) - one_time
-    lines = [
-        (
-            f"⏰ <b>Your reminders</b> — one-time: {one_time}/{config.reminder_limit}, "
-            f"recurring: {recurring}/{config.reminder_recurring_limit}"
-        ),
-        "",
-    ]
-    for row in rows:
+    header = (
+        f"⏰ <b>Your reminders</b> — one-time: {one_time}/{config.reminder_limit}, "
+        f"recurring: {recurring}/{config.reminder_recurring_limit}"
+    )
+    if pages > 1:
+        header += f" (page {page + 1}/{pages})"
+    blocks = [header]
+    builder = InlineKeyboardBuilder()
+    for row in shown:
         icon = "🔁" if row["schedule"] else "⏰"
         ai = " · 🤖 AI" if row["ai_mode"] else ""
-        when = _format_fire_time(row["fire_at"])
+        paused = "" if row["enabled"] else " · ⏸ <b>paused</b>"
         schedule = f" · {describe_schedule(row['schedule'])}" if row["schedule"] else ""
-        lines.append(
-            f"<b>#{row['id']}</b> {icon}{ai}{schedule}\n"
-            f"Next: {when}\n"
+        next_line = (
+            f"Next: {_format_fire_time(row['fire_at'])}" if row["enabled"] else "Paused"
+        )
+        blocks.append(
+            f"<b>#{row['id']}</b> {icon}{ai}{schedule}{paused}\n"
+            f"{next_line}\n"
             f"<i>{html.escape(row['text'][:150])}</i>"
         )
-    lines.append("")
-    lines.append(
-        "Delete: <code>/delreminder N</code> or <code>/delreminder all</code>"
+        toggle = (
+            f"⏸ Pause #{row['id']}" if row["enabled"] else f"▶️ Resume #{row['id']}"
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=toggle, callback_data=f"rem:tg:{user_id}:{row['id']}:{page}"
+            ),
+            InlineKeyboardButton(
+                text=f"🗑 #{row['id']}",
+                callback_data=f"rem:del:{user_id}:{row['id']}:{page}",
+            ),
+        )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(text="◀", callback_data=f"rem:pg:{user_id}:{page - 1}")
+            )
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="rem:noop"))
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton(text="▶", callback_data=f"rem:pg:{user_id}:{page + 1}")
+            )
+        builder.row(*nav)
+    builder.row(
+        InlineKeyboardButton(text="🗑 Delete all", callback_data=f"rem:all:{user_id}")
     )
-    await safe_answer(message, "\n\n".join(lines))
+    return "\n\n".join(blocks), builder.as_markup()
+
+
+@router.message(Command("reminders"))
+async def cmd_reminders(message: Message) -> None:
+    """List the user's reminders with Pause / Resume / Delete buttons."""
+    user = message.from_user
+    if user is None:
+        return
+    if not config.enable_reminders:
+        await safe_answer(message, "⚠️ Reminders are disabled on this bot.")
+        return
+
+    text, markup = await _render_list(user.id)
+    await safe_answer(message, text, reply_markup=markup)
+
+
+def _confirm_all_markup(user_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Yes, delete all", callback_data=f"rem:allok:{user_id}")
+    builder.button(text="✖ Cancel", callback_data=f"rem:pg:{user_id}:0")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == "rem:noop")
+async def cb_reminders_noop(callback: CallbackQuery) -> None:
+    await safe_answer_callback(callback)
+
+
+@router.callback_query(F.data.startswith("rem:"))
+async def cb_reminders(callback: CallbackQuery) -> None:
+    """Pause/resume/delete/paginate; only the list's owner may press."""
+    parts = (callback.data or "").split(":")
+    try:
+        action, owner = parts[1], int(parts[2])
+    except (IndexError, ValueError):
+        await safe_answer_callback(callback)
+        return
+    if callback.from_user is None or callback.from_user.id != owner:
+        await safe_answer_callback(callback, "This is not your list.", show_alert=True)
+        return
+    if not config.enable_reminders:
+        await safe_answer_callback(callback, "Reminders are disabled.", show_alert=True)
+        return
+
+    page = 0
+    toast: str | None = None
+    try:
+        if action == "pg":
+            page = int(parts[3])
+        elif action in ("tg", "del"):
+            reminder_id, page = int(parts[3]), int(parts[4])
+            async with user_service() as service:
+                if action == "tg":
+                    reminder = await service.toggle_reminder(reminder_id, owner)
+                    if reminder is None:
+                        toast = "Reminder not found."
+                    else:
+                        toast = "Resumed" if reminder.enabled else "Paused"
+                else:
+                    deleted = await service.delete_reminder(reminder_id, owner)
+                    toast = "Deleted" if deleted else "Reminder not found."
+        elif action == "all":
+            await safe_edit_text(
+                callback.message,
+                "🗑 <b>Delete all your reminders?</b> This cannot be undone.",
+                reply_markup=_confirm_all_markup(owner),
+            )
+            await safe_answer_callback(callback)
+            return
+        elif action == "allok":
+            async with user_service() as service:
+                count = await service.delete_all_reminders(owner)
+            toast = f"Deleted {count}"
+        else:
+            await safe_answer_callback(callback)
+            return
+    except (IndexError, ValueError):
+        await safe_answer_callback(callback)
+        return
+
+    text, markup = await _render_list(owner, page)
+    await safe_edit_text(callback.message, text, reply_markup=markup)
+    await safe_answer_callback(callback, toast)
 
 
 @router.message(Command("delreminder"))

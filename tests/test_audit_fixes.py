@@ -534,7 +534,9 @@ class AccessProbeTests(unittest.IsolatedAsyncioTestCase):
         from bot.services.access import check_access
 
         service = SimpleNamespace(
+            is_blocked=AsyncMock(return_value=False),
             is_allowed_user=AsyncMock(return_value=True),
+            get_daily_limit=AsyncMock(return_value=10),
             get_daily_usage_remaining=AsyncMock(return_value=0),
             consume_daily_usage=AsyncMock(),
         )
@@ -550,6 +552,7 @@ class AccessProbeTests(unittest.IsolatedAsyncioTestCase):
         from bot.services.access import check_access
 
         service = SimpleNamespace(
+            is_blocked=AsyncMock(return_value=False),
             is_allowed_user=AsyncMock(return_value=False),
             get_guest_messages_remaining=AsyncMock(return_value=0),
         )

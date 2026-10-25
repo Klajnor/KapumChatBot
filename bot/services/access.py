@@ -15,7 +15,7 @@ class AccessResult:
     """Outcome of an access check."""
 
     allowed: bool
-    role: str  # "admin" | "allowed" | "guest" | "denied"
+    role: str  # "admin" | "allowed" | "guest" | "blocked" | "denied"
     message: str | None = None
     remaining: int | None = None
     consumed: bool = False  # a quota unit was taken and can be refunded
@@ -29,13 +29,24 @@ def _denied_message() -> str:
     )
 
 
-def _daily_limit_result() -> AccessResult:
+def _blocked_result() -> AccessResult:
+    return AccessResult(
+        allowed=False,
+        role="blocked",
+        message=(
+            "🚫 <b>Access blocked.</b>\n\n"
+            "An administrator has disabled your access to this bot."
+        ),
+    )
+
+
+def _daily_limit_result(limit: int) -> AccessResult:
     return AccessResult(
         allowed=False,
         role="allowed",
         message=(
             f"⚠️ <b>Daily limit reached.</b>\n\n"
-            f"You have used all {config.daily_limit} questions for today. "
+            f"You have used all {limit} questions for today. "
             f"Come back tomorrow!"
         ),
     )
@@ -78,7 +89,9 @@ async def check_access(
 
     The rules are, in order:
       * administrators   — unlimited;
-      * whitelisted users — ``config.daily_limit`` questions per day;
+      * blocked users    — denied (even as guests);
+      * whitelisted users — their personal limit, else ``config.daily_limit``,
+        questions per day;
       * everyone else    — ``config.guest_message_limit`` free-trial messages
         (when guest access is enabled), otherwise denied.
 
@@ -92,21 +105,25 @@ async def check_access(
     if config.is_admin(telegram_id):
         return AccessResult(allowed=True, role="admin")
 
+    if await service.is_blocked(telegram_id):
+        return _blocked_result()
+
     if await service.is_allowed_user(telegram_id):
+        limit = await service.get_daily_limit(telegram_id)
         remaining = await service.get_daily_usage_remaining(telegram_id)
         if not consume:
             if require_quota and remaining <= 0:
-                return _daily_limit_result()
+                return _daily_limit_result(limit)
             return AccessResult(allowed=True, role="allowed", remaining=remaining)
         if remaining <= 0:
-            return _daily_limit_result()
+            return _daily_limit_result(limit)
         used = await service.consume_daily_usage(telegram_id)
         if used is None:  # a parallel request took the last unit
-            return _daily_limit_result()
+            return _daily_limit_result(limit)
         return AccessResult(
             allowed=True,
             role="allowed",
-            remaining=max(0, config.daily_limit - used),
+            remaining=max(0, limit - used),
             consumed=True,
         )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, false, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from bot.config import DEFAULT_SYSTEM_PROMPT_TEXT
@@ -24,6 +24,10 @@ class User(Base):
     )
     is_admin: Mapped[bool] = mapped_column(default=False)
     guest_messages_used: Mapped[int] = mapped_column(Integer, default=0)
+    # Access level set from the admin menu. ``is_admin`` above only mirrors
+    # ADMIN_IDS (owners); ``granted_admin`` is an admin promoted at runtime.
+    granted_admin: Mapped[bool] = mapped_column(default=False, server_default=false())
+    blocked: Mapped[bool] = mapped_column(default=False, server_default=false())
 
     # Relationships
     settings: Mapped[UserSettings | None] = relationship(
@@ -93,6 +97,8 @@ class AllowedUser(Base):
     username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Personal daily question limit; NULL means "use DAILY_LIMIT".
+    daily_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class DailyUsage(Base):

@@ -613,6 +613,8 @@ class Config:
 
     # --- Admin ---
     admin_ids: list[int] = field(default_factory=list)
+    # Admins promoted at runtime from the admin menu (stored in the database).
+    extra_admin_ids: set[int] = field(default_factory=set)
 
     # --- Limits ---
     max_history_length: int = field(
@@ -697,6 +699,33 @@ class Config:
     # Total timeout for fetching one linked page, seconds.
     link_fetch_timeout: int = field(
         default_factory=lambda: _env_int("LINK_FETCH_TIMEOUT", 15)
+    )
+    # OCR for scanned PDFs (no text layer): the first pages are rendered to
+    # images and transcribed by a vision model. Every page is one paid model
+    # call, so the page count is capped hard.
+    enable_pdf_ocr: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_PDF_OCR", True)
+    )
+    pdf_ocr_max_pages: int = field(
+        default_factory=lambda: _env_int("PDF_OCR_MAX_PAGES", 5)
+    )
+    # YouTube summaries: a video link is replaced by its captions (yt-dlp,
+    # optional dependency; videos without captions are not transcribed).
+    enable_youtube: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_YOUTUBE", True)
+    )
+    # Characters of transcript forwarded to the model per video.
+    youtube_max_chars: int = field(
+        default_factory=lambda: _env_int("YOUTUBE_MAX_CHARS", 30_000)
+    )
+    # Total timeout for loading one video's captions, seconds.
+    youtube_timeout: int = field(
+        default_factory=lambda: _env_int("YOUTUBE_TIMEOUT", 40)
+    )
+    # Preferred caption languages, best first (the video's own language is the
+    # fallback).
+    youtube_langs: str = field(
+        default_factory=lambda: _env("YOUTUBE_LANGS", default="ru,en")
     )
 
     # --- Web search (RAG) ---
@@ -1050,6 +1079,10 @@ class Config:
             1_048_576, min(self.max_document_bytes, 20 * 1024 * 1024)
         )
         self.link_fetch_timeout = max(5, min(self.link_fetch_timeout, 60))
+        # OCR pages and transcript size bound the paid tokens of one request.
+        self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))
+        self.youtube_max_chars = max(2_000, min(self.youtube_max_chars, 100_000))
+        self.youtube_timeout = max(10, min(self.youtube_timeout, 120))
         # Web search bounds.
         self.search_timeout = max(5, min(self.search_timeout, 60))
         self.search_max_results = max(1, min(self.search_max_results, 10))
@@ -1100,9 +1133,13 @@ class Config:
             os.getenv("AI_FALLBACK_MODELS", "")
         ) or [dict(model) for model in DEFAULT_AI_FALLBACK_MODELS]
 
-    def is_admin(self, telegram_id: int) -> bool:
-        """Return True if the given Telegram ID belongs to an administrator."""
+    def is_owner(self, telegram_id: int) -> bool:
+        """True for IDs from ``ADMIN_IDS``: they can never be demoted or blocked."""
         return telegram_id in self.admin_ids
+
+    def is_admin(self, telegram_id: int) -> bool:
+        """True for owners and for admins promoted from the admin menu."""
+        return telegram_id in self.admin_ids or telegram_id in self.extra_admin_ids
 
     def validate(self) -> None:
         """Validate that required config values are present."""

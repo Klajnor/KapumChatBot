@@ -3,6 +3,39 @@
 ## [Unreleased]
 
 ### Added
+- **OCR for scanned PDFs** — a PDF without a text layer is no longer rejected:
+  its first `PDF_OCR_MAX_PAGES` pages (default 5, hard max 20) are rendered to
+  JPEG and transcribed by a vision model, one call per page (3 in parallel).
+  The user is told how many pages were read, and the model is told the text is
+  OCR and partial. `ENABLE_PDF_OCR=false` restores the old rejection.
+- **YouTube summaries** — YouTube links (watch, shorts, live, embed, youtu.be)
+  in a link-only message are replaced by the video's captions with a `[m:ss]`
+  mark per minute, read with the optional `yt-dlp` (manual captions preferred
+  over automatic, `YOUTUBE_LANGS` order, then the video's own language). The
+  extractor URL is rebuilt from the validated video id, so a crafted link
+  cannot reach other hosts. Videos without captions and live streams are
+  reported, not transcribed. If videos stop loading, upgrade yt-dlp.
+- **XLSX and PPTX analysis** — uploaded `.xlsx` workbooks (every sheet as
+  `a | b | c` rows, cached formula values) and `.pptx` decks (slide text,
+  tables and speaker notes) are read like PDF/DOCX. New optional deps
+  `openpyxl` and `python-pptx`; same zip-expansion guard as DOCX, plus caps of
+  20 sheets / 5000 rows per sheet / 200 slides. Legacy `.xls`/`.ppt` are not
+  supported.
+- **Inline reminder controls** — `/reminders` now shows ⏸ Pause / ▶️ Resume and
+  🗑 Delete buttons per reminder (6 per page, with paging) and a confirmed
+  "Delete all". Only the user who opened the list can press its buttons.
+  Paused reminders stay listed and keep their slot in the limits; resuming a
+  recurring one jumps to its next future occurrence instead of firing for the
+  paused time. `/delreminder` keeps working.
+- **Access levels + admin menu** — `/admin` opens an inline-keyboard menu.
+  Levels: guest → user → admin → owner (`ADMIN_IDS`, cannot be changed from the
+  menu). Admins browse users (filters: all / users / guests / blocked / admins),
+  open a user card and, with buttons: change the personal daily limit (±1/±5, a
+  typed value, or back to `DAILY_LIMIT`), reset today's usage, switch the model,
+  reset the system prompt, grant/revoke access and block/unblock. Only owners
+  promote/demote admins (stored in the DB, loaded at startup). Blocked users are
+  denied even as guests. New columns (`users.granted_admin`, `users.blocked`,
+  `allowed_users.daily_limit`) are added automatically on SQLite and PostgreSQL.
 - **MCP tools / Obsidian «second brain» (admin-only)** — the chat model can
   use tools exposed by external MCP servers over stdio. Servers are read from a
   Claude-style `.mcp.json` (`MCP_CONFIG_FILE`, file or directory) or inline

@@ -40,11 +40,14 @@ from bot.services.ai_client import (
     is_vision_model,
 )
 from bot.services.documents import (
+    clip_extracted,
     detect_file_type,
     extract_document_text,
     fetch_url_text,
 )
 from bot.services.formulas import has_table, promote_complex_inline
+from bot.services.pdf_ocr import ocr_pdf
+from bot.services.youtube import YouTubeError, describe, fetch_transcript, youtube_video_id
 from bot.services.image_tools import enhance_image
 from bot.services.intent import (
     VISION_FOR_GEN_PROMPT,
@@ -108,6 +111,10 @@ DEFAULT_VISION_PROMPT = "Что изображено на этой картин�
 DEFAULT_VOICE_PROMPT = "Ответь на то, что пользователь сказал в этом голосовом сообщении."
 
 # Default ask when a document/link arrives without the user's own question.
+DEFAULT_VIDEO_PROMPT = (
+    "Сделай краткое изложение этого видео по субтитрам: основные темы, "
+    "ключевые моменты (с таймкодами) и выводы."
+)
 DEFAULT_DOCUMENT_PROMPT = (
     "Сделай краткое изложение этого документа: основные темы, ключевые "
     "моменты и выводы."
@@ -120,7 +127,7 @@ DEFAULT_LINK_PROMPT = (
 
 MSG_UNSUPPORTED_DOCUMENT = (
     "📎 <b>This file type cannot be analyzed.</b>\n\n"
-    "Supported formats: <b>PDF</b>, <b>DOCX</b>, plain text and code "
+    "Supported formats: <b>PDF</b>, <b>DOCX</b>, <b>XLSX</b>, <b>PPTX</b>, plain text and code "
     "(TXT, MD, CSV, JSON, PY, …).\n"
     "Scanned PDFs without a text layer are not supported — send the page "
     "as a photo for vision analysis instead.\n\n"
@@ -389,7 +396,20 @@ async def _expand_links_with_content(message: Message, text: str) -> str:
     await safe_answer(message, f"🔗 <b>Reading {len(urls)} link(s)…</b>\n{listed}")
 
     blocks: list[str] = []
+    videos = 0
     for url in urls:
+        video_id = youtube_video_id(url) if config.enable_youtube else None
+        if video_id is not None:
+            try:
+                transcript = await fetch_transcript(video_id)
+            except YouTubeError as exc:
+                await safe_answer(message, f"⚠️ <b>YouTube:</b> {html.escape(str(exc))}")
+                continue
+            videos += 1
+            blocks.append(
+                wrap_untrusted("web", f"{describe(transcript)}\n\n{transcript.text}")
+            )
+            continue
         page = await fetch_url_text(url)
         if page is None:
             continue
@@ -405,7 +425,9 @@ async def _expand_links_with_content(message: Message, text: str) -> str:
         )
         return text
 
-    request = remainder or DEFAULT_LINK_PROMPT
+    request = remainder or (
+        DEFAULT_VIDEO_PROMPT if videos == len(blocks) else DEFAULT_LINK_PROMPT
+    )
     return "\n\n".join(blocks) + f"\n\n---\n\nUser request: {request}"
 
 
@@ -1512,22 +1534,44 @@ async def _handle_document(message: Message) -> None:
             )
             return
 
+        ocr_note = ""
         async with waiting(message):
             extracted = await extract_document_text(file_type, data)
+            if not extracted and file_type == "pdf" and config.enable_pdf_ocr:
+                await safe_answer(
+                    message,
+                    "🔍 <b>No text layer — this looks like a scan.</b> Reading up "
+                    f"to {config.pdf_ocr_max_pages} page(s) with a vision model…",
+                )
+                ocr = await ocr_pdf(data)
+                if ocr is not None:
+                    extracted = clip_extracted(ocr.text)
+                    ocr_note = (
+                        f"[Scanned PDF read by OCR: pages 1-{ocr.pages_read} of "
+                        f"{ocr.total_pages}"
+                        + ("; the remaining pages were NOT read" if ocr.partial else "")
+                        + ". OCR may contain recognition errors.]\n\n"
+                    )
+                    if ocr.partial:
+                        await safe_answer(
+                            message,
+                            f"ℹ️ Read the first {ocr.pages_read} of {ocr.total_pages} "
+                            "pages (OCR page limit).",
+                        )
         if not extracted:
             await refund_access(service, user.id, access)
             await safe_answer(
                 message,
                 "❌ <b>Could not extract any text from this file.</b>\n\n"
-                "Scanned PDFs (images without a text layer), password-protected "
-                "and empty documents are not supported. Send a scanned page as "
-                "a photo — vision models can read it.",
+                "Password-protected and empty documents are not supported, and "
+                "scans need a vision model (and ENABLE_PDF_OCR). You can also "
+                "send a scanned page as a photo.",
             )
             return
 
         caption = strip_bot_mention(message.caption or "")
         combined = _compose_document_context(
-            doc.file_name or "document", extracted, caption
+            doc.file_name or "document", ocr_note + extracted, caption
         )
         await _answer_with_ai(message, service, combined, access)
     except Exception:

@@ -18,6 +18,12 @@ pillow>=10.0
 # plain-text/code files need no extra dependency.
 pdfplumber>=0.11
 python-docx>=1.1
+# openpyxl reads XLSX sheets, python-pptx reads PPTX slides and notes.
+openpyxl>=3.1
+python-pptx>=1.0
+# YouTube summaries (optional): captions are read with yt-dlp. YouTube changes
+# often, so keep it current (pip install -U yt-dlp) if videos stop loading.
+yt-dlp>=2025.1.1
 # Link analysis (optional): high-quality main-content extraction from web
 # pages. Without it a built-in stdlib HTML parser is used as a fallback.
 trafilatura>=2.0

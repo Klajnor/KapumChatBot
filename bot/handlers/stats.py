@@ -40,6 +40,8 @@ async def cmd_stats(message: Message) -> None:
 
         if config.is_admin(user.id):
             lines.append("\n👑 <b>Role:</b> admin (unlimited)")
+        elif await service.is_blocked(user.id):
+            lines.append("\n🚫 <b>Role:</b> blocked")
         else:
             is_allowed = await service.is_allowed_user(user.id)
             today = datetime.date.today().isoformat()
@@ -49,7 +51,7 @@ async def cmd_stats(message: Message) -> None:
                 lines.append(f"\n📅 <b>Today ({today}):</b>")
                 lines.append(
                     f"⚠️ <b>Remaining questions:</b> "
-                    f"{remaining}/{config.daily_limit}"
+                    f"{remaining}/{await service.get_daily_limit(user.id)}"
                 )
             else:
                 remaining = await service.get_guest_messages_remaining(user.id)

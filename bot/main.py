@@ -16,6 +16,7 @@ from bot.database.session import engine, init_db
 # Import all handlers and register their routers with the dispatcher.
 from bot.handlers import (
     admin,
+    admin_panel,
     chat,
     clear,
     export,
@@ -35,6 +36,7 @@ from bot.services.health import start_health_server, stop_health_server
 from bot.services.mcp import mcp_manager
 from bot.services.reminders import cancel_pending_fires, reminder_scheduler_loop
 from bot.services.telegram_utils import safe_answer_guest
+from bot.services.user_service import user_service
 
 # Order matters: command routers are registered before the catch-all chat router.
 dp.include_router(start.router)
@@ -47,6 +49,7 @@ dp.include_router(export.router)
 dp.include_router(clear.router)
 dp.include_router(stats.router)
 dp.include_router(admin.router)
+dp.include_router(admin_panel.router)
 if config.enable_guest_mode:
     dp.include_router(guest.router)
 dp.include_router(chat.router)
@@ -131,6 +134,9 @@ async def main() -> None:
     try:
         await init_db()
         logger.info("Database initialized")
+
+        async with user_service() as service:
+            await service.load_granted_admins()
 
         await setup_bot()
 

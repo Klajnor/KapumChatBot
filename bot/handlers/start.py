@@ -17,7 +17,7 @@ _BASE_COMMANDS = (
     "💬 <b>Send any text</b> — chat with the AI\n"
     "🖼️ <b>Send an image</b> — analyze it (vision models)\n"
     "🎤 <b>Send a voice message</b> — I'll recognize it and reply\n"
-    "📄 <b>Send a document</b> (PDF/DOCX/TXT) — I'll read and analyze it\n"
+    "📄 <b>Send a document</b> (PDF/DOCX/XLSX/PPTX/TXT) — I'll read and analyze it\n"
     "🔗 <b>Send a link</b> — I'll fetch the page and summarize it\n"
     "↩️ <b>Reply to a message</b> — I'll answer about the quoted text or photo\n"
     "🤖 /models — choose an AI model\n"

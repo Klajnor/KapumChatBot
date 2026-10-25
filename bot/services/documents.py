@@ -1,10 +1,10 @@
 """Text extraction from uploaded documents and linked web pages.
 
 Heavy parsers are optional dependencies: ``pdfplumber`` (PDF), ``python-docx``
-(DOCX) and ``trafilatura`` (high-quality article extraction). Each import is
+(DOCX), ``openpyxl`` (XLSX), ``python-pptx`` (PPTX) and ``trafilatura`` (high-quality article extraction). Each import is
 guarded, so the bot runs without them and degrades gracefully:
 
-* a PDF/DOCX upload is rejected with an explanation when its parser is
+* a PDF/DOCX/XLSX/PPTX upload is rejected with an explanation when its parser is
   missing (plain text never needs one);
 * link extraction falls back to a built-in stdlib HTML parser.
 
@@ -50,14 +50,16 @@ _TEXT_EXTENSIONS = frozenset({
 _MIME_TYPES = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
 }
 
 
 def detect_file_type(file_name: str | None, mime_type: str | None = None) -> str | None:
-    """Classify an upload as ``"pdf"``, ``"docx"``, ``"txt"`` or None.
+    """Classify an upload as ``"pdf"``, ``"docx"``, ``"xlsx"``, ``"pptx"``, ``"txt"`` or None.
 
     The extension wins; the MIME type is the fallback for nameless files.
-    Legacy ``.doc``/``.docx``-in-``.doc``, spreadsheets and archives are not
+    Legacy ``.doc``/``.xls``/``.ppt`` formats and archives are not
     supported and return None.
     """
     name = (file_name or "").lower()
@@ -65,6 +67,10 @@ def detect_file_type(file_name: str | None, mime_type: str | None = None) -> str
         return "pdf"
     if name.endswith(".docx"):
         return "docx"
+    if name.endswith(".xlsx"):
+        return "xlsx"
+    if name.endswith(".pptx"):
+        return "pptx"
     for extension in _TEXT_EXTENSIONS:
         if name.endswith(extension):
             return "txt"
@@ -113,8 +119,11 @@ def clip_extracted(text: str) -> str:
 
 # Decompression / expansion guards. Uploads are capped at 20 MB *compressed*,
 # which says nothing about how much memory parsing them needs.
-_MAX_EXPANDED_BYTES = 100 * 1024 * 1024  # DOCX: declared uncompressed total
+_MAX_EXPANDED_BYTES = 100 * 1024 * 1024  # DOCX/XLSX/PPTX: declared uncompressed total
 _MAX_PDF_PAGES = 200  # PDF: pages parsed before giving up
+_MAX_SHEETS = 20  # XLSX: sheets read
+_MAX_SHEET_ROWS = 5000  # XLSX: rows read per sheet
+_MAX_SLIDES = 200  # PPTX: slides read
 
 
 def _extract_pdf(data: bytes) -> str | None:
@@ -145,7 +154,7 @@ def _extract_pdf(data: bytes) -> str | None:
 
 
 def _docx_expanded_size(data: bytes) -> int | None:
-    """Declared uncompressed size of a DOCX, or None when it is not a zip."""
+    """Declared uncompressed size of an OOXML file, or None when it is not a zip."""
     try:
         import zipfile
 
@@ -187,6 +196,123 @@ def _extract_docx(data: bytes) -> str | None:
         return None
 
 
+def _ooxml_too_large(data: bytes, kind: str) -> bool:
+    """True when an OOXML zip declares an unreasonable uncompressed size."""
+    expanded = _docx_expanded_size(data)
+    if expanded is not None and expanded > _MAX_EXPANDED_BYTES:
+        logger.error(
+            "%s rejected: declares %d bytes uncompressed (limit %d)",
+            kind,
+            expanded,
+            _MAX_EXPANDED_BYTES,
+        )
+        return True
+    return False
+
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).replace("\n", " ").strip()
+
+
+def _extract_xlsx(data: bytes) -> str | None:
+    """Extract sheets as ``a | b | c`` rows from XLSX bytes (optional dep).
+
+    Cached formula results are read (``data_only``); formulas that were never
+    calculated by a spreadsheet application come out empty.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        logger.warning("openpyxl is not installed; XLSX analysis is unavailable")
+        return None
+    if _ooxml_too_large(data, "XLSX"):
+        return None
+    try:
+        workbook = openpyxl.load_workbook(
+            BytesIO(data), read_only=True, data_only=True
+        )
+        try:
+            parts: list[str] = []
+            collected = 0
+            for sheet in workbook.worksheets[:_MAX_SHEETS]:
+                lines = [f"## Sheet: {sheet.title}"]
+                for index, row in enumerate(sheet.iter_rows(values_only=True)):
+                    if index >= _MAX_SHEET_ROWS or collected >= config.max_extracted_chars:
+                        break
+                    cells = [_cell_text(value) for value in row]
+                    while cells and not cells[-1]:
+                        cells.pop()
+                    if not any(cells):
+                        continue
+                    line = " | ".join(cells)
+                    lines.append(line)
+                    collected += len(line)
+                if len(lines) > 1:
+                    parts.append("\n".join(lines))
+                if collected >= config.max_extracted_chars:
+                    break
+        finally:
+            workbook.close()
+        return "\n\n".join(parts) or None
+    except Exception as exc:  # noqa: BLE001 - a broken XLSX must not kill a reply
+        logger.error("XLSX text extraction failed: %s", exc)
+        return None
+
+
+def _shape_texts(shapes: Any) -> list[str]:
+    """Text of shapes, tables and grouped shapes on a slide, in order."""
+    texts: list[str] = []
+    for shape in shapes:
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            text = shape.text_frame.text.strip()
+            if text:
+                texts.append(text)
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    texts.append(" | ".join(cells))
+        children = getattr(shape, "shapes", None)
+        if children is not None and getattr(shape, "shape_type", None) == 6:  # group
+            texts.extend(_shape_texts(children))
+    return texts
+
+
+def _extract_pptx(data: bytes) -> str | None:
+    """Extract slide text, tables and speaker notes from PPTX bytes (optional dep)."""
+    try:
+        import pptx
+    except ImportError:
+        logger.warning("python-pptx is not installed; PPTX analysis is unavailable")
+        return None
+    if _ooxml_too_large(data, "PPTX"):
+        return None
+    try:
+        presentation = pptx.Presentation(BytesIO(data))
+        parts: list[str] = []
+        collected = 0
+        for number, slide in enumerate(presentation.slides, 1):
+            if number > _MAX_SLIDES or collected >= config.max_extracted_chars:
+                break
+            texts = _shape_texts(slide.shapes)
+            if slide.has_notes_slide:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    texts.append(f"[Notes] {notes}")
+            if texts:
+                block = f"## Slide {number}\n" + "\n".join(texts)
+                parts.append(block)
+                collected += len(block)
+        return "\n\n".join(parts) or None
+    except Exception as exc:  # noqa: BLE001 - a broken PPTX must not kill a reply
+        logger.error("PPTX text extraction failed: %s", exc)
+        return None
+
+
 async def extract_document_text(file_type: str, data: bytes) -> str | None:
     """Extract readable text from document bytes (None when impossible).
 
@@ -199,6 +325,10 @@ async def extract_document_text(file_type: str, data: bytes) -> str | None:
         text = await asyncio.to_thread(_extract_pdf, data)
     elif file_type == "docx":
         text = await asyncio.to_thread(_extract_docx, data)
+    elif file_type == "xlsx":
+        text = await asyncio.to_thread(_extract_xlsx, data)
+    elif file_type == "pptx":
+        text = await asyncio.to_thread(_extract_pptx, data)
     else:
         return None
     if not text or not text.strip():

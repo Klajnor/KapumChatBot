@@ -120,6 +120,34 @@ async def _add_missing_allowed_user_columns_sqlite(conn: Any) -> None:
             )
 
 
+async def _add_missing_access_columns_sqlite(conn: Any) -> None:
+    """Add the access-level columns (limits, blocking, admin grants) to SQLite."""
+    wanted = {
+        "allowed_users": [("daily_limit", "INTEGER")],
+        "users": [
+            ("granted_admin", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("blocked", "BOOLEAN NOT NULL DEFAULT 0"),
+        ],
+    }
+    for table, columns in wanted.items():
+        result = await conn.execute(text(f"PRAGMA table_info({table})"))
+        existing = {str(row[1]) for row in result.fetchall()}
+        for column, ddl in columns:
+            if column in existing:
+                continue
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    )
+            except Exception as exc:  # pragma: no cover - defensive, DB dependent
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Migration skipped (%s.%s): %s", table, column, exc
+                )
+
+
 async def _run_migrations(conn: Any) -> None:
     """Apply idempotent migrations for databases created by older versions.
 
@@ -130,12 +158,18 @@ async def _run_migrations(conn: Any) -> None:
     """
     if conn.dialect.name == "sqlite":
         await _add_missing_allowed_user_columns_sqlite(conn)
+        await _add_missing_access_columns_sqlite(conn)
         return
 
     statements = [
         # Guest free-trial counter on users.
         "ALTER TABLE users "
         "ADD COLUMN IF NOT EXISTS guest_messages_used INTEGER NOT NULL DEFAULT 0",
+        # Access levels: runtime admins, blocking, per-user daily limit.
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS granted_admin BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE",
         # allowed_users table.
         "CREATE TABLE IF NOT EXISTS allowed_users ("
         "telegram_id BIGINT NOT NULL PRIMARY KEY, "
@@ -148,6 +182,7 @@ async def _run_migrations(conn: Any) -> None:
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS username VARCHAR(128)",
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS first_name VARCHAR(128)",
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS last_name VARCHAR(128)",
+        "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS daily_limit INTEGER",
         # daily_usage table + index + unique constraint.
         "CREATE TABLE IF NOT EXISTS daily_usage ("
         "id SERIAL PRIMARY KEY, "

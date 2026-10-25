@@ -39,7 +39,7 @@ class UserService:
             username=username,
             first_name=first_name,
             last_name=last_name,
-            is_admin=config.is_admin(telegram_id),
+            is_admin=config.is_owner(telegram_id),
         )
         await self.session.commit()
 
@@ -191,7 +191,7 @@ class UserService:
         return created
 
     async def list_reminders(self, telegram_id: int) -> list[Reminder]:
-        """All enabled reminders of a user, soonest first."""
+        """All reminders of a user (active and paused), soonest first."""
         reminders = await self.reminder_repo.list_by_user(telegram_id)
         # Detach the plain data before the session closes.
         await self.session.commit()
@@ -202,6 +202,35 @@ class UserService:
         deleted = await self.reminder_repo.delete(reminder_id, telegram_id)
         await self.session.commit()
         return deleted
+
+    async def toggle_reminder(
+        self, reminder_id: int, telegram_id: int
+    ) -> Reminder | None:
+        """Pause an active reminder or resume a paused one (owner only).
+
+        Resuming a recurring reminder moves it to its next future occurrence,
+        so it does not fire for the time spent paused; a one-time reminder that
+        is already overdue simply fires on the next scheduler tick.
+        """
+        from bot.services.reminders import next_occurrence
+
+        reminder = await self.reminder_repo.get(reminder_id, telegram_id)
+        if reminder is None:
+            return None
+        if reminder.enabled:
+            reminder.enabled = False
+        else:
+            if reminder.schedule:
+                now = datetime.datetime.now(datetime.UTC)
+                next_fire = next_occurrence(reminder.schedule, reminder.fire_at, now)
+                if next_fire is None:  # broken schedule: it can never run again
+                    await self.reminder_repo.delete(reminder_id, telegram_id)
+                    await self.session.commit()
+                    return None
+                reminder.fire_at = next_fire
+            reminder.enabled = True
+        await self.session.commit()
+        return reminder
 
     async def delete_all_reminders(self, telegram_id: int) -> int:
         """Delete every reminder of a user; returns how many were removed."""
@@ -330,7 +359,9 @@ class UserService:
     async def consume_daily_usage(self, telegram_id: int) -> int | None:
         """Atomically count a query; the new count, or None at the daily limit."""
         count = await self.user_repo.try_consume_daily_usage(
-            telegram_id, datetime.date.today(), config.daily_limit
+            telegram_id,
+            datetime.date.today(),
+            await self.get_daily_limit(telegram_id),
         )
         await self.session.commit()
         return count
@@ -344,9 +375,89 @@ class UserService:
         self, telegram_id: int, daily_limit: int | None = None
     ) -> int:
         """Get the number of remaining questions for today."""
-        limit = config.daily_limit if daily_limit is None else daily_limit
+        limit = (
+            await self.get_daily_limit(telegram_id)
+            if daily_limit is None
+            else daily_limit
+        )
         used = await self.get_daily_usage_used(telegram_id)
         return max(0, limit - used)
+
+    async def get_daily_limit(self, telegram_id: int) -> int:
+        """The user's daily question limit: personal override or ``DAILY_LIMIT``."""
+        override = await self.user_repo.get_daily_limit_override(telegram_id)
+        return config.daily_limit if override is None else override
+
+    async def set_daily_limit(self, telegram_id: int, limit: int | None) -> bool:
+        """Set a personal daily limit (``None`` restores the default)."""
+        ok = await self.user_repo.set_daily_limit(telegram_id, limit)
+        await self.session.commit()
+        return ok
+
+    # --- Access levels -----------------------------------------------------
+
+    async def is_blocked(self, telegram_id: int) -> bool:
+        return await self.user_repo.is_blocked(telegram_id)
+
+    async def set_blocked(self, telegram_id: int, blocked: bool) -> None:
+        await self.user_repo.set_blocked(telegram_id, blocked)
+        await self.session.commit()
+
+    async def set_admin(self, telegram_id: int, granted: bool) -> None:
+        """Promote/demote a runtime admin and apply it to the live config."""
+        await self.user_repo.set_granted_admin(telegram_id, granted)
+        await self.session.commit()
+        if granted:
+            config.extra_admin_ids.add(telegram_id)
+        else:
+            config.extra_admin_ids.discard(telegram_id)
+
+    async def load_granted_admins(self) -> None:
+        """Load promoted admins into the live config (called at startup)."""
+        config.extra_admin_ids = set(await self.user_repo.get_granted_admin_ids())
+
+    async def get_level(self, telegram_id: int) -> str:
+        """``owner`` | ``admin`` | ``blocked`` | ``user`` | ``guest``."""
+        if config.is_owner(telegram_id):
+            return "owner"
+        if config.is_admin(telegram_id):
+            return "admin"
+        if await self.user_repo.is_blocked(telegram_id):
+            return "blocked"
+        if await self.user_repo.is_allowed_user(telegram_id):
+            return "user"
+        return "guest"
+
+    async def list_known_users(self) -> list[dict]:
+        """Registered users plus allowed-but-never-seen ones, with their level."""
+        users = {u.telegram_id: u for u in await self.user_repo.list_users()}
+        allowed = {a.telegram_id: a for a in await self.user_repo.get_allowed_users()}
+        rows: list[dict] = []
+        for tid in dict.fromkeys([*users, *allowed]):
+            user, entry = users.get(tid), allowed.get(tid)
+            if config.is_owner(tid):
+                level = "owner"
+            elif config.is_admin(tid):
+                level = "admin"
+            elif user is not None and user.blocked:
+                level = "blocked"
+            elif entry is not None:
+                level = "user"
+            else:
+                level = "guest"
+            rows.append(
+                {
+                    "telegram_id": tid,
+                    "level": level,
+                    "username": (user.username if user and user.username else None)
+                    or (entry.username if entry else None),
+                    "first_name": (user.first_name if user and user.first_name else None)
+                    or (entry.first_name if entry else None),
+                    "last_name": (user.last_name if user and user.last_name else None)
+                    or (entry.last_name if entry else None),
+                }
+            )
+        return rows
 
     async def reset_daily_usage(self, telegram_id: int) -> bool:
         """Reset today's usage counter. Returns True if a record existed."""

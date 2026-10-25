@@ -287,6 +287,55 @@ class UserRepository:
         existing = await self.session.get(AllowedUser, telegram_id)
         return existing is not None
 
+    # --- Access levels ---------------------------------------------------------
+
+    async def get_daily_limit_override(self, telegram_id: int) -> int | None:
+        """Personal daily limit of an allowed user (``None`` = global default)."""
+        existing = await self.session.get(AllowedUser, telegram_id)
+        return existing.daily_limit if existing is not None else None
+
+    async def set_daily_limit(self, telegram_id: int, limit: int | None) -> bool:
+        """Set (or clear with ``None``) a personal limit; False if not allowed."""
+        existing = await self.session.get(AllowedUser, telegram_id)
+        if existing is None:
+            return False
+        existing.daily_limit = limit
+        await self.session.flush()
+        return True
+
+    async def is_blocked(self, telegram_id: int) -> bool:
+        user = await self.session.get(User, telegram_id)
+        return bool(user and user.blocked)
+
+    async def set_blocked(self, telegram_id: int, blocked: bool) -> None:
+        """Block or unblock a user (the user row is created when unknown)."""
+        await self.get_or_create_user(telegram_id)
+        await self.session.execute(
+            update(User).where(User.telegram_id == telegram_id).values(blocked=blocked)
+        )
+
+    async def set_granted_admin(self, telegram_id: int, granted: bool) -> None:
+        """Promote to / demote from a runtime administrator."""
+        await self.get_or_create_user(telegram_id)
+        await self.session.execute(
+            update(User)
+            .where(User.telegram_id == telegram_id)
+            .values(granted_admin=granted)
+        )
+
+    async def get_granted_admin_ids(self) -> list[int]:
+        result = await self.session.execute(
+            select(User.telegram_id).where(User.granted_admin.is_(True))
+        )
+        return [int(row[0]) for row in result.all()]
+
+    async def list_users(self) -> list[User]:
+        """Every registered user, newest first."""
+        result = await self.session.execute(
+            select(User).order_by(User.created_at.desc())
+        )
+        return list(result.scalars().all())
+
     # --- Daily usage tracking ---------------------------------------------
 
     async def get_daily_usage(
@@ -532,7 +581,7 @@ class ReminderRepository:
         return reminder
 
     async def count(self, user_id: int, *, recurring: bool | None = None) -> int:
-        """Count a user's enabled reminders.
+        """Count a user's reminders (paused ones still occupy a slot).
 
         ``recurring=None`` counts all; ``True`` only scheduled ones; ``False``
         only one-time ones.
@@ -540,7 +589,7 @@ class ReminderRepository:
         stmt = (
             select(func.count())
             .select_from(Reminder)
-            .where(Reminder.user_id == user_id, Reminder.enabled.is_(True))
+            .where(Reminder.user_id == user_id)
         )
         if recurring is True:
             stmt = stmt.where(Reminder.schedule.isnot(None))
@@ -550,10 +599,10 @@ class ReminderRepository:
         return int(result.scalar() or 0)
 
     async def list_by_user(self, user_id: int) -> list[Reminder]:
-        """All enabled reminders of a user, soonest first."""
+        """All reminders of a user (active and paused), soonest first."""
         result = await self.session.execute(
             select(Reminder)
-            .where(Reminder.user_id == user_id, Reminder.enabled.is_(True))
+            .where(Reminder.user_id == user_id)
             .order_by(Reminder.fire_at, Reminder.id)
         )
         return list(result.scalars().all())
