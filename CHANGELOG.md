@@ -54,8 +54,8 @@
 - **Daily channel digest** — channels are chosen in `/admin → Digest`; the bot
   stores their text posts (it must be a channel admin), and once a day at
   `DIGEST_TIME` (in `REMINDER_TIMEZONE`) summarises everything since the previous
-  summary (24 h on the first run). With fewer than `DIGEST_MIN_MESSAGES` (40)
-  messages up to `DIGEST_CONTEXT_MESSAGES` (20) earlier ones are added as
+  summary (24 h on the first run). With fewer than `DIGEST_MIN_MESSAGES` (20)
+  messages up to `DIGEST_CONTEXT_MESSAGES` (64) earlier ones are added as
   context. The summary is posted to the channel; every admin then gets the
   input/output token counts per channel. The summary model and prompt are
   stored in the new `app_settings` table and edited in the admin menu without a

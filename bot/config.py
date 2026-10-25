@@ -829,10 +829,10 @@ class Config:
     )
     # Fewer messages than this in the window → add older ones as context.
     digest_min_messages: int = field(
-        default_factory=lambda: _env_int("DIGEST_MIN_MESSAGES", 40)
+        default_factory=lambda: _env_int("DIGEST_MIN_MESSAGES", 20)
     )
     digest_context_messages: int = field(
-        default_factory=lambda: _env_int("DIGEST_CONTEXT_MESSAGES", 20)
+        default_factory=lambda: _env_int("DIGEST_CONTEXT_MESSAGES", 64)
     )
     # Input cap per channel (characters); the oldest messages are dropped first.
     digest_max_input_chars: int = field(

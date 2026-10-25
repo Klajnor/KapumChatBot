@@ -75,6 +75,7 @@ class TestDigest(DBTest):
                 patch.object(digest.ai_client, "chat_completion_result", fake),
                 patch.object(digest, "_send_markdown", AsyncMock(return_value=True)),
                 patch.object(digest, "notify_admins", AsyncMock()),
+                patch.object(digest.config, "digest_context_messages", 20),
             ):
                 until = NOW
                 report = await digest._digest_channel(CHAT, "News", until, "m", "p")
