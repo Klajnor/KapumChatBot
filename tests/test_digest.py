@@ -114,7 +114,19 @@ class TestDigest(DBTest):
                 first = await digest._digest_channel(CHAT, "News", NOW, "m", "p")
                 second = await digest._digest_channel(CHAT, "News", NOW, "m", "p")
             self.assertEqual(first.messages, 1)  # only the post 2 h ago
-            self.assertEqual(second.error, "no new messages")
+            # A quiet period still gets a summary of the latest stored messages.
+            self.assertTrue(second.recent_only)
+            self.assertEqual((second.messages, second.context), (3, 0))
+            self.assertTrue(second.posted)
+
+        self._run(go)
+
+    def test_channel_without_any_messages_is_skipped(self):
+        async def go() -> None:
+            await digest.add_channel(CHAT, "News", 1)
+            report = await digest._digest_channel(CHAT, "News", NOW, "m", "p")
+            self.assertEqual(report.error, digest.NO_MESSAGES)
+            self.assertFalse(report.posted)
 
         self._run(go)
 
@@ -179,12 +191,12 @@ class TestDigest(DBTest):
 
         reports = [
             digest.ChannelReport(1, "A", 5, 0, 100, 20, "m", True),
-            digest.ChannelReport(2, "B", error="no new messages"),
+            digest.ChannelReport(2, "B", error=digest.NO_MESSAGES),
             digest.ChannelReport(3, "C", error="boom"),
         ]
         text = _run_notice(digest.DigestResult(reports))
         self.assertIn("A: 5 msg", text)
-        self.assertIn("no new messages", text)
+        self.assertIn("nothing stored", text)
         self.assertIn("boom", text)
         self.assertIn("already in progress", _run_notice(digest.DigestResult(skipped=True)))
 

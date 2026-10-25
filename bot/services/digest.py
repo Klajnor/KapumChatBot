@@ -56,6 +56,8 @@ _RETENTION_DAYS = 7
 _KEEP_LATEST = 100
 _DEFAULT_WINDOW = datetime.timedelta(hours=24)
 
+NO_MESSAGES = "no messages"  # ChannelReport.error: nothing stored for the channel
+
 _run_lock = asyncio.Lock()
 # chat ids currently on the digest list; ``None`` = not loaded yet.
 _channel_ids: set[int] | None = None
@@ -74,6 +76,7 @@ class ChannelReport:
     model: str = ""
     posted: bool = False
     error: str = ""
+    recent_only: bool = False  # quiet period: summarised the latest stored messages
 
 
 @dataclass(slots=True)
@@ -203,8 +206,14 @@ def _format_line(author: str, created_at: datetime.datetime, text: str) -> str:
     return f"[{local:%d.%m %H:%M}] {who}{clipped}"
 
 
-def build_input(messages: list, context: list, max_chars: int) -> str:
-    """Compose the user message; the oldest lines go first when over budget."""
+def build_input(
+    messages: list, context: list, max_chars: int, *, recent_only: bool = False
+) -> str:
+    """Compose the user message; the oldest lines go first when over budget.
+
+    ``recent_only`` marks a quiet period: ``messages`` are then the latest ones
+    from before the window, and the model is told so.
+    """
     main = [_format_line(m.author, m.created_at, m.text) for m in messages]
     background = [_format_line(m.author, m.created_at, m.text) for m in context]
 
@@ -220,7 +229,12 @@ def build_input(messages: list, context: list, max_chars: int) -> str:
     parts = []
     if background:
         parts.append("Контекст (более ранние сообщения):\n" + "\n".join(background))
-    parts.append("Сообщения за период:\n" + "\n".join(main))
+    title = (
+        "За период новых сообщений не было. Последние сообщения канала:"
+        if recent_only
+        else "Сообщения за период:"
+    )
+    parts.append(f"{title}\n" + "\n".join(main))
     return wrap_untrusted("channel", "\n\n".join(parts))
 
 
@@ -244,15 +258,23 @@ async def _digest_channel(
             context = await repo.messages_up_to(
                 chat_id, since, config.digest_context_messages
             )
+        if not messages and config.digest_context_messages > 0:
+            # A quiet period still gets a summary: of the latest stored messages.
+            messages = await repo.messages_up_to(
+                chat_id, until, config.digest_context_messages
+            )
+            report.recent_only = bool(messages)
         if not messages:
-            # Nothing was lost: move the window so it does not grow forever.
+            # Nothing stored at all: move the window so it does not grow forever.
             await repo.mark_digest(chat_id, until)
             await session.commit()
-            report.error = "no new messages"
+            report.error = NO_MESSAGES
             return report
         # Detach the rows before the (slow) model call.
         report.messages, report.context = len(messages), len(context)
-        text = build_input(messages, context, config.digest_max_input_chars)
+        text = build_input(
+            messages, context, config.digest_max_input_chars, recent_only=report.recent_only
+        )
 
     request = [
         {"role": "system", "content": prompt},
@@ -311,6 +333,8 @@ def format_stats(reports: list[ChannelReport]) -> str:
         total_out += r.output_tokens or 0
         mark = "" if r.posted else " ⚠️ " + html.escape(r.error)
         context = f" (+{r.context} context)" if r.context else ""
+        if r.recent_only:
+            context = " (no new, latest)"
         lines.append(
             f"• {name}: {r.messages} msg{context} · "
             f"↑ {format_tokens(r.input_tokens)} ↓ {format_tokens(r.output_tokens)} tok · "
@@ -341,8 +365,8 @@ async def run_digest(notify: int | None = None) -> DigestResult:
     """Process every channel once.
 
     ``notify`` limits the statistics to one admin (manual run from the menu);
-    the scheduled run reports to all admins. Channels with no new messages are
-    left out of the statistics.
+    the scheduled run reports to all admins. Channels with no stored messages
+    at all are left out of the statistics.
     """
     if _run_lock.locked():
         return DigestResult(skipped=True)
@@ -358,7 +382,7 @@ async def run_digest(notify: int | None = None) -> DigestResult:
                 report = ChannelReport(chat_id=chat_id, title=title, error=str(exc)[:200])
             result.reports.append(report)
 
-        shown = [r for r in result.reports if r.error != "no new messages"]
+        shown = [r for r in result.reports if r.error != NO_MESSAGES]
         if shown:
             await notify_admins(format_stats(shown), only=notify)
         return result

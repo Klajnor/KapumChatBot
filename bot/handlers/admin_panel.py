@@ -570,13 +570,14 @@ def _run_notice(result: digest.DigestResult) -> str:
     for r in result.reports:
         name = html.escape(r.title or str(r.chat_id))
         if r.posted:
+            quiet = " (no new, latest)" if r.recent_only else ""
             lines.append(
-                f"✅ {name}: {r.messages} msg, ↑ {digest.format_tokens(r.input_tokens)} "
+                f"✅ {name}: {r.messages} msg{quiet}, ↑ {digest.format_tokens(r.input_tokens)} "
                 f"↓ {digest.format_tokens(r.output_tokens)} tok"
             )
-        elif r.error == "no new messages":
+        elif r.error == digest.NO_MESSAGES:
             lines.append(
-                f"➖ {name}: no new messages since the last summary "
+                f"➖ {name}: nothing stored for this chat yet "
                 "(is the bot an admin there?)"
             )
         else:

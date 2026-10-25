@@ -18,6 +18,7 @@ from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from bot.bot import get_bot_id
 from bot.config import config
 from bot.services import digest
 
@@ -34,7 +35,21 @@ def _author(message: Message) -> str:
     return ""  # an anonymous channel post: the channel itself is the author
 
 
+def _is_own(message: Message) -> bool:
+    """True for the bot's own messages (its answers and the posted summaries)."""
+    bot_id = get_bot_id()
+    if not bot_id:
+        return False
+    sender = message.from_user
+    via = message.via_bot
+    return (sender is not None and sender.id == bot_id) or (
+        via is not None and via.id == bot_id
+    )
+
+
 async def _record(message: Message, *, edited: bool = False) -> None:
+    if _is_own(message):
+        return
     try:
         await digest.record_message(
             message.chat.id,

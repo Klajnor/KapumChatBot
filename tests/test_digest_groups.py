@@ -82,6 +82,17 @@ class TestGroupDigest(DBTest):
 
         self._run(go)
 
+    def test_own_messages_of_the_bot_are_ignored(self):
+        async def go() -> None:
+            await digest.add_channel(GROUP, "Team", ADMIN)
+            dp, _ = self._dispatcher()
+            with patch("bot.handlers.digest.get_bot_id", return_value=MEMBER):
+                await dp.feed_update(AsyncMock(), _message("my own answer", MEMBER, 1))
+                await dp.feed_update(AsyncMock(), _message("a human", ADMIN, 2))
+            self.assertEqual(await self._stored(), ["a human"])
+
+        self._run(go)
+
     def test_untracked_group_is_ignored(self):
         async def go() -> None:
             dp, _ = self._dispatcher()
