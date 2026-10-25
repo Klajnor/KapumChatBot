@@ -1,8 +1,14 @@
 """
 Full WebSocket ASR test with qwen-audio-3.0-realtime-plus (Manual mode).
 """
-import asyncio, base64, json, sys, os, wave, struct, math
-from io import BytesIO
+import asyncio
+import base64
+import json
+import math
+import os
+import struct
+import sys
+
 import aiohttp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +38,7 @@ async def recv_event(ws, timeout=10):
         if msg.type == aiohttp.WSMsgType.TEXT:
             return json.loads(msg.data)
         return {"_raw": str(msg.type)}
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"_timeout": True}
 
 
@@ -43,7 +49,7 @@ async def main():
     print()
 
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession() as s:  # noqa: SIM117
             async with s.ws_connect(URL, headers=h,
                                      timeout=aiohttp.ClientTimeout(total=60, sock_read=15)) as ws:
                 # 1. session.update (Manual mode)
@@ -106,16 +112,16 @@ async def main():
                         print(f"   Session id: {evt.get('session', {}).get('id', '?')}")
 
                 if transcription:
-                    print(f"\n[SUCCESS] ASR via WebSocket works!")
+                    print("\n[SUCCESS] ASR via WebSocket works!")
                     print(f"Transcription: {transcription!r}")
                 elif transcription is not None:
-                    print(f"\n[OK] WebSocket flow works, transcription empty (tone)")
+                    print("\n[OK] WebSocket flow works, transcription empty (tone)")
                 else:
-                    print(f"\n[PARTIAL] Flow worked but no transcription received")
+                    print("\n[PARTIAL] Flow worked but no transcription received")
 
     except aiohttp.ClientError as e:
         print(f"[FAIL] {type(e).__name__}: {e}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - ручной скрипт, печатаем любую ошибку
         print(f"[FAIL] {type(e).__name__}: {e}")
 
 if __name__ == "__main__":
