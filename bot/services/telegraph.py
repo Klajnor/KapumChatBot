@@ -206,7 +206,7 @@ def _convert_inline(nodes: list[Any], *, rich: bool) -> list[Any]:
             if not rich and kind in ("s", "u"):
                 out.extend(children)
                 continue
-            tag = {"i": "em"}.get(kind, kind) if rich else {"i": "em"}.get(kind, kind)
+            tag = {"i": "em"}.get(kind, kind)
             out.append({"tag": tag, "children": children})
         elif kind == "spoiler":
             out.extend(_convert_inline(node[1], rich=rich))

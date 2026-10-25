@@ -361,7 +361,7 @@ async def _send_formula_photo(
             if attempt >= _MAX_429_RETRIES:
                 return False
             await asyncio.sleep(_retry_delay(exc))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - image delivery falls back to text
             logger.warning("Could not send formula image; using text: %s", exc)
             return False
     return False
@@ -454,8 +454,8 @@ async def _send_chunk(
             except TelegramAPIError as exc:
                 logger.error("Sending the answer failed (%s)", exc)
                 break
-            except Exception as exc:  # noqa: BLE001 - a reply must not be lost
-                logger.exception("Unexpected error while sending the answer: %s", exc)
+            except Exception:
+                logger.exception("Unexpected error while sending the answer")
                 break
 
     return await _send_truncated(message, body, limit, reply_markup=reply_markup)

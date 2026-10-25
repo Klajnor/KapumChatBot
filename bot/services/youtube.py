@@ -151,7 +151,7 @@ def _load_transcript(video_id: str) -> Transcript:
             body = ydl.urlopen(formats[0]["url"]).read()
     except YouTubeError:
         raise
-    except Exception as exc:  # noqa: BLE001 - yt-dlp raises many unrelated types
+    except Exception as exc:
         logger.warning("YouTube extraction failed for %s: %s", video_id, exc)
         raise YouTubeError(
             "Could not load the video (private, age-restricted, region-locked, "
@@ -189,7 +189,7 @@ async def fetch_transcript(video_id: str) -> Transcript:
         return await asyncio.wait_for(
             asyncio.to_thread(_load_transcript, video_id), config.youtube_timeout
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise YouTubeError("YouTube took too long to answer. Try again later.") from None
 
 

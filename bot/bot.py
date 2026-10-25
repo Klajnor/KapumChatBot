@@ -54,7 +54,7 @@ async def setup_bot() -> None:
 
     try:
         await bot.set_my_commands(_COMMANDS)
-    except Exception as exc:  # pragma: no cover - network dependent
+    except Exception as exc:  # pragma: no cover - network dependent  # noqa: BLE001
         logger.warning("Failed to register bot commands: %s", exc)
 
 

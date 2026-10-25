@@ -593,50 +593,49 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
             try:
                 async with aiohttp.ClientSession(
                     timeout=timeout, connector=connector
-                ) as session:
-                    async with session.get(
-                        url, headers=_FETCH_HEADERS, allow_redirects=False
-                    ) as resp:
-                        if resp.status in (301, 302, 303, 307, 308):
-                            location = resp.headers.get("Location")
-                            if not location:
-                                return None, url, None
-                            url = urljoin(url, location)
-                            continue
-                        if resp.status != 200:
-                            logger.info("URL fetch got HTTP %s", resp.status)
+                ) as session, session.get(
+                    url, headers=_FETCH_HEADERS, allow_redirects=False
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
                             return None, url, None
-                        content_type = (
-                            (resp.headers.get("Content-Type") or "")
-                            .lower()
-                            .split(";", 1)[0]
-                            .strip()
-                        )
-                        allowed = (
-                            content_type.startswith(
-                                (
-                                    "text/",
-                                    "application/json",
-                                    "application/xml",
-                                    "application/pdf",
-                                )
+                        url = urljoin(url, location)
+                        continue
+                    if resp.status != 200:
+                        logger.info("URL fetch got HTTP %s", resp.status)
+                        return None, url, None
+                    content_type = (
+                        (resp.headers.get("Content-Type") or "")
+                        .lower()
+                        .split(";", 1)[0]
+                        .strip()
+                    )
+                    allowed = (
+                        content_type.startswith(
+                            (
+                                "text/",
+                                "application/json",
+                                "application/xml",
+                                "application/pdf",
                             )
-                            or "xhtml" in content_type
-                            or not content_type
                         )
-                        if not allowed:
-                            logger.info(
-                                "Skipping non-text content type %r", content_type
-                            )
-                            return None, url, None
-                        declared = resp.content_length
-                        if declared is not None and declared > _MAX_FETCH_BYTES:
-                            logger.info("Page is too large (%d bytes)", declared)
-                            return None, url, None
-                        body = await resp.content.read(_MAX_FETCH_BYTES + 1)
-                        if len(body) > _MAX_FETCH_BYTES:
-                            return None, url, None
-                        return body, str(resp.url), content_type
+                        or "xhtml" in content_type
+                        or not content_type
+                    )
+                    if not allowed:
+                        logger.info(
+                            "Skipping non-text content type %r", content_type
+                        )
+                        return None, url, None
+                    declared = resp.content_length
+                    if declared is not None and declared > _MAX_FETCH_BYTES:
+                        logger.info("Page is too large (%d bytes)", declared)
+                        return None, url, None
+                    body = await resp.content.read(_MAX_FETCH_BYTES + 1)
+                    if len(body) > _MAX_FETCH_BYTES:
+                        return None, url, None
+                    return body, str(resp.url), content_type
             finally:
                 await connector.close()
     except (TimeoutError, aiohttp.ClientError, OSError) as exc:

@@ -8,8 +8,8 @@ which is fine because the requests themselves die with the process.
 from __future__ import annotations
 
 from collections import defaultdict
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 from bot.config import config
 

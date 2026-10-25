@@ -13,9 +13,9 @@ from PIL import Image
 
 from bot.config import DEFAULT_STYLE_HINT, FORMULA_STYLE_HINT, config
 from bot.handlers.guest import GuestReply, _to_result
+from bot.services import telegram_utils as sending
 from bot.services.ai_client import AIClient
 from bot.services.formulas import MAX_FORMULA_CHARS, render_formula, split_display_math
-from bot.services import telegram_utils as sending
 
 
 class FormulaTests(unittest.IsolatedAsyncioTestCase):

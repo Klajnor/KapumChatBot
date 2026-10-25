@@ -46,8 +46,6 @@ from bot.services.documents import (
     fetch_url_text,
 )
 from bot.services.formulas import has_table, promote_complex_inline
-from bot.services.pdf_ocr import ocr_pdf
-from bot.services.youtube import YouTubeError, describe, fetch_transcript, youtube_video_id
 from bot.services.image_tools import enhance_image
 from bot.services.intent import (
     VISION_FOR_GEN_PROMPT,
@@ -60,6 +58,7 @@ from bot.services.mcp import (
     mcp_manager,
     remove_mcp_hint,
 )
+from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.rich import (
     RICH_LIMIT,
@@ -99,6 +98,12 @@ from bot.services.untrusted import (
     wrap_untrusted,
 )
 from bot.services.user_service import UserService
+from bot.services.youtube import (
+    YouTubeError,
+    describe,
+    fetch_transcript,
+    youtube_video_id,
+)
 
 logger = logging.getLogger(__name__)
 

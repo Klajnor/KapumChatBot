@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -87,17 +88,21 @@ class ProgressNotifier:
 
     # --- Context manager ---------------------------------------------------
 
-    async def __aenter__(self) -> "ProgressNotifier":
+    async def __aenter__(self) -> Self:
         if config.enable_progress:
             self._started = time.monotonic()
             self._stopped = False
             self._task = asyncio.create_task(self._run(), name="progress-notice")
         return self
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.stop()
         # Never suppress the wrapped exception.
-        return None
 
     async def stop(self) -> None:
         """Cancel the loop and delete the notice. Idempotent.

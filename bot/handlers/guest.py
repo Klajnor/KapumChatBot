@@ -490,9 +490,8 @@ async def handle_guest_message(message: Message) -> None:
         and reply.photo_url is None
         and reply.mode == "markdown"
         and reply.text
-    ):
-        if await safe_answer_guest(message, _to_result(reply, mode="rich")):
-            return
+    ) and await safe_answer_guest(message, _to_result(reply, mode="rich")):
+        return
     if await safe_answer_guest(message, _to_result(reply)):
         return
     if reply.mode != "plain":
@@ -522,8 +521,8 @@ async def _run_guest_reply(message: Message, caller, chat_id: int) -> GuestReply
             ),
             mode="plain",
         )
-    except Exception as exc:  # noqa: BLE001 - always produce a single reply
-        logger.exception("Guest message handling failed: %s", exc)
+    except Exception:
+        logger.exception("Guest message handling failed")
         reply = GuestReply(
             text="❌ Something went wrong. Please try again.", mode="plain"
         )

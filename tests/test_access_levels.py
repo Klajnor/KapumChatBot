@@ -99,7 +99,7 @@ class TestAccessLevels(DBTest):
                 await s.register_user(USER, username="bob")
                 await s.add_allowed_user(USER)
                 await s.register_user(GUEST)
-            text, markup = await _render_list(OWNER, "u", 0)
+            _text, markup = await _render_list(OWNER, "u", 0)
             data = [b.callback_data for row in markup.inline_keyboard for b in row]
             self.assertIn(f"adm:u:{USER}", data)
             self.assertNotIn(f"adm:u:{GUEST}", data)

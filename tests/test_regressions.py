@@ -196,9 +196,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(guest, "UserService"),
             patch.object(guest, "_build_reply", AsyncMock(side_effect=asyncio.CancelledError)),
             patch.object(guest, "safe_answer_guest", AsyncMock()) as answer,
+            self.assertRaises(asyncio.CancelledError),
         ):
-            with self.assertRaises(asyncio.CancelledError):
-                await guest.handle_guest_message(message)
+            await guest.handle_guest_message(message)
         session.close.assert_awaited_once()
         answer.assert_not_awaited()
 
@@ -344,9 +344,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.ai_client, "close", AsyncMock()) as ai_close,
             patch.object(main.bot.session, "close", AsyncMock()) as bot_close,
             patch.object(main, "engine", SimpleNamespace(dispose=AsyncMock())) as db,
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                await main.main()
+            await main.main()
         ai_close.assert_awaited_once()
         bot_close.assert_awaited_once()
         db.dispose.assert_awaited_once()

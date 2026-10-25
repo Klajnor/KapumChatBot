@@ -8,8 +8,9 @@ import logging
 import re
 import shutil
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -1179,71 +1180,73 @@ class AIClient:
         chunk_size = 32_000
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(
+            async with (
+                aiohttp.ClientSession() as session,
+                session.ws_connect(
                     url, headers=headers, timeout=timeout,
-                ) as ws:
-                    # 1 — Configure session (Manual mode: the client decides
-                    # where a phrase ends, which suits a complete voice note).
+                ) as ws,
+            ):
+                # 1 — Configure session (Manual mode: the client decides
+                # where a phrase ends, which suits a complete voice note).
+                await ws.send_json({
+                    "type": "session.update",
+                    "session": {
+                        "turn_detection": None,
+                        "input_audio_format": "pcm16",
+                        "input_audio_sample_rate": 16000,
+                    },
+                })
+                await self._ws_recv(
+                    ws, expect={"session.created", "session.updated"}
+                )
+
+                # 2 — Stream the audio as base64 PCM16 chunks.
+                for offset in range(0, len(pcm16), chunk_size):
+                    chunk = pcm16[offset : offset + chunk_size]
                     await ws.send_json({
-                        "type": "session.update",
-                        "session": {
-                            "turn_detection": None,
-                            "input_audio_format": "pcm16",
-                            "input_audio_sample_rate": 16000,
-                        },
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode("ascii"),
                     })
-                    await self._ws_recv(
-                        ws, expect={"session.created", "session.updated"}
-                    )
 
-                    # 2 — Stream the audio as base64 PCM16 chunks.
-                    for offset in range(0, len(pcm16), chunk_size):
-                        chunk = pcm16[offset : offset + chunk_size]
-                        await ws.send_json({
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(chunk).decode("ascii"),
-                        })
+                # 3 — Commit + finish (Manual mode).
+                await ws.send_json({"type": "input_audio_buffer.commit"})
+                await ws.send_json({"type": "session.finish"})
 
-                    # 3 — Commit + finish (Manual mode).
-                    await ws.send_json({"type": "input_audio_buffer.commit"})
-                    await ws.send_json({"type": "session.finish"})
+                # 4 — Read responses until transcription or error.
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        event = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    evt_type = event.get("type", "")
 
-                    # 4 — Read responses until transcription or error.
-                    async for msg in ws:
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        try:
-                            event = json.loads(msg.data)
-                        except json.JSONDecodeError:
-                            continue
-                        evt_type = event.get("type", "")
+                    if evt_type == "error":
+                        err = event.get("error", {})
+                        logger.warning(
+                            "ASR WebSocket error: %s",
+                            str(err.get("message", ""))[:200],
+                        )
+                        return False, None
 
-                        if evt_type == "error":
-                            err = event.get("error", {})
-                            logger.warning(
-                                "ASR WebSocket error: %s",
-                                str(err.get("message", ""))[:200],
-                            )
-                            return False, None
+                    if evt_type == "conversation.item.input_audio_transcription.completed":
+                        transcript = event.get("transcript")
+                        if transcript is not None:
+                            transcript = str(transcript).strip()
+                        if not transcript:
+                            for part in event.get("content") or []:
+                                if isinstance(part, dict):
+                                    value = part.get("transcript", "")
+                                    if value:
+                                        transcript = str(value).strip()
+                                        break
+                        return True, transcript or None
 
-                        if evt_type == "conversation.item.input_audio_transcription.completed":
-                            transcript = event.get("transcript")
-                            if transcript is not None:
-                                transcript = str(transcript).strip()
-                            if not transcript:
-                                for part in event.get("content") or []:
-                                    if isinstance(part, dict):
-                                        value = part.get("transcript", "")
-                                        if value:
-                                            transcript = str(value).strip()
-                                            break
-                            return True, transcript or None
+                    if evt_type == "session.finished":
+                        break
 
-                        if evt_type == "session.finished":
-                            break
-
-                    return True, None  # session ended without a transcript
+                return True, None  # session ended without a transcript
 
         except (TimeoutError, aiohttp.ClientError) as exc:
             logger.warning("ASR WebSocket failed: %s", exc)
@@ -1370,7 +1373,7 @@ class AIClient:
             "parameters": parameters,
         }
 
-        status, data, elapsed = await self._post_chat(
+        status, data, _elapsed = await self._post_chat(
             payload,
             url=url,
             timeout=config.image_timeout,

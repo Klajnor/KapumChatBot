@@ -62,13 +62,7 @@ _SUBSCRIPTS = {
 
 # Periodic table, used to tell a chemical formula from an identifier.
 ELEMENT_SYMBOLS = frozenset(
-    """
-    H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni
-    Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I
-    Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt
-    Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr
-    Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og D T
-    """.split()
+    ["H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og", "D", "T"]
 )
 
 # LaTeX command → Unicode. Longest names first so ``\neq`` wins over ``\ne``.
@@ -120,13 +114,7 @@ _SYMBOLS: dict[str, str] = {
 # letter or digit, so ``\Delta G`` becomes ``ΔG`` (not ``Δ G``) and ``2\pi r``
 # becomes ``2πr``.
 _TIGHT_SYMBOLS = frozenset(
-    """
-    alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa
-    lambda mu nu xi pi varpi rho varrho sigma varsigma tau upsilon phi varphi
-    chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega
-    partial nabla infty hbar ell aleph Re Im degree celsius angstrom ohm mho
-    imath jmath angle sum prod int oint
-    """.split()
+    ["alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta", "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu", "xi", "pi", "varpi", "rho", "varrho", "sigma", "varsigma", "tau", "upsilon", "phi", "varphi", "chi", "psi", "omega", "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega", "partial", "nabla", "infty", "hbar", "ell", "aleph", "Re", "Im", "degree", "celsius", "angstrom", "ohm", "mho", "imath", "jmath", "angle", "sum", "prod", "int", "oint"]
 )
 
 _SYMBOL_NAMES = sorted(

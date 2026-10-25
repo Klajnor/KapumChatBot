@@ -199,8 +199,8 @@ async def _render_list(
 
     if not rows:
         return (
-            "📭 <b>No active reminders.</b>\n\n"
-            "Create one with /remind — the full format list is in /help.",
+            ("📭 <b>No active reminders.</b>\n\n"
+            "Create one with /remind — the full format list is in /help."),
             None,
         )
 

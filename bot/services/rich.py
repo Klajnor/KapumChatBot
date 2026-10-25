@@ -36,7 +36,7 @@ from bot.services.science import (  # internal helpers of the formula detector
     _MATH_MARKER_RE,
     _VARIABLE_RE,
 )
-from bot.services.telegram_utils import throttle, _retry_delay
+from bot.services.telegram_utils import _retry_delay, throttle
 
 logger = logging.getLogger(__name__)
 

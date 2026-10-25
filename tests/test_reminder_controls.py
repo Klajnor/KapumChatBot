@@ -84,7 +84,7 @@ class TestReminderControls(DBTest):
     def test_list_keyboard_and_owner_guard(self):
         async def go() -> None:
             rid = await self._add(OWNER, None, 30)
-            text, markup = await handler._render_list(OWNER)
+            _text, markup = await handler._render_list(OWNER)
             data = [b.callback_data for row in markup.inline_keyboard for b in row]
             self.assertIn(f"rem:tg:{OWNER}:{rid}:0", data)
             self.assertIn(f"rem:del:{OWNER}:{rid}:0", data)

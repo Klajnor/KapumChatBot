@@ -234,7 +234,7 @@ def _render_png(block: str) -> bytes | None:
             result = io.BytesIO()
             padded.save(result, format="PNG")
             return result.getvalue()
-    except Exception as exc:  # malformed or unsupported math must keep its text
+    except Exception as exc:  # noqa: BLE001 - malformed or unsupported math must keep its text
         logger.debug("Formula rendering fell back to text: %s", exc)
         return None
 
@@ -300,7 +300,7 @@ def _table_chunk_png(header: list[str], rows: list[list[str]]) -> bytes | None:
             artist = figure.text(0, 0, text, fontsize=11, fontweight=weight, va="center")
             try:
                 box = artist.get_window_extent(renderer)
-            except Exception:  # mathtext rejected the cell: fall back to plain text
+            except Exception:  # noqa: BLE001 - mathtext rejected the cell: fall back to plain text
                 artist.remove()
                 plain = _fit(_EMPHASIS.sub("", re.sub(r"[$\\{}]", "", cell)))
                 artist = figure.text(0, 0, plain, fontsize=11, fontweight=weight, va="center")
@@ -356,7 +356,7 @@ def _render_table(block: str) -> list[bytes] | None:
                 if png is None:
                     return None
                 images.append(png)
-    except Exception as exc:  # the caller keeps the text version
+    except Exception as exc:  # noqa: BLE001 - the caller keeps the text version
         logger.warning("Table rendering fell back to text: %s", exc)
         return None
     return images

@@ -218,11 +218,7 @@ def _parse_blocks(text: str) -> list[Any]:
             if not current_stripped:
                 break
             if paragraph and (
-                current_stripped.startswith("```")
-                or _HEADING_RE.match(current_stripped)
-                or _HR_RE.match(current)
-                or current_stripped.startswith(">")
-                or _LIST_RE.match(current)
+                current_stripped.startswith(("```", ">")) or _HEADING_RE.match(current_stripped) or _HR_RE.match(current) or _LIST_RE.match(current)
             ):
                 break
             paragraph.append(current_stripped)

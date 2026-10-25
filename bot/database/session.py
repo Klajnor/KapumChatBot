@@ -112,7 +112,7 @@ async def _add_missing_allowed_user_columns_sqlite(conn: Any) -> None:
                 await conn.execute(
                     text(f"ALTER TABLE allowed_users ADD COLUMN {column} VARCHAR(128)")
                 )
-        except Exception as exc:  # pragma: no cover - defensive, DB dependent
+        except Exception as exc:  # pragma: no cover - defensive, DB dependent  # noqa: BLE001
             import logging
 
             logging.getLogger(__name__).warning(
@@ -140,7 +140,7 @@ async def _add_missing_access_columns_sqlite(conn: Any) -> None:
                     await conn.execute(
                         text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
                     )
-            except Exception as exc:  # pragma: no cover - defensive, DB dependent
+            except Exception as exc:  # pragma: no cover - defensive, DB dependent  # noqa: BLE001
                 import logging
 
                 logging.getLogger(__name__).warning(
@@ -163,42 +163,42 @@ async def _run_migrations(conn: Any) -> None:
 
     statements = [
         # Guest free-trial counter on users.
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS guest_messages_used INTEGER NOT NULL DEFAULT 0",
+        ("ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS guest_messages_used INTEGER NOT NULL DEFAULT 0"),
         # Access levels: runtime admins, blocking, per-user daily limit.
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS granted_admin BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE users "
-        "ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE",
+        ("ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS granted_admin BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE"),
         # allowed_users table.
-        "CREATE TABLE IF NOT EXISTS allowed_users ("
+        ("CREATE TABLE IF NOT EXISTS allowed_users ("
         "telegram_id BIGINT NOT NULL PRIMARY KEY, "
         "added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
         "added_by BIGINT, "
         "username VARCHAR(128), "
         "first_name VARCHAR(128), "
-        "last_name VARCHAR(128))",
+        "last_name VARCHAR(128))"),
         # Cached Telegram profile on allowed_users (older installations).
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS username VARCHAR(128)",
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS first_name VARCHAR(128)",
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS last_name VARCHAR(128)",
         "ALTER TABLE allowed_users ADD COLUMN IF NOT EXISTS daily_limit INTEGER",
         # daily_usage table + index + unique constraint.
-        "CREATE TABLE IF NOT EXISTS daily_usage ("
+        ("CREATE TABLE IF NOT EXISTS daily_usage ("
         "id SERIAL PRIMARY KEY, "
         "telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE, "
         "date DATE NOT NULL, "
         "query_count INTEGER NOT NULL DEFAULT 0, "
-        "UNIQUE (telegram_id, date))",
-        "CREATE INDEX IF NOT EXISTS ix_daily_usage_telegram_id "
-        "ON daily_usage (telegram_id)",
+        "UNIQUE (telegram_id, date))"),
+        ("CREATE INDEX IF NOT EXISTS ix_daily_usage_telegram_id "
+        "ON daily_usage (telegram_id)"),
         # Conversation key on messages (needed for group/guest chats).
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id BIGINT",
         "CREATE INDEX IF NOT EXISTS ix_messages_chat_id ON messages (chat_id)",
         # Backfill existing rows: private-chat history was keyed by the user id.
         "UPDATE messages SET chat_id = user_id WHERE chat_id IS NULL",
         # reminders table (scheduled messages and AI requests).
-        "CREATE TABLE IF NOT EXISTS reminders ("
+        ("CREATE TABLE IF NOT EXISTS reminders ("
         "id SERIAL PRIMARY KEY, "
         "user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE, "
         "chat_id BIGINT NOT NULL, "
@@ -207,7 +207,7 @@ async def _run_migrations(conn: Any) -> None:
         "fire_at TIMESTAMPTZ NOT NULL, "
         "schedule VARCHAR(64), "
         "enabled BOOLEAN NOT NULL DEFAULT TRUE, "
-        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"),
         "CREATE INDEX IF NOT EXISTS ix_reminders_user_id ON reminders (user_id)",
         "CREATE INDEX IF NOT EXISTS ix_reminders_fire_at ON reminders (fire_at)",
     ]
@@ -216,7 +216,7 @@ async def _run_migrations(conn: Any) -> None:
         try:
             async with conn.begin_nested():
                 await conn.execute(text(statement))
-        except Exception as exc:  # pragma: no cover - defensive, DB dependent
+        except Exception as exc:  # pragma: no cover - defensive, DB dependent  # noqa: BLE001
             # Never abort startup because of an idempotent migration.
             import logging
 

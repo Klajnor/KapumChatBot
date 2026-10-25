@@ -25,6 +25,7 @@ from uuid import uuid4
 
 import aiohttp
 
+
 def mask(text: str) -> str:
     text = re.sub(r'("(?:access|auth)_token"\s*:\s*")[^"]*(")', r"\1***\2", text)
     # auth_url grants editing of the account's pages — a secret as well
@@ -60,7 +61,7 @@ async def _show(
                 return {"ok": False, "error": "not an object"}
             except json.JSONDecodeError:
                 return {"ok": False, "error": "non-JSON body (see above)"}
-    except asyncio.TimeoutError:
+    except TimeoutError:
         print(f"--- {label}: TIMEOUT (blocked or unreachable?)")
     except aiohttp.ClientConnectorSSLError as exc:
         print(f"--- {label}: TLS ERROR — handshake refused: {exc}")

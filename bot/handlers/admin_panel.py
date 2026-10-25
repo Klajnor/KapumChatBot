@@ -308,7 +308,7 @@ async def cb_admin(callback: CallbackQuery) -> None:
         if callback.message is not None and hasattr(callback.message, "delete"):
             try:
                 await callback.message.delete()
-            except Exception:  # noqa: BLE001 - an old message may be undeletable
+            except Exception:  # noqa: BLE001, S110 - an old message may be undeletable
                 pass
     elif action == "list":
         flt = parts[2] if len(parts) > 2 else "a"
@@ -356,8 +356,8 @@ async def _show_stats(callback: CallbackQuery) -> None:
     lines = [
         "📊 <b>Statistics</b>\n",
         f"Today: <b>{today_total}</b> queries",
-        f"14 days: <b>{sum(totals.values())}</b> queries, "
-        f"<b>{len(totals)}</b> active users\n",
+        (f"14 days: <b>{sum(totals.values())}</b> queries, "
+        f"<b>{len(totals)}</b> active users\n"),
     ]
     for i, (tid, total) in enumerate(
         sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:10], 1

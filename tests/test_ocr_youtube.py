@@ -84,9 +84,11 @@ class CaptionParsingTests(unittest.TestCase):
 
 class TranscriptFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_errors_become_user_messages(self):
-        with patch.object(youtube, "_load_transcript", side_effect=youtube.YouTubeError("no")):
-            with self.assertRaises(youtube.YouTubeError):
-                await youtube.fetch_transcript("dQw4w9WgXcQ")
+        with (
+            patch.object(youtube, "_load_transcript", side_effect=youtube.YouTubeError("no")),
+            self.assertRaises(youtube.YouTubeError),
+        ):
+            await youtube.fetch_transcript("dQw4w9WgXcQ")
 
     async def test_timeout(self):
         import time
@@ -94,9 +96,9 @@ class TranscriptFlowTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(youtube, "_load_transcript", lambda _id: time.sleep(0.3)),
             patch.object(config, "youtube_timeout", 0.05),
+            self.assertRaises(youtube.YouTubeError) as ctx,
         ):
-            with self.assertRaises(youtube.YouTubeError) as ctx:
-                await youtube.fetch_transcript("dQw4w9WgXcQ")
+            await youtube.fetch_transcript("dQw4w9WgXcQ")
         self.assertIn("too long", str(ctx.exception))
 
 
