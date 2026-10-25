@@ -31,7 +31,7 @@ from bot.bot import bot
 from bot.config import config
 from bot.database.repository import DigestRepository
 from bot.database.session import async_session_factory
-from bot.services.ai_client import ai_client
+from bot.services.ai_client import ChatResult, ai_client
 from bot.services.reminders import _send_html, _send_markdown, get_timezone
 from bot.services.rich import send_rich_to
 from bot.services.untrusted import apply_untrusted_hint, wrap_untrusted
@@ -240,6 +240,42 @@ def build_input(
     return wrap_untrusted("channel", "\n\n".join(parts))
 
 
+async def _ask(text: str, model: str, prompt: str) -> ChatResult:
+    """One summary request with the digest's system prompt."""
+    request = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text},
+    ]
+    apply_untrusted_hint(request)
+    return await ai_client.chat_completion_result(
+        request, model=model, temperature=0.3, max_tokens=config.digest_max_tokens
+    )
+
+
+async def run_test(samples: list, admin_id: int) -> ChannelReport:
+    """Summarise hand-picked messages (admin menu test) and send the result.
+
+    ``samples`` are objects with ``author``, ``created_at`` and ``text``. The
+    summary and the token statistics go to ``admin_id`` only; nothing is
+    stored, posted to a channel, or marked as digested.
+    """
+    model, prompt = await get_model(), await get_prompt()
+    report = ChannelReport(chat_id=0, title="Test", messages=len(samples), model=model)
+    text = build_input(samples, [], config.digest_max_input_chars)
+    result = await _ask(text, model, prompt)
+    report.input_tokens, report.output_tokens = result.input_tokens, result.output_tokens
+    if result.model:
+        report.model = result.model
+    if not result.content:
+        report.error = "the model returned no answer"
+        return report
+    report.posted = await _deliver(admin_id, f"🧪 **Тестовое саммари**\n\n{result.content}")
+    if not report.posted:
+        report.error = "could not send the summary"
+    await notify_admins(format_stats([report]), only=admin_id)
+    return report
+
+
 async def _deliver(chat_id: int, markdown: str) -> bool:
     """Post the summary as a rich message; HTML, then plain text, as fallbacks."""
     if await send_rich_to(bot, chat_id, markdown):
@@ -285,14 +321,7 @@ async def _digest_channel(
             messages, context, config.digest_max_input_chars, recent_only=report.recent_only
         )
 
-    request = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text},
-    ]
-    apply_untrusted_hint(request)
-    result = await ai_client.chat_completion_result(
-        request, model=model, temperature=0.3, max_tokens=config.digest_max_tokens
-    )
+    result = await _ask(text, model, prompt)
     report.input_tokens, report.output_tokens = result.input_tokens, result.output_tokens
     if result.model:
         report.model = result.model

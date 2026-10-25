@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime
 import html
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Router
@@ -59,6 +60,8 @@ _FILTERS = {  # key -> (button label, levels shown; None = all)
 # Per-admin menu state (in memory: a restart just closes the menu context).
 _view: dict[int, tuple[str, int]] = {}  # admin -> (list filter, page)
 _awaiting: dict[int, tuple[str, int | None]] = {}  # admin -> (kind, target id)
+# Digest test: admin -> messages collected so far and the status message to update.
+_test_state: dict[int, dict[str, Any]] = {}
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -295,6 +298,8 @@ async def cb_admin(callback: CallbackQuery) -> None:
     action = parts[1] if len(parts) > 1 else ""
     # Leaving an input prompt by pressing any other button cancels it.
     _awaiting.pop(actor, None)
+    if action != "dgqr":
+        _test_state.pop(actor, None)
 
     try:
         target = int(parts[2]) if len(parts) > 2 and action not in ("list",) else None
@@ -644,7 +649,7 @@ async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
         b.row(_button(f"📡 {label}", f"adm:dgc:{chat_id}"))
     b.row(_button("➕ Add channel", "adm:dga"), _button("▶️ Run now", "adm:dgrun"))
     b.row(_button("🤖 Model", "adm:dgm"), _button("✏️ Prompt", "adm:dgp"))
-    b.row(_button("🕒 Time", "adm:dgt"))
+    b.row(_button("🕒 Time", "adm:dgt"), _button("🧪 Test", "adm:dgq"))
     if custom:
         b.row(_button("♻️ Default prompt", "adm:dgd"))
     b.row(_button("🏠 Menu", "adm:home"))
@@ -731,6 +736,9 @@ async def _digest_action(
     elif action == "dgd":
         await digest.set_setting(digest.SETTING_PROMPT, None)
         await _digest_show(callback, "♻️ Prompt reset to the default.")
+    elif action in ("dgq", "dgqr"):
+        await _digest_test_action(callback, actor, action)
+        return
     elif action == "dgt":
         await _show_time(callback)
     elif action == "dgh":
@@ -828,3 +836,111 @@ async def _digest_input(message: Message, actor: int, kind: str, text: str) -> N
         notice += "\n⚠️ The bot is not an admin there yet — it will not see posts."
     screen, markup = await _digest_screen(notice)
     await message.answer(screen, reply_markup=markup)
+
+
+# --- Digest test: summarise messages sent to the bot ---------------------------------
+
+MAX_TEST_MESSAGES = 200
+
+
+def _test_markup(count: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(_button(f"▶️ Summarize ({count})", "adm:dgqr"))
+    b.row(_button("✖ Cancel", "adm:dg"))
+    return b.as_markup()
+
+
+def _test_text(count: int) -> str:
+    return (
+        "🧪 <b>Digest test</b>\n\n"
+        "Send or forward several messages from a conversation, then press "
+        "<b>Summarize</b>. The result comes back here with the current model and "
+        "prompt; nothing is stored or posted to a channel.\n\n"
+        f"Collected: <b>{count}</b> (up to {MAX_TEST_MESSAGES})"
+    )
+
+
+def _sample_author(message: Message) -> str:
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        return (
+            getattr(getattr(origin, "sender_user", None), "full_name", None)
+            or getattr(origin, "sender_user_name", None)
+            or getattr(chat, "title", None)
+            or ""
+        )
+    return message.from_user.full_name if message.from_user else ""
+
+
+def _collecting_test(message: Message) -> bool:
+    user = message.from_user
+    return (
+        user is not None
+        and user.id in _test_state
+        and message.chat.type == "private"
+        and config.is_admin(user.id)
+        and not (message.text or "").startswith("/")
+    )
+
+
+@router.message(_collecting_test)
+async def on_test_message(message: Message) -> None:
+    state = _test_state.get(message.from_user.id)
+    text = (message.text or message.caption or "").strip()
+    if state is None or not text or len(state["samples"]) >= MAX_TEST_MESSAGES:
+        return
+    origin = getattr(message, "forward_origin", None)
+    state["samples"].append(
+        SimpleNamespace(
+            author=_sample_author(message),
+            created_at=getattr(origin, "date", None) or message.date,
+            text=text,
+        )
+    )
+    status = state["status"]
+    try:
+        await status.edit_text(
+            _test_text(len(state["samples"])),
+            reply_markup=_test_markup(len(state["samples"])),
+        )
+    except Exception as exc:  # noqa: BLE001 - a lost counter update is harmless
+        logger.debug("Could not update the test counter: %s", exc)
+
+
+async def _digest_test_action(callback: CallbackQuery, actor: int, action: str) -> None:
+    message = callback.message
+    if message is None or message.chat.type != "private":
+        await safe_answer_callback(
+            callback, "The test works only in a private chat with the bot", show_alert=True
+        )
+        return
+    if action == "dgq":
+        _test_state[actor] = {"samples": [], "status": message}
+        await _show(callback, _test_text(0), _test_markup(0))
+        await safe_answer_callback(callback)
+        return
+
+    state = _test_state.get(actor)
+    if state is None or not state["samples"]:
+        await safe_answer_callback(callback, "Nothing collected yet", show_alert=True)
+        return
+    await safe_answer_callback(callback, "Summarizing…")
+    samples = state["samples"]
+    await _show(
+        callback,
+        f"⏳ <b>Summarizing {len(samples)} message(s)…</b>",
+        InlineKeyboardMarkup(inline_keyboard=[]),
+    )
+    _test_state.pop(actor, None)
+    try:
+        report = await digest.run_test(samples, actor)
+        notice = (
+            "🧪 Test done."
+            if report.posted
+            else f"⚠️ Test failed: {html.escape(report.error or 'unknown error')}"
+        )
+    except Exception:
+        logger.exception("Digest test failed")
+        notice = "❌ The test failed, see the log."
+    await _digest_show(callback, notice)
