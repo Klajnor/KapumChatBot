@@ -122,6 +122,34 @@ class TestDigest(DBTest):
 
         self._run(go)
 
+    def test_summary_goes_out_as_rich_message_first(self):
+        async def go() -> None:
+            with (
+                patch.object(digest, "send_rich_to", AsyncMock(return_value=True)) as rich,
+                patch.object(digest, "_send_markdown", AsyncMock()) as legacy,
+            ):
+                self.assertTrue(await digest._deliver(CHAT, "1. one\n2. two"))
+            rich.assert_awaited_once()
+            legacy.assert_not_awaited()
+
+            with (
+                patch.object(digest, "send_rich_to", AsyncMock(return_value=False)),
+                patch.object(digest, "_send_markdown", AsyncMock(return_value=True)) as legacy,
+            ):
+                self.assertTrue(await digest._deliver(CHAT, "text"))
+            legacy.assert_awaited_once()
+
+        self._run(go)
+
+    def test_html_lists_use_no_unsupported_tags(self):
+        from bot.services.markdown import render
+
+        html_text = render("1. one\n2. two\n\n- a\n- b", "html")
+        for tag in ("<ol", "<ul", "<li"):
+            self.assertNotIn(tag, html_text)
+        self.assertIn("1. one", html_text)
+        self.assertIn("\u2022 a", html_text)
+
     def test_channel_without_any_messages_is_skipped(self):
         async def go() -> None:
             await digest.add_channel(CHAT, "News", 1)

@@ -27,11 +27,13 @@ from dataclasses import dataclass, field
 
 from aiogram.exceptions import TelegramAPIError
 
+from bot.bot import bot
 from bot.config import config
 from bot.database.repository import DigestRepository
 from bot.database.session import async_session_factory
 from bot.services.ai_client import ai_client
 from bot.services.reminders import _send_html, _send_markdown, get_timezone
+from bot.services.rich import send_rich_to
 from bot.services.untrusted import apply_untrusted_hint, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -238,6 +240,13 @@ def build_input(
     return wrap_untrusted("channel", "\n\n".join(parts))
 
 
+async def _deliver(chat_id: int, markdown: str) -> bool:
+    """Post the summary as a rich message; HTML, then plain text, as fallbacks."""
+    if await send_rich_to(bot, chat_id, markdown):
+        return True
+    return await _send_markdown(chat_id, markdown)
+
+
 # --- One channel -------------------------------------------------------------------
 
 
@@ -294,7 +303,7 @@ async def _digest_channel(
     day = until.astimezone(get_timezone()).strftime("%d.%m.%Y")
     summary = f"📰 **Саммари за сутки · {day}**\n\n{result.content}"
     try:
-        report.posted = await _send_markdown(chat_id, summary)
+        report.posted = await _deliver(chat_id, summary)
         if not report.posted:
             report.error = "could not post the summary"
     except TelegramAPIError as exc:

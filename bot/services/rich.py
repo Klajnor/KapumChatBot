@@ -23,6 +23,7 @@ import asyncio
 import itertools
 import logging
 import re
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram.enums import ChatType
@@ -168,6 +169,24 @@ async def send_rich(
         rich = InputRichMessage(markdown=payload)
         markup = reply_markup if index == total else None
         if not await _send_one(message, rich, markup, extra):
+            return False
+    return True
+
+
+async def send_rich_to(bot: Any, chat_id: int, text: str) -> bool:
+    """Deliver Markdown as rich message(s) to a chat without a source message.
+
+    For scheduled posts (channel digest): no reply parameters, no keyboard.
+    Returns False when Telegram refuses, so the caller can fall back.
+    """
+    parts = split_rich(adapt_markdown(text))
+    if not parts:
+        return False
+    target = SimpleNamespace(chat=SimpleNamespace(id=chat_id), bot=bot)
+    total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        payload = f"Part {index}/{total}\n\n{part}" if total > 1 else part
+        if not await _send_one(target, InputRichMessage(markdown=payload), None, {}):
             return False
     return True
 

@@ -275,13 +275,15 @@ def render_html(text: str) -> str:
             body = _render_inline_html(_parse_inline(block[1]))
             parts.append(f"<blockquote>{body}</blockquote>")
         elif kind == "list":
+            # Telegram HTML has no <ul>/<ol>/<li>: a list is plain lines.
             ordered, items = block[1], block[2]
-            tag = "ol" if ordered else "ul"
-            rendered = "".join(
-                f"<li>{_render_inline_html(_parse_inline(item))}</li>"
-                for item in items
+            parts.append(
+                "\n".join(
+                    f"{f'{index}.' if ordered else '•'} "
+                    f"{_render_inline_html(_parse_inline(item))}"
+                    for index, item in enumerate(items, start=1)
+                )
             )
-            parts.append(f"<{tag}>{rendered}</{tag}>")
         elif kind == "hr":
             parts.append("──────────")
     return "\n\n".join(p for p in parts if p)
