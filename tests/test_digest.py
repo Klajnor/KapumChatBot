@@ -290,6 +290,38 @@ class TestDigest(DBTest):
         self.assertIn("boom", text)
         self.assertIn("already in progress", _run_notice(digest.DigestResult(skipped=True)))
 
+    def test_stats_name_the_channel_count_messages_and_show_the_period(self):
+        async def go() -> None:
+            await self._seed([30, 10, 2])
+            _, fake = self._fake_ai()
+            with (
+                patch.object(digest.ai_client, "chat_completion_result", fake),
+                patch.object(digest, "_send_markdown", AsyncMock(return_value=True)),
+                patch.object(digest, "send_rich_to", AsyncMock(return_value=True)),
+                patch.object(digest.config, "reminder_timezone", "UTC"),
+                patch.object(digest.config, "digest_context_messages", 0),
+            ):
+                report = await digest._digest_channel(CHAT, "News", NOW, "m", "p")
+                text = digest.format_stats([report])
+            self.assertEqual(report.messages, 2)  # the 30 h old post is outside the window
+            self.assertIn("News", text)
+            self.assertIn("2 msg", text)
+            self.assertIn("25.10.2026 08:00 → 25.10.2026 16:00", text)
+
+        self._run(go)
+
+    def test_test_request_is_labelled_as_such(self):
+        samples = [
+            SimpleNamespace(author="a", text="x", created_at=NOW),
+            SimpleNamespace(author="b", text="y", created_at=NOW + datetime.timedelta(hours=1)),
+        ]
+        report = digest.ChannelReport(0, "Test", 2, test=True, input_tokens=5, output_tokens=1)
+        report.first_at, report.last_at = digest._span(samples)
+        text = digest.format_stats([report])
+        self.assertIn("Test request", text)
+        self.assertIn("not a channel", text)
+        self.assertIn("2 msg", text)
+
     def test_stats_report_both_directions_and_total(self):
         reports = [
             digest.ChannelReport(CHAT, "News", 5, 2, 1200, 300, "m", True),

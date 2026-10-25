@@ -93,6 +93,9 @@ class ChannelReport:
     posted: bool = False
     error: str = ""
     recent_only: bool = False  # quiet period: summarised the latest stored messages
+    test: bool = False  # a hand-made test request, not a channel
+    first_at: datetime.datetime | None = None  # time of the oldest analysed message
+    last_at: datetime.datetime | None = None  # time of the newest analysed message
 
 
 @dataclass(slots=True)
@@ -381,7 +384,10 @@ async def run_test(samples: list, admin_id: int) -> ChannelReport:
     stored, posted to a channel, or marked as digested.
     """
     model, prompt = await get_model(), await get_prompt()
-    report = ChannelReport(chat_id=0, title="Test", messages=len(samples), model=model)
+    report = ChannelReport(
+        chat_id=0, title="Test", messages=len(samples), model=model, test=True
+    )
+    report.first_at, report.last_at = _span(samples)
     text = build_input(samples, [], config.digest_max_input_chars)
     result = await _ask(text, model, prompt)
     report.input_tokens, report.output_tokens = result.input_tokens, result.output_tokens
@@ -444,6 +450,7 @@ async def _digest_channel(
             return report
         # Detach the rows before the (slow) model call.
         report.messages, report.context = len(messages), len(context)
+        report.first_at, report.last_at = _span(context, messages)
         text = build_input(
             messages, context, config.digest_max_input_chars, recent_only=report.recent_only
         )
@@ -485,14 +492,33 @@ def format_tokens(value: int | None) -> str:
     return "n/a" if value is None else f"{value:,}".replace(",", " ")
 
 
+def _span(*groups: list) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    """Oldest and newest ``created_at`` over message lists (UTC), if any."""
+    times = [_utc(m.created_at) for group in groups for m in group]
+    return (min(times), max(times)) if times else (None, None)
+
+
+def _stamp(value: datetime.datetime | None) -> str:
+    if value is None:
+        return "?"
+    return _utc(value).astimezone(get_timezone()).strftime("%d.%m.%Y %H:%M")
+
+
+NL = "\n"
+
+
 def format_stats(reports: list[ChannelReport]) -> str:
     """Admin message: token usage per channel plus the total."""
     lines = ["📰 <b>Digest — token statistics</b>\n"]
     total_in = total_out = 0
     for r in reports:
-        name = f"<b>{html.escape(r.title or str(r.chat_id))}</b>"
+        name = (
+            "🧪 <b>Test request</b> (not a channel)"
+            if r.test
+            else f"📡 <b>{html.escape(r.title or str(r.chat_id))}</b>"
+        )
         if r.error and not r.input_tokens and not r.output_tokens:
-            lines.append(f"• {name}: ⚠️ {html.escape(r.error)}")
+            lines.append(f"{name}{NL}   ⚠️ {html.escape(r.error)}")
             continue
         total_in += r.input_tokens or 0
         total_out += r.output_tokens or 0
@@ -500,9 +526,13 @@ def format_stats(reports: list[ChannelReport]) -> str:
         context = f" (+{r.context} context)" if r.context else ""
         if r.recent_only:
             context = " (no new, latest)"
+        period = (
+            f"{NL}   🕒 {_stamp(r.first_at)} → {_stamp(r.last_at)}" if r.first_at else ""
+        )
         lines.append(
-            f"• {name}: {r.messages} msg{context} · "
-            f"↑ {format_tokens(r.input_tokens)} ↓ {format_tokens(r.output_tokens)} tok · "
+            f"{name}{NL}"
+            f"   📨 {r.messages} msg{context}{period}{NL}"
+            f"   ↑ {format_tokens(r.input_tokens)} ↓ {format_tokens(r.output_tokens)} tok · "
             f"<code>{html.escape(r.model)}</code>{mark}"
         )
     if len([r for r in reports if r.input_tokens or r.output_tokens]) > 1:
