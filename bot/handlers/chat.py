@@ -21,6 +21,7 @@ from aiogram.types import (
 from bot.bot import get_bot_id, get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
+from bot.handlers.reminders import maybe_freeform_reminder
 from bot.keyboards.inline import (
     get_answer_keyboard,
     get_enhance_choice_keyboard,
@@ -1429,6 +1430,13 @@ async def handle_text(message: Message) -> None:
 
     text = strip_bot_mention(message.text)
     if not text:
+        return
+
+    # Free-form reminder requests («напомни завтра позвонить маме») are
+    # intercepted before the message becomes a chat question: reminder
+    # creation is free (see /remind) and must not spend a daily question.
+    # Returns True only when the message was clearly a reminder request.
+    if await maybe_freeform_reminder(message, text):
         return
 
     # A question sent as a reply to a photo analyzes (or regenerates from)

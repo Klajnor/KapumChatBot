@@ -820,6 +820,13 @@ class Config:
     reminder_ai_enabled: bool = field(
         default_factory=lambda: _env_bool("REMINDER_AI_ENABLED", True)
     )
+    # Free-form reminder requests in ordinary chat text ("напомни завтра
+    # позвонить маме") are detected with one small AI intent call and turned
+    # into a regular /remind reminder (services/reminder_intent.py); the rest
+    # of the chat flow is unaffected and guests never reach the detection.
+    reminder_freeform: bool = field(
+        default_factory=lambda: _env_bool("REMINDER_FREEFORM", True)
+    )
     # IANA timezone used to interpret "at 15:30" / "daily at 9:00" and to
     # display fire times (Linux: system tzdata; Windows: the tzdata package).
     reminder_timezone: str = field(

@@ -27,6 +27,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.config import config
 from bot.database.models import Reminder
 from bot.services.access import check_access
+from bot.services.reminder_intent import extract_freeform, looks_like_reminder
 from bot.services.reminders import (
     ParsedReminder,
     describe_schedule,
@@ -39,7 +40,7 @@ from bot.services.telegram_utils import (
     safe_answer_callback,
     safe_edit_text,
 )
-from bot.services.user_service import user_service
+from bot.services.user_service import UserService, user_service
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -96,6 +97,41 @@ def _confirmation(reminder_id: int, parsed: ParsedReminder) -> str:
     return "\n".join(lines)
 
 
+async def create_reminder_record(
+    service: UserService,
+    user_id: int,
+    chat_id: int,
+    parsed: ParsedReminder,
+) -> tuple[int | None, str | None]:
+    """Insert a reminder honouring the per-user cap (capture race-safe).
+
+    Returns ``(reminder_id, None)`` on success or ``(None, error)`` when the
+    one-time / recurring limit of the user is exhausted. Shared by
+    ``/remind`` and free-form reminder requests.
+    """
+    recurring = parsed.schedule is not None
+    limit = config.reminder_recurring_limit if recurring else config.reminder_limit
+    async with _create_lock(user_id):
+        count = await service.count_reminders(user_id, recurring=recurring)
+        if count >= limit:
+            kind = "Recurring reminders" if recurring else "Reminders"
+            return None, (
+                f"⚠️ <b>Limit reached:</b> {kind} {count}/{limit}.\n\n"
+                "Delete some first — see /reminders and /delreminder."
+            )
+        created = await service.add_reminder(
+            Reminder(
+                user_id=user_id,
+                chat_id=chat_id,
+                text=parsed.text,
+                ai_mode=parsed.ai_mode,
+                fire_at=parsed.fire_at,
+                schedule=parsed.schedule,
+            )
+        )
+        return created.id, None
+
+
 @router.message(Command("remind"))
 async def cmd_remind(message: Message) -> None:
     """Create a one-time or recurring reminder (optionally an AI request)."""
@@ -141,34 +177,71 @@ async def cmd_remind(message: Message) -> None:
             )
             return
 
-        recurring = parsed.schedule is not None
-        limit = (
-            config.reminder_recurring_limit if recurring else config.reminder_limit
+        reminder_id, error = await create_reminder_record(
+            service, user.id, message.chat.id, parsed
         )
-        async with _create_lock(user.id):
-            count = await service.count_reminders(user.id, recurring=recurring)
-            if count >= limit:
-                kind = "Recurring reminders" if recurring else "Reminders"
-                await safe_answer(
-                    message,
-                    f"⚠️ <b>Limit reached:</b> {kind} {count}/{limit}.\n\n"
-                    "Delete some first — see /reminders and /delreminder.",
-                )
-                return
-
-            created = await service.add_reminder(
-                Reminder(
-                    user_id=user.id,
-                    chat_id=message.chat.id,
-                    text=parsed.text,
-                    ai_mode=parsed.ai_mode,
-                    fire_at=parsed.fire_at,
-                    schedule=parsed.schedule,
-                )
-            )
-            reminder_id = created.id
+        if error is not None:
+            await safe_answer(message, error)
+            return
 
     await safe_answer(message, _confirmation(reminder_id, parsed))
+
+
+async def maybe_freeform_reminder(message: Message, text: str) -> bool:
+    """Catch free-form reminder requests inside ordinary text («напомни…»).
+
+    Called from the chat flow before the message becomes a chat question.
+    Returns ``True`` when the message was fully handled as a reminder request
+    (a reminder was created, or a friendly error was sent) and the caller
+    must not answer it again. Creation is free (see ``/remind``), does not
+    consume the daily quota, and is offered only to non-guest users.
+    """
+    user = message.from_user
+    if user is None:
+        return False
+    if not config.enable_reminders or not config.reminder_freeform:
+        return False
+    # Layer 1: the cheap pre-filter. Messages without any reminder-like word
+    # continue as chat without paying for detection.
+    if not looks_like_reminder(text):
+        return False
+
+    async with user_service() as service:
+        await service.register_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+        # Reminder creation is free (nothing is consumed), but it is an
+        # authorized-only feature; guests get the normal chat answer instead.
+        access = await check_access(
+            service, user.id, consume=False, require_quota=False
+        )
+        if not access.allowed or access.role == "guest":
+            return False
+        settings = await service.get_user_settings(user.id)
+
+    # Layer 2: one small AI call converts the request into a /remind slot;
+    # layer 3 inside the service re-validates it with the plain regexes.
+    outcome = await extract_freeform(text, settings["model"])
+    if outcome is None:
+        # Not a reminder request (or detection failed): answer as chat.
+        return False
+
+    if isinstance(outcome, str):
+        await safe_answer(message, outcome)
+        return True
+
+    async with user_service() as service:
+        reminder_id, error = await create_reminder_record(
+            service, user.id, message.chat.id, outcome
+        )
+    if error is not None:
+        await safe_answer(message, error)
+        return True
+    await safe_answer(message, _confirmation(reminder_id, outcome))
+    return True
 
 
 PER_PAGE = 6
