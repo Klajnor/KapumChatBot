@@ -965,27 +965,67 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
             ["https://a.test/a", "https://a.test/b", "https://other.test/x"],
         )
 
-    async def test_link_expansion_follows_page_links(self):
+    async def test_link_expansion_follows_links_three_levels(self):
         message = SimpleNamespace(chat=SimpleNamespace(id=1))
-        root = documents.FetchedPage(
-            url="https://a.test/", title="Root", text="Root body",
-            links=["https://a.test/child"],
-        )
-        child = documents.FetchedPage(
-            url="https://a.test/child", title="Child", text="Child body"
-        )
-        fetch = AsyncMock(side_effect=[root, child])
+
+        def page(name, links=()):
+            return documents.FetchedPage(
+                url=f"https://a.test/{name}", title=name.upper(),
+                text=f"{name} body", links=[f"https://a.test/{n}" for n in links],
+            )
+
+        pages = {
+            "https://a.test/": page("", ["l1"]),
+            "https://a.test/l1": page("l1", ["l2"]),
+            "https://a.test/l2": page("l2", ["l3"]),
+            "https://a.test/l3": page("l3", ["l4"]),
+            "https://a.test/l4": page("l4"),
+        }
+
+        async def fetch(url, with_links=False):
+            return pages.get(url)
+
         with (
-            patch.object(config, "link_crawl_pages", 3),
+            patch.object(config, "link_crawl_depth", 3),
+            patch.object(config, "link_crawl_max_chars", 20_000),
             patch.object(chat, "fetch_url_text", fetch),
             patch.object(chat, "safe_answer", AsyncMock()),
         ):
             expanded = await chat._expand_links_with_content(
                 message, "https://a.test/"
             )
-        self.assertIn("Root body", expanded)
-        self.assertIn("[Linked page: https://a.test/child]", expanded)
-        self.assertIn("Child body", expanded)
+        for name in ("l1", "l2", "l3"):
+            self.assertIn(f"{name} body", expanded)
+        self.assertIn("(found on https://a.test/l2)", expanded)
+        self.assertNotIn("l4 body", expanded)  # depth 4 is not followed
+
+    async def test_crawl_stops_at_size_limit_and_reports(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        root = documents.FetchedPage(
+            url="https://a.test/", title="", text="root",
+            links=[f"https://a.test/{i}" for i in range(6)],
+        )
+
+        async def fetch(url, with_links=False):
+            if url == "https://a.test/":
+                return root
+            return documents.FetchedPage(url=url, title="", text="x" * 1000)
+
+        answer = AsyncMock()
+        with (
+            patch.object(config, "link_crawl_depth", 3),
+            patch.object(config, "link_crawl_max_chars", 2500),
+            patch.object(chat, "fetch_url_text", fetch),
+            patch.object(chat, "safe_answer", answer),
+        ):
+            notes: list[str] = []
+            blocks, _, _ = await chat.read_links(
+                "https://a.test/", notes=notes
+            )
+        # root + 2 full pages + 1 truncated to the remaining 500 chars.
+        self.assertEqual(len(blocks), 4)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Прочитано 3 страниц из 6", notes[0])
 
     def test_document_context_includes_link_blocks(self):
         composed = chat._compose_document_context(

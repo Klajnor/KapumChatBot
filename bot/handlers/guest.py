@@ -249,6 +249,7 @@ async def _build_reply(
     # Same for an attached (or replied-to) document: reject an unsupported or
     # oversized file before it costs a free message.
     document = _document_of(message) if config.enable_document_analysis else None
+    crawl_notes: list[str] = []
     file_type = None
     if document is not None:
         file_type = detect_file_type(document.file_name, document.mime_type)
@@ -296,7 +297,9 @@ async def _build_reply(
             )
         link_blocks: list[str] = []
         if config.enable_link_analysis and text:
-            link_blocks, remainder, _ = await read_links(text, require_short=False)
+            link_blocks, remainder, _ = await read_links(
+                text, require_short=False, notes=crawl_notes
+            )
             if link_blocks:
                 text = remainder
         text = _compose_document_context(
@@ -304,7 +307,7 @@ async def _build_reply(
         )
     elif config.enable_link_analysis and text:
         # A summons that is essentially bare links reads those pages.
-        link_blocks, remainder, videos = await read_links(text)
+        link_blocks, remainder, videos = await read_links(text, notes=crawl_notes)
         if link_blocks:
             request = remainder or (
                 DEFAULT_VIDEO_PROMPT if videos == len(link_blocks) else DEFAULT_LINK_PROMPT
@@ -522,7 +525,10 @@ async def _build_reply(
     telegraph_reply = await _maybe_telegraph_reply(text, result.content, footer)
     if telegraph_reply is not None:
         return telegraph_reply
-    return GuestReply(text=with_timing(result.content + _guest_hint(access), footer))
+    tail = "".join(f"\n\n{note}" for note in crawl_notes)
+    return GuestReply(
+        text=with_timing(result.content + tail + _guest_hint(access), footer)
+    )
 
 
 # --- Handler ---------------------------------------------------------------

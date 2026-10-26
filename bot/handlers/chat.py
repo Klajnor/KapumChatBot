@@ -344,6 +344,9 @@ _MAX_LINKS_PER_MESSAGE = 2
 # A message with more non-URL text than this is a discussion that merely
 # contains links, not a "read this" request — fetch nothing, pollute nothing.
 _LINK_REMAINDER_LIMIT = 300
+# Crawl: pages fetched concurrently, and the smallest text chunk worth adding.
+_CRAWL_BATCH = 5
+_CRAWL_MIN_CHUNK = 300
 
 
 def _clean_url(candidate: str) -> str:
@@ -404,15 +407,19 @@ async def read_links(
     notify: Any = None,
     *,
     require_short: bool = True,
+    notes: list[str] | None = None,
 ) -> tuple[list[str], str, int]:
     """Fetch the pages linked in ``text``: ``(blocks, remainder, videos)``.
 
     ``blocks`` are untrusted-wrapped page bodies (YouTube links give
     transcripts); ``remainder`` is the text without the URLs, i.e. the user's
-    own question. Pages reached from a linked page (one level deep, at most
-    ``LINK_CRAWL_PAGES`` per message) follow their parent. ``notify`` is an
-    optional ``async (str)`` for progress notes. With ``require_short`` a
-    message that is mostly prose yields nothing: it merely mentions links.
+    own question. Links found on a page are followed breadth-first up to
+    ``LINK_CRAWL_DEPTH`` levels; the crawl is bounded by a total text budget
+    (``LINK_CRAWL_MAX_CHARS``) and a fetch cap, and stops with a note when a
+    limit is reached. ``notify`` is an optional ``async (str)`` for progress
+    notes; the final crawl note is also appended to ``notes`` (for callers
+    that cannot send several messages). With ``require_short`` a message that
+    is mostly prose yields nothing: it merely mentions links.
     """
     urls = _find_urls(text)
     remainder = _URL_RE.sub(" ", text).strip()
@@ -430,8 +437,24 @@ async def read_links(
     blocks: list[str] = []
     videos = 0
     seen = set(urls)
-    crawl_left = config.link_crawl_pages
-    crawled = 0
+    max_depth = config.link_crawl_depth
+    # Crawl state shared by all links of the message.
+    budget = config.link_crawl_max_chars
+    fetches = 0
+    read = 0
+    found = 0
+    limited = False
+
+    def discover(parent: FetchedPage) -> list[tuple[str, str]]:
+        nonlocal found
+        fresh = [
+            (link, parent.url) for link in parent.links
+            if link not in seen and youtube_video_id(link) is None
+        ]
+        seen.update(link for link, _ in fresh)
+        found += len(fresh)
+        return fresh
+
     for url in urls:
         video_id = youtube_video_id(url) if config.enable_youtube else None
         if video_id is not None:
@@ -445,7 +468,7 @@ async def read_links(
                 wrap_untrusted("web", f"{describe(transcript)}\n\n{transcript.text}")
             )
             continue
-        page = await fetch_url_text(url, with_links=crawl_left > 0)
+        page = await fetch_url_text(url, with_links=max_depth > 0)
         if page is None:
             continue
         header = f"[Web page: {page.url}]"
@@ -453,31 +476,54 @@ async def read_links(
             header += f"\nTitle: {page.title}"
         blocks.append(wrap_untrusted("web", f"{header}\n\n{page.text}"))
 
-        # One level deeper: the pages this page links to.
-        children = [
-            link for link in page.links
-            if link not in seen and youtube_video_id(link) is None
-        ][:crawl_left]
-        if not children:
-            continue
-        seen.update(children)
-        crawl_left -= len(children)
-        sub_limit = max(2000, config.max_extracted_chars // 3)
-        subpages = await asyncio.gather(
-            *(fetch_url_text(child) for child in children), return_exceptions=True
+        frontier = discover(page) if max_depth > 0 and not limited else []
+        for depth in range(1, max_depth + 1):
+            if not frontier or limited:
+                break
+            deeper: list[tuple[str, str]] = []
+            for start in range(0, len(frontier), _CRAWL_BATCH):
+                batch = frontier[start:start + _CRAWL_BATCH]
+                if fetches + len(batch) > config.link_crawl_max_fetches:
+                    limited = True
+                    break
+                fetches += len(batch)
+                pages = await asyncio.gather(
+                    *(
+                        fetch_url_text(link, with_links=depth < max_depth)
+                        for link, _ in batch
+                    ),
+                    return_exceptions=True,
+                )
+                for (_, parent_url), child in zip(batch, pages, strict=True):
+                    if not isinstance(child, FetchedPage):
+                        continue
+                    if budget < _CRAWL_MIN_CHUNK:
+                        limited = True
+                        break
+                    body = child.text[:budget]
+                    budget -= len(body)
+                    read += 1
+                    sub_header = f"[Linked page: {child.url}]\n(found on {parent_url})"
+                    if child.title:
+                        sub_header += f"\nTitle: {child.title}"
+                    blocks.append(wrap_untrusted("web", f"{sub_header}\n\n{body}"))
+                    if depth < max_depth:
+                        deeper.extend(discover(child))
+                if limited:
+                    break
+            frontier = deeper
+        if limited:
+            break
+    if limited:
+        note = (
+            f"ℹ️ Прочитано {read} страниц из {found}, дальше уперся в лимит "
+            f"({config.link_crawl_max_chars // 1000} тыс. символов на обход)."
         )
-        for child in subpages:
-            if not isinstance(child, FetchedPage):
-                continue
-            crawled += 1
-            sub_header = f"[Linked page: {child.url}]\n(found on {page.url})"
-            if child.title:
-                sub_header += f"\nTitle: {child.title}"
-            blocks.append(
-                wrap_untrusted("web", f"{sub_header}\n\n{child.text[:sub_limit]}")
-            )
-    if crawled:
-        await say(f"🔗 Also read <b>{crawled}</b> page(s) linked from there.")
+        await say(note)
+        if notes is not None:
+            notes.append(note)
+    elif read:
+        await say(f"🔗 Also read <b>{read}</b> page(s) linked from there.")
     return blocks, remainder, videos
 
 
