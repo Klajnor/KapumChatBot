@@ -1000,7 +1000,6 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("l4 body", expanded)  # depth 4 is not followed
 
     async def test_crawl_stops_at_size_limit_and_reports(self):
-        message = SimpleNamespace(chat=SimpleNamespace(id=1))
         root = documents.FetchedPage(
             url="https://a.test/", title="", text="root",
             links=[f"https://a.test/{i}" for i in range(6)],
