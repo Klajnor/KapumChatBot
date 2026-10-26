@@ -35,7 +35,7 @@ from aiogram.exceptions import (
 
 from bot.bot import bot
 from bot.config import config
-from bot.database.repository import ReminderRepository
+from bot.database.repository import ReminderRepository, UserRepository
 from bot.database.session import async_session_factory
 from bot.services.access import check_access
 from bot.services.ai_client import ai_client
@@ -95,9 +95,15 @@ class ParsedReminder:
     ai_mode: bool = False
 
 
-def get_timezone() -> datetime.tzinfo:
-    """The configured display/schedule timezone (UTC when unavailable)."""
-    name = (config.reminder_timezone or "UTC").strip()
+def get_timezone(name: str | None = None) -> datetime.tzinfo:
+    """Resolve an IANA zone name (validated) or fall back to UTC.
+
+    ``name=None`` selects the global ``REMINDER_TIMEZONE`` default; users
+    override it individually with ``/timezone`` (stored in the DB).
+    """
+    name = (name or "").strip()
+    if not name:
+        name = (config.reminder_timezone or "").strip()
     if not name or name.upper() == "UTC":
         return datetime.UTC
     try:
@@ -149,9 +155,9 @@ def _next_weekly(
     return candidate.astimezone(datetime.UTC)
 
 
-def remind_usage() -> str:
+def remind_usage(user_tz_name: str | None = None) -> str:
     """The /remind help text (also the error for an empty argument)."""
-    tz = config.reminder_timezone or "UTC"
+    tz = user_tz_name or config.reminder_timezone or "UTC"
     return (
         "⏰ <b>Set a reminder</b> — <code>/remind &lt;when&gt; &lt;text&gt;</code>\n\n"
         "<b>One-time:</b>\n"
@@ -176,14 +182,18 @@ def remind_usage() -> str:
 
 
 def parse_reminder(
-    argument: str, now: datetime.datetime | None = None
+    argument: str,
+    now: datetime.datetime | None = None,
+    tz: datetime.tzinfo | None = None,
 ) -> ParsedReminder | str:
     """Parse the text after ``/remind``.
 
+    ``tz`` overrides the display timezone (the user's personal zone chosen
+    with ``/timezone``); by default the global ``REMINDER_TIMEZONE`` applies.
     Returns a :class:`ParsedReminder`, or a user-facing HTML error string.
     """
     now = now or datetime.datetime.now(datetime.UTC)
-    tz = get_timezone()
+    tz = tz or get_timezone()
     spec = argument.strip()
     if not spec:
         return remind_usage()
@@ -267,14 +277,21 @@ def parse_reminder(
 
 
 def next_occurrence(
-    schedule: str, previous_fire: datetime.datetime, now: datetime.datetime
+    schedule: str,
+    previous_fire: datetime.datetime,
+    now: datetime.datetime,
+    tz: datetime.tzinfo | None = None,
 ) -> datetime.datetime | None:
     """When a recurring reminder should fire next; None on a broken schedule.
 
     Interval schedules advance from ``previous_fire`` (no drift); fires missed
     while the bot was down are skipped, not queued. Wall-clock schedules
-    (daily/weekly) simply take the next matching local time after ``now``.
+    (daily/weekly) simply take the next matching local time after ``now`` —
+    computed in ``tz`` (the reminder owner's personal zone when they have one,
+    ``REMINDER_TIMEZONE`` otherwise; wall-clock schedules fire at the same
+    local hour for their owner).
     """
+    tz = tz or get_timezone()
     if previous_fire.tzinfo is None:
         # SQLite hands back naive datetimes; stored times are always UTC.
         previous_fire = previous_fire.replace(tzinfo=datetime.UTC)
@@ -367,9 +384,22 @@ async def process_due() -> list[DueReminder]:
     claimed: list[DueReminder] = []
     async with async_session_factory() as session:
         repo = ReminderRepository(session)
-        for reminder in await repo.get_due(now):
+        user_repo = UserRepository(session)
+        due_all = await repo.get_due(now)
+        # One query per tick (not per reminder) for owners' personal zones.
+        personal_tz = await user_repo.get_reminder_timezones(
+            [r.user_id for r in due_all]
+        )
+        tz_cache: dict[int, datetime.tzinfo] = {}
+        for reminder in due_all:
+            tz = tz_cache.get(reminder.user_id)
+            if tz is None:
+                tz = get_timezone(personal_tz.get(reminder.user_id))
+                tz_cache[reminder.user_id] = tz
             if reminder.schedule:
-                next_fire = next_occurrence(reminder.schedule, reminder.fire_at, now)
+                next_fire = next_occurrence(
+                    reminder.schedule, reminder.fire_at, now, tz=tz
+                )
                 if next_fire is None:
                     # A broken schedule would fire forever — stop it for good.
                     await repo.delete_by_id(reminder.id)

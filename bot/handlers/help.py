@@ -30,6 +30,7 @@ _CHAT_SECTION = (
     "• /remind &lt;when&gt; &lt;text&gt; — reminder or scheduled AI request\n"
     "• /reminders — list your reminders\n"
     "• /delreminder &lt;N|all&gt; — delete a reminder\n"
+    "• /timezone &lt;Area/City&gt; — your reminder time zone (/timezone without arguments asks in a dialog)\n"
     "• /export — save this conversation as Markdown or PDF (sent to DM)\n"
     "• /persona — choose an AI personality (preset system prompt)\n"
     "• /prompt — view the current system prompt (private chat only)\n"
@@ -45,6 +46,7 @@ _TIPS = (
     "• Switch models with /models (models marked 🖼️ support images)\n"
     "• Ask to draw something and I'll reply with a generated image\n"
     "• <code>/remind daily at 9:00 ai: …</code> — a scheduled request to the AI\n"
+    "• Say «напомни завтра в 5 позвонить маме» — reminders work in plain words too, and /timezone puts their clock in your zone\n"
     "• Use /clear to start a fresh conversation\n"
     "• In groups, mention me or reply to my message to get an answer"
 )

@@ -72,6 +72,15 @@ class UserService:
         await self.user_repo.update_system_prompt(telegram_id, prompt)
         await self.session.commit()
 
+    async def get_reminder_timezone(self, telegram_id: int) -> str | None:
+        """Personal reminders IANA zone of the user; ``None`` = global."""
+        return await self.user_repo.get_reminder_timezone(telegram_id)
+
+    async def set_reminder_timezone(self, telegram_id: int, name: str | None) -> None:
+        """Persist (or reset with ``None``) the personal reminders zone."""
+        await self.user_repo.set_reminder_timezone(telegram_id, name)
+        await self.session.commit()
+
     # --- History -----------------------------------------------------------
 
     async def add_message(

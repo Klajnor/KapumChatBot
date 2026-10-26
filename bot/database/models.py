@@ -39,6 +39,9 @@ class User(Base):
     # ADMIN_IDS (owners); ``granted_admin`` is an admin promoted at runtime.
     granted_admin: Mapped[bool] = mapped_column(default=False, server_default=false())
     blocked: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # Personal reminders timezone: IANA name. NULL means "use the global
+    # REMINDER_TIMEZONE". Set with /timezone.
+    reminder_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Relationships
     settings: Mapped[UserSettings | None] = relationship(

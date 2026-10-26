@@ -127,7 +127,10 @@ def _could_not_parse_time() -> str:
 
 
 async def extract_freeform(
-    text: str, model: str, now: datetime.datetime | None = None
+    text: str,
+    model: str,
+    now: datetime.datetime | None = None,
+    tz: datetime.tzinfo | None = None,
 ) -> ParsedReminder | str | None:
     """Turn a free-form message into a reminder, or decide it is not one.
 
@@ -136,9 +139,13 @@ async def extract_freeform(
     the recognised time failed validation, and ``None`` when the message is
     not a reminder request (including all AI and parsing failures — the
     caller should continue the chat flow).
+
+    ``tz`` is the reminder owner's zone (personal ``/timezone`` override or
+    the global ``REMINDER_TIMEZONE``): relative phrases like «завтра» are
+    interpreted against it, and the created reminder follows it.
     """
     now = now or datetime.datetime.now(datetime.UTC)
-    tz = get_timezone()
+    tz = tz or get_timezone()
     local_now = now.astimezone(tz)
     context = (
         f"Current local time in the {tz} timezone: "
@@ -170,7 +177,7 @@ async def extract_freeform(
     # including the recurring intervals floor, the ~10-year ceiling and the
     # "ai:" prefix handling.
     parsed = parse_reminder(
-        f"{spec} {answer.text.strip()}".strip(), now=now
+        f"{spec} {answer.text.strip()}".strip(), now=now, tz=tz
     )
     if isinstance(parsed, str):
         # The model invented a time we cannot represent; rephrase politely.

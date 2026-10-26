@@ -95,6 +95,32 @@ class UserRepository:
         """Get user by Telegram ID."""
         return await self.session.get(User, telegram_id)
 
+    async def get_reminder_timezone(self, telegram_id: int) -> str | None:
+        """Personal reminders IANA zone; ``None`` = use REMINDER_TIMEZONE."""
+        user = await self.session.get(User, telegram_id)
+        return user.reminder_timezone if user is not None else None
+
+    async def set_reminder_timezone(self, telegram_id: int, name: str | None) -> None:
+        """Store (or reset with ``None``) the personal reminders time zone."""
+        user = await self.session.get(User, telegram_id)
+        if user is None:
+            return
+        user.reminder_timezone = name
+
+    async def get_reminder_timezones(
+        self, telegram_ids: list[int]
+    ) -> dict[int, str]:
+        """Personal zones for several users at once; users without an
+        override are simply missing from the result."""
+        if not telegram_ids:
+            return {}
+        rows = await self.session.execute(
+            select(User.telegram_id, User.reminder_timezone).where(
+                User.telegram_id.in_(telegram_ids)
+            )
+        )
+        return {int(tid): str(tz) for tid, tz in rows.all() if tz}
+
     async def find_user_by_username(self, username: str) -> User | None:
         """Find a registered user by Telegram username (case-insensitive)."""
         username = username.lstrip("@").strip()

@@ -21,7 +21,7 @@ from aiogram.types import (
 from bot.bot import get_bot_id, get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
-from bot.handlers.reminders import maybe_freeform_reminder
+from bot.handlers.reminders import maybe_freeform_reminder, maybe_timezone_dialog
 from bot.keyboards.inline import (
     get_answer_keyboard,
     get_enhance_choice_keyboard,
@@ -1430,6 +1430,11 @@ async def handle_text(message: Message) -> None:
 
     text = strip_bot_mention(message.text)
     if not text:
+        return
+
+    # An in-progress /timezone dialog («where are you?») consumes the user's
+    # next message before the chat ever sees it.
+    if await maybe_timezone_dialog(message, text):
         return
 
     # Free-form reminder requests («напомни завтра позвонить маме») are

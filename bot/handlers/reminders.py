@@ -40,6 +40,7 @@ from bot.services.telegram_utils import (
     safe_answer_callback,
     safe_edit_text,
 )
+from bot.services.timezone_intent import detect_timezone, is_valid_zone_name
 from bot.services.user_service import UserService, user_service
 
 logger = logging.getLogger(__name__)
@@ -68,22 +69,24 @@ def _create_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
-def _format_fire_time(fire_at: datetime.datetime) -> str:
-    """Fire time in the configured display timezone."""
+def _format_fire_time(fire_at: datetime.datetime, tz: datetime.tzinfo) -> str:
+    """Fire time in the given (European) display timezone."""
     if fire_at.tzinfo is None:
         # SQLite hands back naive datetimes; stored times are always UTC.
         fire_at = fire_at.replace(tzinfo=datetime.UTC)
-    return fire_at.astimezone(get_timezone()).strftime("%d.%m.%Y %H:%M %Z")
+    return fire_at.astimezone(tz).strftime("%d.%m.%Y %H:%M %Z")
 
 
-def _confirmation(reminder_id: int, parsed: ParsedReminder) -> str:
+def _confirmation(
+    reminder_id: int, parsed: ParsedReminder, tz: datetime.tzinfo
+) -> str:
     """The 'reminder created' reply."""
     icon = "🔁" if parsed.schedule else "⏰"
     lines = [
         f"✅ <b>Reminder #{reminder_id} created</b> {icon}",
         "",
         f"<i>{html.escape(parsed.text[:300])}</i>",
-        f"🕒 First fire: {_format_fire_time(parsed.fire_at)}",
+        f"🕒 First fire: {_format_fire_time(parsed.fire_at, tz)}",
     ]
     if parsed.schedule:
         lines.append(f"🔁 Schedule: {html.escape(describe_schedule(parsed.schedule))}")
@@ -144,12 +147,16 @@ async def cmd_remind(message: Message) -> None:
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await safe_answer(message, remind_usage())
-        return
-
-    parsed = parse_reminder(parts[1])
-    if isinstance(parsed, str):  # an error/help message for the user
-        await safe_answer(message, parsed)
+        # The help shows *that* user's personal zone when they have one.
+        async with user_service() as service:
+            await service.register_user(
+                telegram_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+            )
+            tz = get_timezone(await service.get_reminder_timezone(user.id))
+            await safe_answer(message, remind_usage(user_tz_name=str(tz)))
         return
 
     async with user_service() as service:
@@ -177,6 +184,15 @@ async def cmd_remind(message: Message) -> None:
             )
             return
 
+        # The wall-clock slots (at / tomorrow at / daily / weekly) are
+        # interpreted in the user's personal zone (/timezone) when they set
+        # one, otherwise in REMINDER_TIMEZONE.
+        tz = get_timezone(await service.get_reminder_timezone(user.id))
+        parsed = parse_reminder(parts[1], tz=tz)
+        if isinstance(parsed, str):  # an error/help message for the user
+            await safe_answer(message, parsed)
+            return
+
         reminder_id, error = await create_reminder_record(
             service, user.id, message.chat.id, parsed
         )
@@ -184,7 +200,7 @@ async def cmd_remind(message: Message) -> None:
             await safe_answer(message, error)
             return
 
-    await safe_answer(message, _confirmation(reminder_id, parsed))
+    await safe_answer(message, _confirmation(reminder_id, parsed, tz))
 
 
 async def maybe_freeform_reminder(message: Message, text: str) -> bool:
@@ -221,10 +237,11 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
         if not access.allowed or access.role == "guest":
             return False
         settings = await service.get_user_settings(user.id)
+        tz = get_timezone(await service.get_reminder_timezone(user.id))
 
     # Layer 2: one small AI call converts the request into a /remind slot;
     # layer 3 inside the service re-validates it with the plain regexes.
-    outcome = await extract_freeform(text, settings["model"])
+    outcome = await extract_freeform(text, settings["model"], tz=tz)
     if outcome is None:
         # Not a reminder request (or detection failed): answer as chat.
         return False
@@ -240,7 +257,7 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
     if error is not None:
         await safe_answer(message, error)
         return True
-    await safe_answer(message, _confirmation(reminder_id, outcome))
+    await safe_answer(message, _confirmation(reminder_id, outcome, tz))
     return True
 
 
@@ -257,6 +274,7 @@ async def _render_list(
     """
     async with user_service() as service:
         reminders = await service.list_reminders(user_id)
+        owner_tz = get_timezone(await service.get_reminder_timezone(user_id))
         # Snapshot the rows into plain data inside the session.
         rows = [
             {
@@ -297,7 +315,9 @@ async def _render_list(
         paused = "" if row["enabled"] else " · ⏸ <b>paused</b>"
         schedule = f" · {describe_schedule(row['schedule'])}" if row["schedule"] else ""
         next_line = (
-            f"Next: {_format_fire_time(row['fire_at'])}" if row["enabled"] else "Paused"
+            f"Next: {_format_fire_time(row['fire_at'], owner_tz)}"
+            if row["enabled"]
+            else "Paused"
         )
         blocks.append(
             f"<b>#{row['id']}</b> {icon}{ai}{schedule}{paused}\n"
@@ -460,3 +480,205 @@ async def cmd_delreminder(message: Message) -> None:
             f"⚠️ Reminder <b>#{html.escape(argument)}</b> not found — "
             "see /reminders for the list.",
         )
+
+
+# --- Personal reminders timezone (/timezone) -----------------------------------
+
+# In-flight /timezone dialogs: user_id → the currently proposed IANA zone
+# (None = waiting for the user's city/zone description). A user with an
+# entry sends their next text message into the dialog instead of the chat.
+_tz_dialogs: dict[int, str | None] = {}
+_TZ_DIALOGS_CAP = 200
+
+_TZ_AUTH_MESSAGE = (
+    "⚠️ <b>Time zones are for authorized users only.</b>\n\n"
+    "Reminder times are interpreted per user in their own zone; guests "
+    "always use the server timezone."
+)
+_TZ_DIALOG_PROMPT = (
+    "🌍 <b>What time zone are you in?</b>\n\n"
+    "Write a city or zone — for example <i>I'm in Moscow</i>, "
+    "<i>novosibirsk</i> or <i>Europe/Moscow</i>. I will guess the exact IANA "
+    "zone, show you the current time there and ask you to confirm.\n\n"
+    "Say <code>cancel</code> to stop without saving."
+)
+_TZ_COULD_NOT_DETECT = (
+    "🤔 <b>Could not tell where that is.</b>\n\n"
+    "Name a city or a known zone (e.g. <code>Europe/Moscow</code>), or say "
+    "<code>cancel</code> to stop."
+)
+_TZ_INVALID_TEMPLATE = (
+    '⚠️ <b>"{name}" is not a valid IANA time zone.</b>\n\n'
+    "Use the <code>Area/City</code> form — for example "
+    "<code>/timezone Europe/Moscow</code> — or send <code>/timezone</code> "
+    "and I will guess the zone in a short dialog."
+)
+_TZ_SAVED_TEMPLATE = (
+    "✅ <b>Time zone saved: {zone}.</b>\n\n"
+    "It is now {now:%H:%M} there. New <code>/remind</code> commands "
+    "(<i>at 15:30</i>, <i>tomorrow</i>, <i>daily</i>, <i>weekly</i>) are "
+    "interpreted in this zone and <code>/reminders</code> shows fire times "
+    "in it. One-time reminders created earlier keep their stored time.\n"
+    "Change it any time with <code>/timezone</code>."
+)
+_TZ_CANDIDATE_TEMPLATE = (
+    "🌍 Your time zone looks like <b>{zone}</b>.\n"
+    "It is now {now:%H:%M}, {now:%A} there.\n\n"
+    "Is that the same as the time on your clock?"
+)
+_TZ_WRONG = (
+    " okay — name another city or zone (or say <code>cancel</code>)."
+)
+
+
+def _dialog_active(user_id: int) -> bool:
+    return user_id in _tz_dialogs
+
+
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message) -> None:
+    """Set the personal reminders timezone: strict form or a guided dialog.
+
+    ``/timezone Europe/Moscow`` saves the exact IANA name; a bare
+    ``/timezone`` starts the dialog: the bot asks where the user lives, the
+    user's model guesses the IANA zone, and the choice is confirmed by
+    showing the current time in that zone before anything is saved.
+    """
+    user = message.from_user
+    if user is None:
+        return
+    if not config.enable_reminders:
+        await safe_answer(message, "⚠️ Reminders are disabled on this bot.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    async with user_service() as service:
+        await service.register_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+        # Free, but authorized-only — like /remind: the zone is only used to
+        # interpret reminder times.
+        access = await check_access(
+            service, user.id, consume=False, require_quota=False
+        )
+        if not access.allowed or access.role == "guest":
+            await safe_answer(message, access.message or _TZ_AUTH_MESSAGE)
+            return
+
+        if not argument:
+            _tz_dialogs[user.id] = None
+            await safe_answer(message, _TZ_DIALOG_PROMPT)
+            return
+
+        if not is_valid_zone_name(argument):
+            await safe_answer(
+                message,
+                _TZ_INVALID_TEMPLATE.format(name=html.escape(argument)),
+            )
+            return
+        await service.set_reminder_timezone(user.id, argument)
+
+    tz = get_timezone(argument)
+    local_now = datetime.datetime.now(datetime.UTC).astimezone(tz)
+    await safe_answer(
+        message,
+        _TZ_SAVED_TEMPLATE.format(zone=html.escape(argument), now=local_now),
+    )
+
+
+async def maybe_timezone_dialog(message: Message, text: str) -> bool:
+    """Feed the user's next message into an active ``/timezone`` dialog.
+
+    Called from the chat flow before anything else. Returns ``True`` when
+    the message was consumed by the dialog (or it was cancelled) and the
+    caller must not answer again.
+    """
+    user = message.from_user
+    if user is None or not _dialog_active(user.id):
+        return False
+
+    lowered = text.strip().lower().rstrip("!.")
+    if lowered in ("cancel", "отмена", "не надо", "стоп"):
+        _tz_dialogs.pop(user.id, None)
+        await safe_answer(message, "Cancelled — the time zone was not changed.")
+        return True
+
+    # Evict stale dialogs so a user closing the app cannot grow it forever.
+    if len(_tz_dialogs) > _TZ_DIALOGS_CAP:
+        for key in list(_tz_dialogs)[: len(_tz_dialogs) - _TZ_DIALOGS_CAP]:
+            _tz_dialogs.pop(key, None)
+
+    async with user_service() as service:
+        settings = await service.get_user_settings(user.id)
+
+    detected = await detect_timezone(text, settings["model"])
+    if detected is None:
+        await safe_answer(message, _TZ_COULD_NOT_DETECT)
+        return True  # keep waiting for a usable answer
+
+    _tz_dialogs[user.id] = detected
+    local_now = datetime.datetime.now(datetime.UTC).astimezone(get_timezone(detected))
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Yes, it matches", callback_data="tz:ok"),
+        InlineKeyboardButton(text="❌ No, wrong", callback_data="tz:no"),
+    )
+    await safe_answer(
+        message,
+        _TZ_CANDIDATE_TEMPLATE.format(
+            zone=html.escape(detected), now=local_now
+        ),
+        reply_markup=builder.as_markup(),
+    )
+    return True
+
+
+@router.callback_query(F.data.startswith("tz:"))
+async def cb_timezone(callback: CallbackQuery) -> None:
+    """Confirm / reject the detected zone; only the dialog owner may answer."""
+    user = callback.from_user
+    action = (callback.data or "").split(":")[1] if callback.data else ""
+    if user is None:
+        await safe_answer_callback(callback)
+        return
+    candidate = _tz_dialogs.get(user.id)
+    if candidate is None:
+        await safe_answer_callback(
+            callback, "The dialog is over — send /timezone to start again.",
+            show_alert=True,
+        )
+        return
+
+    if action == "ok":
+        async with user_service() as service:
+            await service.set_reminder_timezone(user.id, candidate)
+        _tz_dialogs.pop(user.id, None)
+        local_now = datetime.datetime.now(datetime.UTC).astimezone(
+            get_timezone(candidate)
+        )
+        if callback.message is not None:
+            await safe_edit_text(
+                callback.message,
+                _TZ_SAVED_TEMPLATE.format(zone=html.escape(candidate), now=local_now),
+            )
+        await safe_answer_callback(callback)
+        return
+
+    if action == "no":
+        # Back to "tell me where you live": a wrong guess means the model
+        # needs a clearer description.
+        _tz_dialogs[user.id] = None
+        if callback.message is not None:
+            await safe_edit_text(
+                callback.message,
+                "❌ Not that one." + _TZ_WRONG,
+            )
+        await safe_answer_callback(callback)
+        return
+
+    await safe_answer_callback(callback)

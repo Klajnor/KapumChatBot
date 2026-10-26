@@ -127,6 +127,7 @@ async def _add_missing_access_columns_sqlite(conn: Any) -> None:
         "users": [
             ("granted_admin", "BOOLEAN NOT NULL DEFAULT 0"),
             ("blocked", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("reminder_timezone", "VARCHAR(64)"),
         ],
     }
     for table, columns in wanted.items():
@@ -170,6 +171,9 @@ async def _run_migrations(conn: Any) -> None:
         "ADD COLUMN IF NOT EXISTS granted_admin BOOLEAN NOT NULL DEFAULT FALSE"),
         ("ALTER TABLE users "
         "ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE"),
+        # Personal reminders timezone (IANA name; NULL = REMINDER_TIMEZONE).
+        ("ALTER TABLE users "
+        "ADD COLUMN IF NOT EXISTS reminder_timezone VARCHAR(64)"),
         # allowed_users table.
         ("CREATE TABLE IF NOT EXISTS allowed_users ("
         "telegram_id BIGINT NOT NULL PRIMARY KEY, "
