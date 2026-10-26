@@ -21,26 +21,28 @@ pytest tests/test_regressions.py -v      # один файл
 pytest tests/test_regressions.py::RegressionTests::test_name -v   # один тест
 ```
 
-- Тесты — в основном `unittest.IsolatedAsyncioTestCase` (запускаются через pytest); БД-тесты используют реальную in-memory SQLite, без моков. Telegram-объекты подменяются `SimpleNamespace` / `unittest.mock`.
-- `ffmpeg` нужен для голосовых (не pip-пакет); `ENABLE_VOICE=false` отключает.
-- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `scripts/clean_pycache.*` — очистка кэша; `restart.sh` — деплой на сервер (`/opt/KapumChatBot`, systemd).
+- Тесты — в основном `unittest.IsolatedAsyncioTestCase` (запускаются через pytest). Разброс — `test_regressions.py` (регрессии), `test_database.py` (in-memory SQLite, без моков), `test_audit_fixes.py` (безопасность). Telegram-объекты подменяются `SimpleNamespace` / `unittest.mock`.
+- `ffmpeg` нужен для голосовых (не pip-пакет); `ENABLE_VOICE=false` отключает. На Windows зонеinfo нужен пакет `tzdata` (REMINDER_TIMEZONE).
+- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `check_telegraph.py`, `test_ws_asr.py` — отладка Telegraph и ASR; `migrate_to_sqlite.py` — перенос PostgreSQL → SQLite; `clean_pycache.*` — очистка кэша; `restart.sh` — деплой на сервер (`/opt/KapumChatBot`, systemd).
 
 ## Конвенции
 
 - `from __future__ import annotations` в каждом модуле, type hints и docstrings на публичном API.
 - `# noqa: BLE001` помечает намеренные широкие `except` вокруг вызовов Telegram, которые не должны ломать ответ.
-- Новый параметр конфигурации → добавить в `bot/config.py`, `.env.example` и таблицу в README.
-- Коммит-префиксы по области: `chat:`, `config:`, `guest:`, `formulas:`, `db:`, `tests:`, `docs:`. Каждую фичу коммитить с подробным описанием в теле; добавлять запись в `CHANGELOG.md` (сверху новые, по датам).
+- Новый параметр конфигурации → добавить в `bot/config.py` (Config dataclass), `.env.example` и таблицу в README. Их уже >100 — переменную легко добавить в одну из них и забыть про остальные.
+- Коммиты на русском, тема в subject (история использует и префиксы области — `chat:`, `db:`, `docs:` — и стиль `Тема: описание`, напр. «Саммари: …»). Каждую фичу коммитить с подробным описанием в теле; добавлять запись в `CHANGELOG.md` — датированный раздел в самом верху «История по коммитам» + развернутая заметка ниже в «Подробные заметки».
+- `CLAUDE.md` — зеркальная копия этого файла: менять синхронно.
 
 ## Архитектура
 
-Точка входа — `bot/main.py`: регистрирует роутеры, глобальный обработчик ошибок, запускает фоновые задачи (`_album_cleanup`, `reminder_scheduler_loop`, `digest_scheduler_loop`, health-сервер, MCP). **Порядок `dp.include_router` важен**: командные роутеры идут раньше catch-all `chat.router`; `guest.router` подключается только при `ENABLE_GUEST_MODE`.
+Точка входа — `bot/main.py`: регистрирует роутеры, глобальный обработчик ошибок, запускает фоновые задачи (`_album_cleanup`, `reminder_scheduler_loop`, `digest_scheduler_loop`, health-сервер, MCP). **Порядок `dp.include_router` важен**: `digest.router` стоит первым (только наблюдает посты каналов/групп), затем командные роутеры, последним catch-all `chat.router`; `guest.router` подключается только при `ENABLE_GUEST_MODE`. Роутеров больше, чем сервисов, — перечислены в `main.py` (start, help, models, image, prompt, reminders, export, clear, stats, admin, admin_panel).
 
 Слои:
+- `bot/bot.py` — инициализация Bot/Dispatcher и хелперы идентичности бота.
 - `bot/handlers/` — Telegram-обработчики. `chat.py` (~3000 строк) — ядро: текст/голос/фото/документы/альбомы, ссылки, tool-loop (поиск, картинки, стикеры, MCP), стриминг (`_StreamPrinter`), доставка ответа (`deliver_answer`), callback-и «спросить другую модель» и выбора способа улучшения фото. `guest.py` — guest chat mode (inline-запрос → ровно один `answerGuestQuery`, поэтому там нет индикатора, поиска и многоходовых циклов).
-- `bot/services/` — бизнес-логика. `ai_client.py` — единый `AIClient` (чат, SSE-стриминг, vision, ASR по WebSocket, генерация картинок через нативный DashScope API, замер времени/токенов, fallback-цепочка моделей). `user_service.py` + `access.py` + `limits.py` — уровни доступа (guest → user → admin → owner из `ADMIN_IDS`), дневные и персональные лимиты, атомарное списание квоты с возвратом при отказе. `documents.py` — извлечение текста (PDF/DOCX/XLSX/PPTX), загрузка ссылок с SSRF-защитой, обход ссылок. `mcp.py` — stdio MCP-клиент («второй мозг»). `rich.py`/`markdown.py`/`telegraph.py`/`formulas.py`/`science.py` — цепочка форматирования ответа.
+- `bot/services/` — бизнес-логика. `ai_client.py` — единый `AIClient` (чат, SSE-стриминг, vision, ASR по WebSocket, генерация картинок через нативный DashScope API, замер времени/токенов, fallback-цепочка моделей). `user_service.py` + `access.py` + `limits.py` — уровни доступа (guest → user → admin → owner из `ADMIN_IDS`), дневные и персональные лимиты, атомарное списание квоты с возвратом при отказе. `documents.py` — извлечение текста (PDF/DOCX/XLSX/PPTX, OCR сканов через vision в `pdf_ocr.py`), загрузка ссылок с SSRF-защитой и обходом страниц до 3 уровней (`LINK_CRAWL_*`). `search.py` — веб-поиск Tavily/Brave, `mcp.py` — stdio MCP-клиент («второй мозг»), `digest.py` — ежедневное саммари каналов/групп (модель и промпт хранятся в БД), `youtube.py` — субтитры через yt-dlp. `rich.py`/`markdown.py`/`telegraph.py`/`formulas.py`/`science.py` — цепочка форматирования ответа.
 - `bot/database/` — SQLAlchemy 2.0 async: `models.py`, `repository.py`, `session.py`. Миграций через Alembic нет: `init_db()` создаёт таблицы и применяет идемпотентные `ALTER TABLE` (отдельные ветки для SQLite и PostgreSQL) — новые колонки добавлять туда же.
-- `bot/config.py` — единый `config` (dataclass из env). Модели задаются слотами `MODEL_1..6_*` + `FALLBACK_MODEL_*` (у каждой свой URL/ключ/`VISION`); `ID` — внутренний id бота, провайдеру уходит `MODEL`. При запуске недоступные у провайдера модели скрываются из `/models`.
+- `bot/config.py` — единственный `Config` dataclass из env, глобальный объект `config`. Модели задаются слотами `MODEL_1..6_*` + `FALLBACK_MODEL_*` (у каждой свой URL/ключ/`VISION`); `ID` — внутренний id бота, провайдеру уходит `MODEL`. При запуске недоступные у провайдера модели скрываются из `/models`.
 
 Сквозные механизмы, которые видны только при чтении нескольких файлов:
 - **Fallback моделей**: при ошибке/пустом ответе/превышении квоты запрос идёт следующей моделью по слотам, затем в `FALLBACK_MODEL_*` (скрыта из меню); для vision перебираются только модели с `VISION=true`.
