@@ -1105,7 +1105,7 @@ class Config:
         self.link_fetch_timeout = max(5, min(self.link_fetch_timeout, 60))
         self.link_crawl_depth = max(0, min(self.link_crawl_depth, 5))
         self.link_crawl_max_chars = max(
-            1000, min(self.link_crawl_max_chars, 100_000)
+            1000, min(self.link_crawl_max_chars, 10_000_000)
         )
         self.link_crawl_max_fetches = max(
             1, min(self.link_crawl_max_fetches, 100)
