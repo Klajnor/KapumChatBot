@@ -221,7 +221,7 @@ class UserService:
         so it does not fire for the time spent paused; a one-time reminder that
         is already overdue simply fires on the next scheduler tick.
         """
-        from bot.services.reminders import next_occurrence
+        from bot.services.reminders import get_timezone, next_occurrence
 
         reminder = await self.reminder_repo.get(reminder_id, telegram_id)
         if reminder is None:
@@ -231,7 +231,11 @@ class UserService:
         else:
             if reminder.schedule:
                 now = datetime.datetime.now(datetime.UTC)
-                next_fire = next_occurrence(reminder.schedule, reminder.fire_at, now)
+                # Wall-clock schedules follow the owner's personal zone.
+                tz = get_timezone(await self.get_reminder_timezone(telegram_id))
+                next_fire = next_occurrence(
+                    reminder.schedule, reminder.fire_at, now, tz=tz
+                )
                 if next_fire is None:  # broken schedule: it can never run again
                     await self.reminder_repo.delete(reminder_id, telegram_id)
                     await self.session.commit()

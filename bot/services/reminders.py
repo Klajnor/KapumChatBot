@@ -295,7 +295,6 @@ def next_occurrence(
     if previous_fire.tzinfo is None:
         # SQLite hands back naive datetimes; stored times are always UTC.
         previous_fire = previous_fire.replace(tzinfo=datetime.UTC)
-    tz = get_timezone()
     parts = schedule.split(":")
     try:
         if parts[0] == "every" and len(parts) == 2:

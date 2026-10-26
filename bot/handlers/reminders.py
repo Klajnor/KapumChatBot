@@ -13,6 +13,8 @@ import asyncio
 import datetime
 import html
 import logging
+import time
+from dataclasses import dataclass
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -484,11 +486,46 @@ async def cmd_delreminder(message: Message) -> None:
 
 # --- Personal reminders timezone (/timezone) -----------------------------------
 
-# In-flight /timezone dialogs: user_id → the currently proposed IANA zone
-# (None = waiting for the user's city/zone description). A user with an
-# entry sends their next text message into the dialog instead of the chat.
-_tz_dialogs: dict[int, str | None] = {}
+@dataclass(slots=True)
+class _TzDialog:
+    """One in-flight /timezone dialog.
+
+    ``candidate`` is the currently proposed IANA zone (None = waiting for the
+    user's city/zone description). The dialog lives only in the chat where
+    /timezone was sent and expires after ``_TZ_DIALOG_TTL`` seconds.
+    """
+
+    chat_id: int
+    candidate: str | None
+    expires_at: float
+
+
+_TZ_DIALOG_TTL = 600.0
+_tz_dialogs: dict[int, _TzDialog] = {}
 _TZ_DIALOGS_CAP = 200
+
+
+def _start_dialog(user_id: int, chat_id: int, candidate: str | None = None) -> None:
+    _tz_dialogs[user_id] = _TzDialog(
+        chat_id=chat_id,
+        candidate=candidate,
+        expires_at=time.monotonic() + _TZ_DIALOG_TTL,
+    )
+
+
+def _get_dialog(user_id: int, chat_id: int | None = None) -> _TzDialog | None:
+    """The user's live dialog; expired ones are dropped, and a dialog started
+    in another chat is invisible (``chat_id`` given)."""
+    dialog = _tz_dialogs.get(user_id)
+    if dialog is None:
+        return None
+    if dialog.expires_at <= time.monotonic():
+        _tz_dialogs.pop(user_id, None)
+        return None
+    if chat_id is not None and dialog.chat_id != chat_id:
+        return None
+    return dialog
+
 
 _TZ_AUTH_MESSAGE = (
     "⚠️ <b>Time zones are for authorized users only.</b>\n\n"
@@ -531,10 +568,6 @@ _TZ_WRONG = (
 )
 
 
-def _dialog_active(user_id: int) -> bool:
-    return user_id in _tz_dialogs
-
-
 @router.message(Command("timezone"))
 async def cmd_timezone(message: Message) -> None:
     """Set the personal reminders timezone: strict form or a guided dialog.
@@ -571,7 +604,7 @@ async def cmd_timezone(message: Message) -> None:
             return
 
         if not argument:
-            _tz_dialogs[user.id] = None
+            _start_dialog(user.id, message.chat.id)
             await safe_answer(message, _TZ_DIALOG_PROMPT)
             return
 
@@ -599,7 +632,7 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
     caller must not answer again.
     """
     user = message.from_user
-    if user is None or not _dialog_active(user.id):
+    if user is None or _get_dialog(user.id, message.chat.id) is None:
         return False
 
     lowered = text.strip().lower().rstrip("!.")
@@ -608,9 +641,11 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
         await safe_answer(message, "Cancelled — the time zone was not changed.")
         return True
 
-    # Evict stale dialogs so a user closing the app cannot grow it forever.
+    # Evict expired dialogs, then the oldest ones over the cap.
     if len(_tz_dialogs) > _TZ_DIALOGS_CAP:
-        for key in list(_tz_dialogs)[: len(_tz_dialogs) - _TZ_DIALOGS_CAP]:
+        for key in list(_tz_dialogs):
+            _get_dialog(key)
+        for key in list(_tz_dialogs)[: max(0, len(_tz_dialogs) - _TZ_DIALOGS_CAP)]:
             _tz_dialogs.pop(key, None)
 
     async with user_service() as service:
@@ -621,12 +656,12 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
         await safe_answer(message, _TZ_COULD_NOT_DETECT)
         return True  # keep waiting for a usable answer
 
-    _tz_dialogs[user.id] = detected
+    _start_dialog(user.id, message.chat.id, detected)
     local_now = datetime.datetime.now(datetime.UTC).astimezone(get_timezone(detected))
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="✅ Yes, it matches", callback_data="tz:ok"),
-        InlineKeyboardButton(text="❌ No, wrong", callback_data="tz:no"),
+        InlineKeyboardButton(text="✅ Yes, it matches", callback_data=f"tz:ok:{detected}"),
+        InlineKeyboardButton(text="❌ No, wrong", callback_data=f"tz:no:{detected}"),
     )
     await safe_answer(
         message,
@@ -646,8 +681,13 @@ async def cb_timezone(callback: CallbackQuery) -> None:
     if user is None:
         await safe_answer_callback(callback)
         return
-    candidate = _tz_dialogs.get(user.id)
-    if candidate is None:
+    chat_id = callback.message.chat.id if callback.message is not None else None
+    dialog = _get_dialog(user.id, chat_id)
+    candidate = dialog.candidate if dialog is not None else None
+    # The button carries the zone it was shown for: a stale button of an
+    # earlier guess must not confirm the newest candidate.
+    shown = (callback.data or "").split(":", 2)[2:]
+    if candidate is None or (shown and shown[0] != candidate):
         await safe_answer_callback(
             callback, "The dialog is over — send /timezone to start again.",
             show_alert=True,
@@ -672,7 +712,7 @@ async def cb_timezone(callback: CallbackQuery) -> None:
     if action == "no":
         # Back to "tell me where you live": a wrong guess means the model
         # needs a clearer description.
-        _tz_dialogs[user.id] = None
+        _start_dialog(user.id, dialog.chat_id)
         if callback.message is not None:
             await safe_edit_text(
                 callback.message,

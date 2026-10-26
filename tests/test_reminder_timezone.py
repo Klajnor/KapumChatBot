@@ -254,3 +254,81 @@ class TestDetectTimezone(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNextOccurrenceHonoursZone(unittest.TestCase):
+    """Regression: next_occurrence used to overwrite ``tz`` with the global zone."""
+
+    def test_daily_uses_passed_zone(self):
+        now = datetime.datetime(2026, 1, 10, 0, 0, tzinfo=datetime.UTC)
+        with patch.object(config, "reminder_timezone", "UTC"):
+            nxt = service.next_occurrence("daily:09:00", now, now, tz=MOSCOW)
+        # 09:00 Moscow (UTC+3) == 06:00 UTC, not 09:00 UTC.
+        self.assertEqual(nxt, datetime.datetime(2026, 1, 10, 6, 0, tzinfo=datetime.UTC))
+
+    def test_weekly_uses_passed_zone(self):
+        now = datetime.datetime(2026, 1, 10, 0, 0, tzinfo=datetime.UTC)  # Saturday
+        with patch.object(config, "reminder_timezone", "UTC"):
+            nxt = service.next_occurrence("weekly:0:09:00", now, now, tz=MOSCOW)
+        self.assertEqual(nxt, datetime.datetime(2026, 1, 12, 6, 0, tzinfo=datetime.UTC))
+
+
+class TestResumeUsesOwnerZone(DBTest):
+    def test_resume_daily_in_owners_zone(self):
+        async def go() -> None:
+            now = datetime.datetime.now(datetime.UTC)
+            target = now.astimezone(MOSCOW) + datetime.timedelta(hours=5)
+            schedule = f"daily:{target.hour:02d}:{target.minute:02d}"
+            async with user_service() as s:
+                await s.register_user(U1)
+                await s.set_reminder_timezone(U1, "Europe/Moscow")
+                created = await s.add_reminder(
+                    Reminder(user_id=U1, chat_id=U1, text="x", fire_at=now,
+                             schedule=schedule, enabled=False)
+                )
+                rid = created.id
+            async with user_service() as s:
+                resumed = await s.toggle_reminder(rid, U1)
+            expected = datetime.datetime(
+                target.year, target.month, target.day, target.hour, target.minute,
+                tzinfo=MOSCOW,
+            ).astimezone(datetime.UTC)
+            fire = resumed.fire_at
+            if fire.tzinfo is None:
+                fire = fire.replace(tzinfo=datetime.UTC)
+            self.assertEqual(fire, expected)
+
+        p = patch("bot.database.session.async_session_factory", self._factory)
+        p.start()
+        try:
+            self._loop.run_until_complete(go())
+        finally:
+            p.stop()
+
+
+class TestTimezoneDialogScope(unittest.TestCase):
+    def setUp(self):
+        from bot.handlers import reminders as handler
+
+        self.h = handler
+        handler._tz_dialogs.clear()
+        self.addCleanup(handler._tz_dialogs.clear)
+
+    def test_only_in_same_chat(self):
+        self.h._start_dialog(1, chat_id=10)
+        self.assertIsNotNone(self.h._get_dialog(1, 10))
+        self.assertIsNone(self.h._get_dialog(1, 99))
+
+    def test_expires(self):
+        self.h._start_dialog(1, chat_id=10)
+        self.h._tz_dialogs[1].expires_at = 0.0
+        self.assertIsNone(self.h._get_dialog(1, 10))
+        self.assertNotIn(1, self.h._tz_dialogs)
+
+    def test_expired_dialog_does_not_swallow_message(self):
+        import asyncio
+
+        self.h._start_dialog(1, chat_id=10)
+        self.h._tz_dialogs[1].expires_at = 0.0
+        msg = SimpleNamespace(from_user=SimpleNamespace(id=1), chat=SimpleNamespace(id=10))
+        self.assertFalse(asyncio.run(self.h.maybe_timezone_dialog(msg, "hello")))
