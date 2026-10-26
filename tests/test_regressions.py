@@ -953,6 +953,48 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("User request: Summarize", expanded)
         self.assertIn('<untrusted_content source="web">', expanded)
 
+    def test_extract_page_links_filters_and_orders(self):
+        body = (
+            b'<a href="/a">a</a><a href="https://other.test/x">x</a>'
+            b'<a href="/a#frag">dup</a><a href="/pic.png">img</a>'
+            b'<a href="mailto:me@a.test">m</a><a href="/b">b</a>'
+        )
+        links = documents.extract_page_links(body, "https://a.test/post")
+        self.assertEqual(
+            links,
+            ["https://a.test/a", "https://a.test/b", "https://other.test/x"],
+        )
+
+    async def test_link_expansion_follows_page_links(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        root = documents.FetchedPage(
+            url="https://a.test/", title="Root", text="Root body",
+            links=["https://a.test/child"],
+        )
+        child = documents.FetchedPage(
+            url="https://a.test/child", title="Child", text="Child body"
+        )
+        fetch = AsyncMock(side_effect=[root, child])
+        with (
+            patch.object(config, "link_crawl_pages", 3),
+            patch.object(chat, "fetch_url_text", fetch),
+            patch.object(chat, "safe_answer", AsyncMock()),
+        ):
+            expanded = await chat._expand_links_with_content(
+                message, "https://a.test/"
+            )
+        self.assertIn("Root body", expanded)
+        self.assertIn("[Linked page: https://a.test/child]", expanded)
+        self.assertIn("Child body", expanded)
+
+    def test_document_context_includes_link_blocks(self):
+        composed = chat._compose_document_context(
+            "r.pdf", "TEXT", "", ["<web>PAGE</web>"]
+        )
+        self.assertIn("TEXT", composed)
+        self.assertIn("<web>PAGE</web>", composed)
+        self.assertIn(chat.DEFAULT_DOCUMENT_LINK_PROMPT, composed)
+
     async def test_failed_fetch_keeps_original_text(self):
         message = SimpleNamespace(chat=SimpleNamespace(id=1))
         original = "what is https://b.test/ ?"

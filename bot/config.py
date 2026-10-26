@@ -662,6 +662,11 @@ class Config:
     enable_link_analysis: bool = field(
         default_factory=lambda: _env_bool("ENABLE_LINK_ANALYSIS", True)
     )
+    # Pages followed from the links found on a linked page (one level deep),
+    # per link in the message. 0 reads only the page itself.
+    link_crawl_pages: int = field(
+        default_factory=lambda: _env_int("LINK_CRAWL_PAGES", 3)
+    )
     # Characters of extracted text forwarded to the model per document/page.
     max_extracted_chars: int = field(
         default_factory=lambda: _env_int("MAX_EXTRACTED_CHARS", 15_000)
@@ -1089,6 +1094,7 @@ class Config:
             1_048_576, min(self.max_document_bytes, 20 * 1024 * 1024)
         )
         self.link_fetch_timeout = max(5, min(self.link_fetch_timeout, 60))
+        self.link_crawl_pages = max(0, min(self.link_crawl_pages, 8))
         # OCR pages and transcript size bound the paid tokens of one request.
         self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))
         self.youtube_max_chars = max(2_000, min(self.youtube_max_chars, 100_000))

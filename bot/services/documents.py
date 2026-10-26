@@ -23,7 +23,7 @@ import ipaddress
 import logging
 import re
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from io import BytesIO
 from typing import Any
@@ -442,6 +442,68 @@ class _HTMLText(HTMLParser):
             self.parts.append(data)
 
 
+class _LinkCollector(HTMLParser):
+    """Collects ``<a href>`` targets of a page in document order."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag != "a":
+            return
+        for name, value in attrs:
+            if name == "href" and value:
+                self.hrefs.append(value.strip())
+
+
+# Targets that are never readable pages.
+_SKIP_LINK_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".ogg", ".wav",
+    ".zip", ".rar", ".7z", ".gz", ".tar", ".exe", ".msi", ".dmg", ".apk",
+    ".css", ".js", ".woff", ".woff2", ".ttf",
+)
+
+
+def extract_page_links(body: bytes, base_url: str, limit: int = 50) -> list[str]:
+    """Absolute, de-duplicated http(s) links found in an HTML page.
+
+    Fragments are dropped, the page itself is excluded, and links to media,
+    archives and static assets are skipped. Same-host links come first: they
+    are the most likely continuation of the page the user pointed at.
+    """
+    collector = _LinkCollector()
+    try:
+        collector.feed(body.decode("utf-8", errors="replace"))
+        collector.close()
+    except Exception:  # noqa: BLE001 - malformed HTML must not kill a reply
+        return []
+    base = urlsplit(base_url)
+    own = base._replace(fragment="").geturl()
+    seen: set[str] = {own}
+    same_host: list[str] = []
+    other: list[str] = []
+    for href in collector.hrefs:
+        if href.lower().startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        try:
+            absolute = urljoin(base_url, href)
+            parts = urlsplit(absolute)
+        except ValueError:
+            continue
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            continue
+        if parts.path.lower().endswith(_SKIP_LINK_EXTENSIONS):
+            continue
+        absolute = parts._replace(fragment="").geturl()
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        (same_host if parts.hostname == base.hostname else other).append(absolute)
+    return (same_host + other)[:limit]
+
+
 def _naive_html_extract(body: bytes) -> tuple[str, str]:
     """(title, visible text) from HTML bytes using only the stdlib."""
     parser = _HTMLText()
@@ -520,6 +582,7 @@ class FetchedPage:
     url: str
     title: str
     text: str
+    links: list[str] = field(default_factory=list)
 
 
 class _PinnedResolver(aiohttp.resolver.AbstractResolver):
@@ -644,11 +707,12 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
     return None, url, None
 
 
-async def fetch_url_text(url: str) -> FetchedPage | None:
+async def fetch_url_text(url: str, *, with_links: bool = False) -> FetchedPage | None:
     """Fetch ``url`` and extract its readable text (None on any failure).
 
     The caller gets a final (possibly redirected) URL, the page title and the
-    main content, clipped to ``MAX_EXTRACTED_CHARS``.
+    main content, clipped to ``MAX_EXTRACTED_CHARS``. With ``with_links`` the
+    page's outgoing links are collected too, for crawling one level deeper.
     """
     if not await asyncio.to_thread(is_safe_public_url, url):
         logger.warning("Refusing to fetch a non-public URL: %s", urlsplit(url).netloc)
@@ -665,4 +729,9 @@ async def fetch_url_text(url: str) -> FetchedPage | None:
         return None
     if not text or not text.strip():
         return None
-    return FetchedPage(url=final_url or url, title=title, text=clip_extracted(text))
+    links: list[str] = []
+    if with_links and "html" in (content_type or ""):
+        links = await asyncio.to_thread(extract_page_links, body, final_url or url)
+    return FetchedPage(
+        url=final_url or url, title=title, text=clip_extracted(text), links=links
+    )

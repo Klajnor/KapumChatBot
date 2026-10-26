@@ -18,9 +18,16 @@ from aiogram.types import (
 
 from bot.config import config
 from bot.database.session import async_session_factory
+from bot.handlers.chat import (
+    DEFAULT_LINK_PROMPT,
+    DEFAULT_VIDEO_PROMPT,
+    _compose_document_context,
+    read_links,
+)
 from bot.services import limits
 from bot.services.access import AccessResult, check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
+from bot.services.documents import detect_file_type, extract_document_text
 from bot.services.intent import (
     VISION_FOR_GEN_PROMPT,
     detect_intent,
@@ -179,6 +186,14 @@ def _voice_of(message: Message):
     return reply.voice if reply is not None else None
 
 
+def _document_of(message: Message):
+    """Return the document attached to the message or to the replied one."""
+    if message.document is not None:
+        return message.document
+    reply = message.reply_to_message
+    return reply.document if reply is not None else None
+
+
 def _extract_text(message: Message) -> str:
     """Summoning text with the ``@bot`` mention removed."""
     return strip_bot_mention(message.text or message.caption or "").strip()
@@ -231,11 +246,70 @@ async def _build_reply(
                 mode="plain",
             )
 
+    # Same for an attached (or replied-to) document: reject an unsupported or
+    # oversized file before it costs a free message.
+    document = _document_of(message) if config.enable_document_analysis else None
+    file_type = None
+    if document is not None:
+        file_type = detect_file_type(document.file_name, document.mime_type)
+        limit_mb = config.max_document_bytes // (1024 * 1024)
+        if file_type is None:
+            return GuestReply(
+                text=(
+                    "⚠️ This file type cannot be analyzed. Supported: PDF, DOCX, "
+                    "XLSX, PPTX, plain text and code."
+                ),
+                mode="plain",
+            )
+        if document.file_size and document.file_size > config.max_document_bytes:
+            return GuestReply(
+                text=f"⚠️ The file is too large. The limit is {limit_mb} MB.",
+                mode="plain",
+            )
+
     access = await check_access(service, caller_id)
     if not access.allowed:
         return GuestReply(
             text=access.message or get_random_themed_response(), mode="html"
         )
+
+    # Document: extract its text (after the quota has been taken) and fold it,
+    # together with the pages linked in the text, into the request.
+    if document is not None:
+        data = await _download(message, document.file_id)
+        if not data:
+            await refund_access(service, caller_id, access)
+            return GuestReply(
+                text=(
+                    "❌ Telegram did not give me access to the attached file in "
+                    "this chat. Send it to the bot in a private chat instead."
+                ),
+                mode="plain",
+            )
+        extracted = None
+        if len(data) <= config.max_document_bytes:
+            extracted = await extract_document_text(file_type, data)
+        if not extracted:
+            await refund_access(service, caller_id, access)
+            return GuestReply(
+                text="❌ Could not extract any text from this file.", mode="plain"
+            )
+        link_blocks: list[str] = []
+        if config.enable_link_analysis and text:
+            link_blocks, remainder, _ = await read_links(text, require_short=False)
+            if link_blocks:
+                text = remainder
+        text = _compose_document_context(
+            document.file_name or "document", extracted, text, link_blocks
+        )
+    elif config.enable_link_analysis and text:
+        # A summons that is essentially bare links reads those pages.
+        link_blocks, remainder, videos = await read_links(text)
+        if link_blocks:
+            request = remainder or (
+                DEFAULT_VIDEO_PROMPT if videos == len(link_blocks) else DEFAULT_LINK_PROMPT
+            )
+            text = "\n\n".join(link_blocks) + f"\n\n---\n\nUser request: {request}"
 
     # Voice message: recognize it now (after the quota has been taken).
     if voice_ok:

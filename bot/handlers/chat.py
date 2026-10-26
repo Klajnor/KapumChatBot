@@ -40,6 +40,7 @@ from bot.services.ai_client import (
     is_vision_model,
 )
 from bot.services.documents import (
+    FetchedPage,
     clip_extracted,
     detect_file_type,
     extract_document_text,
@@ -123,6 +124,11 @@ DEFAULT_VIDEO_PROMPT = (
 DEFAULT_DOCUMENT_PROMPT = (
     "Сделай краткое изложение этого документа: основные темы, ключевые "
     "моменты и выводы."
+)
+
+DEFAULT_DOCUMENT_LINK_PROMPT = (
+    "Сделай краткое изложение этого документа и приложенных страниц по "
+    "ссылкам: основные темы, ключевые моменты и выводы по каждому источнику."
 )
 
 DEFAULT_LINK_PROMPT = (
@@ -362,16 +368,117 @@ def _clean_url(candidate: str) -> str:
     return cleaned
 
 
-def _compose_document_context(name: str, text: str, question: str) -> str:
+def _compose_document_context(
+    name: str,
+    text: str,
+    question: str,
+    link_blocks: list[str] | None = None,
+) -> str:
     """The AI request for an uploaded document: content plus the user's ask.
 
     The extracted document body is third-party content, so it is wrapped in
     untrusted-content tags (see ``bot/services/untrusted.py``): a malicious
     PDF must not be able to inject instructions into the conversation.
+    ``link_blocks`` are pages fetched from links in the caption; they travel
+    with the document so both are analyzed together.
     """
-    request = question.strip() or DEFAULT_DOCUMENT_PROMPT
+    default = DEFAULT_DOCUMENT_LINK_PROMPT if link_blocks else DEFAULT_DOCUMENT_PROMPT
+    request = question.strip() or default
     document = wrap_untrusted("document", f"[Document: {name}]\n\n{text}")
-    return f"{document}\n\n---\n\nUser request: {request}"
+    parts = [document, *(link_blocks or [])]
+    return "\n\n".join(parts) + f"\n\n---\n\nUser request: {request}"
+
+
+def _find_urls(text: str) -> list[str]:
+    """Distinct cleaned URLs of ``text`` in order of appearance."""
+    urls: list[str] = []
+    for candidate in _URL_RE.findall(text):
+        cleaned = _clean_url(candidate)
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+    return urls
+
+
+async def read_links(
+    text: str,
+    notify: Any = None,
+    *,
+    require_short: bool = True,
+) -> tuple[list[str], str, int]:
+    """Fetch the pages linked in ``text``: ``(blocks, remainder, videos)``.
+
+    ``blocks`` are untrusted-wrapped page bodies (YouTube links give
+    transcripts); ``remainder`` is the text without the URLs, i.e. the user's
+    own question. Pages reached from a linked page (one level deep, at most
+    ``LINK_CRAWL_PAGES`` per message) follow their parent. ``notify`` is an
+    optional ``async (str)`` for progress notes. With ``require_short`` a
+    message that is mostly prose yields nothing: it merely mentions links.
+    """
+    urls = _find_urls(text)
+    remainder = _URL_RE.sub(" ", text).strip()
+    if not urls or (require_short and len(remainder) > _LINK_REMAINDER_LIMIT):
+        return [], remainder, 0
+    urls = urls[:_MAX_LINKS_PER_MESSAGE]
+
+    async def say(note: str) -> None:
+        if notify is not None:
+            await notify(note)
+
+    listed = "\n".join(f"<code>{html.escape(u[:120])}</code>" for u in urls)
+    await say(f"🔗 <b>Reading {len(urls)} link(s)…</b>\n{listed}")
+
+    blocks: list[str] = []
+    videos = 0
+    seen = set(urls)
+    crawl_left = config.link_crawl_pages
+    crawled = 0
+    for url in urls:
+        video_id = youtube_video_id(url) if config.enable_youtube else None
+        if video_id is not None:
+            try:
+                transcript = await fetch_transcript(video_id)
+            except YouTubeError as exc:
+                await say(f"⚠️ <b>YouTube:</b> {html.escape(str(exc))}")
+                continue
+            videos += 1
+            blocks.append(
+                wrap_untrusted("web", f"{describe(transcript)}\n\n{transcript.text}")
+            )
+            continue
+        page = await fetch_url_text(url, with_links=crawl_left > 0)
+        if page is None:
+            continue
+        header = f"[Web page: {page.url}]"
+        if page.title:
+            header += f"\nTitle: {page.title}"
+        blocks.append(wrap_untrusted("web", f"{header}\n\n{page.text}"))
+
+        # One level deeper: the pages this page links to.
+        children = [
+            link for link in page.links
+            if link not in seen and youtube_video_id(link) is None
+        ][:crawl_left]
+        if not children:
+            continue
+        seen.update(children)
+        crawl_left -= len(children)
+        sub_limit = max(2000, config.max_extracted_chars // 3)
+        subpages = await asyncio.gather(
+            *(fetch_url_text(child) for child in children), return_exceptions=True
+        )
+        for child in subpages:
+            if not isinstance(child, FetchedPage):
+                continue
+            crawled += 1
+            sub_header = f"[Linked page: {child.url}]\n(found on {page.url})"
+            if child.title:
+                sub_header += f"\nTitle: {child.title}"
+            blocks.append(
+                wrap_untrusted("web", f"{sub_header}\n\n{child.text[:sub_limit]}")
+            )
+    if crawled:
+        await say(f"🔗 Also read <b>{crawled}</b> page(s) linked from there.")
+    return blocks, remainder, videos
 
 
 async def _expand_links_with_content(message: Message, text: str) -> str:
@@ -385,49 +492,16 @@ async def _expand_links_with_content(message: Message, text: str) -> str:
     Page bodies are wrapped as untrusted content: a page that tries to steer
     the model ("ignore your rules…") must stay data.
     """
-    urls: list[str] = []
-    for candidate in _URL_RE.findall(text):
-        cleaned = _clean_url(candidate)
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-    if not urls:
-        return text
-    remainder = _URL_RE.sub(" ", text).strip()
-    if len(remainder) > _LINK_REMAINDER_LIMIT:
-        return text
-    urls = urls[:_MAX_LINKS_PER_MESSAGE]
+    async def notify(note: str) -> None:
+        await safe_answer(message, note)
 
-    listed = "\n".join(f"<code>{html.escape(u[:120])}</code>" for u in urls)
-    await safe_answer(message, f"🔗 <b>Reading {len(urls)} link(s)…</b>\n{listed}")
-
-    blocks: list[str] = []
-    videos = 0
-    for url in urls:
-        video_id = youtube_video_id(url) if config.enable_youtube else None
-        if video_id is not None:
-            try:
-                transcript = await fetch_transcript(video_id)
-            except YouTubeError as exc:
-                await safe_answer(message, f"⚠️ <b>YouTube:</b> {html.escape(str(exc))}")
-                continue
-            videos += 1
-            blocks.append(
-                wrap_untrusted("web", f"{describe(transcript)}\n\n{transcript.text}")
-            )
-            continue
-        page = await fetch_url_text(url)
-        if page is None:
-            continue
-        header = f"[Web page: {page.url}]"
-        if page.title:
-            header += f"\nTitle: {page.title}"
-        blocks.append(wrap_untrusted("web", f"{header}\n\n{page.text}"))
-
+    blocks, remainder, videos = await read_links(text, notify)
     if not blocks:
-        await safe_answer(
-            message,
-            "⚠️ <b>Could not read the linked page(s)</b> — answering without them.",
-        )
+        if _find_urls(text) and len(remainder) <= _LINK_REMAINDER_LIMIT:
+            await safe_answer(
+                message,
+                "⚠️ <b>Could not read the linked page(s)</b> — answering without them.",
+            )
         return text
 
     request = remainder or (
@@ -1575,8 +1649,24 @@ async def _handle_document(message: Message) -> None:
             return
 
         caption = strip_bot_mention(message.caption or "")
+        link_blocks: list[str] = []
+        if config.enable_link_analysis and caption:
+            # Links in the caption belong to the same request as the file:
+            # read them too instead of silently dropping them.
+            async def notify(note: str) -> None:
+                await safe_answer(message, note)
+
+            async with waiting(message):
+                link_blocks, remainder, _ = await read_links(
+                    caption, notify, require_short=False
+                )
+            if link_blocks:
+                caption = remainder
         combined = _compose_document_context(
-            doc.file_name or "document", ocr_note + extracted, caption
+            doc.file_name or "document",
+            ocr_note + extracted,
+            caption,
+            link_blocks,
         )
         await _answer_with_ai(message, service, combined, access)
     except Exception:
