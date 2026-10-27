@@ -23,6 +23,7 @@ from bot.handlers import (
     guest,
     help,
     image,
+    menu,
     models,
     prompt,
     reminders,
@@ -54,6 +55,9 @@ dp.include_router(reminders.router)
 dp.include_router(export.router)
 dp.include_router(clear.router)
 dp.include_router(stats.router)
+# Menu buttons arrive as plain text: they must be matched before admin_panel
+# (admin text input) and the catch-all chat router.
+dp.include_router(menu.router)
 dp.include_router(admin.router)
 dp.include_router(admin_panel.router)
 if config.enable_guest_mode:
@@ -188,7 +192,7 @@ async def main() -> None:
 
         if config.enable_mcp and config.mcp_servers:
             logger.info(
-                "MCP: %d server(s) configured (%s), admin-only=%s",
+                "MCP: %d server(s) configured (%s), owner-only=%s",
                 len(config.mcp_servers),
                 ", ".join(config.mcp_servers),
                 config.mcp_admin_only,

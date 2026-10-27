@@ -72,7 +72,22 @@ async def _handle_generation_command(
         await message.answer(usage)
         return
 
-    prompt = parts[1].strip()
+    await _run_generation(message, sender, parts[1].strip())
+
+
+async def generate_image_from_prompt(message: Message, prompt: str) -> None:
+    """Generate an image for ``prompt`` (the reply-menu dialog's second step)."""
+    if not config.enable_image_generation:
+        await message.answer("🚫 <b>Image generation is disabled.</b>")
+        return
+    await _run_generation(message, generate_and_send_image, prompt.strip())
+
+
+async def _run_generation(message: Message, sender: Sender, prompt: str) -> None:
+    """Take the user's concurrency slot and generate under it."""
+    user = message.from_user
+    if user is None:
+        return
     with limits.slot(user.id) as granted:
         if not granted:
             await message.answer(limits.BUSY_MESSAGE)

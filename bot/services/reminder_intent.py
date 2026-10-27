@@ -16,6 +16,12 @@ requests right in the chat. This module turns them into the same
 
 Any fallback path — AI failure, broken JSON, a message that is not a request —
 returns ``None`` and the caller continues the normal chat flow.
+
+Intended behaviour (not a gap): the detection call is a small, bounded
+service call and does NOT consume the daily question quota, exactly like
+creating a reminder (see ``/remind``). Its cost is bounded by the pre-filter,
+the per-user concurrency cap, ``max_tokens`` and the reminder limits. Forwarded
+messages never reach it. The *scheduled* AI run, by contrast, is charged.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from bot.config import config
 from bot.services.ai_client import ai_client
 from bot.services.reminders import (
     ParsedReminder,
@@ -35,11 +42,25 @@ from bot.services.reminders import (
 
 logger = logging.getLogger(__name__)
 
-# Cheap pre-filter. Only words that are unlikely in ordinary questions;
-# a false positive merely costs one tiny AI call, a false negative loses the
-# feature, so the net is cast wide (rus+eng).
-_PREFILTER = re.compile(
-    r"напом|будильник|разбуди|remind|reminder",
+# Cheap pre-filter over the first REMINDER_PREFILTER_CHARS characters. A false
+# positive merely costs one tiny AI call, a false negative loses the feature,
+# so the net is cast wide (rus+eng). Two independent signals:
+# 1. reminder words by stem — «поставь/установи/устнови напоминалку» match on
+#    the noun, so a typo or any verb in front does not matter;
+_TRIGGER_WORDS = re.compile(
+    r"напом|будильник|разбуд|не\s+(?:дай|давай)\s+забы|таймер|remind|alarm",
+    re.IGNORECASE,
+)
+# 2. a schedule phrase with no reminder word at all: «завтра в 9 утра покажи
+#    погоду в москве», «каждый день в 8 присылай новости». The AI call decides.
+_SCHEDULE_PHRASE = re.compile(
+    r"\bзавтра\b|\bпослезавтра\b"
+    r"|\bчерез\s+(?:\d+|час|полчаса|минуту|пару|несколько)\b"
+    r"|\bв\s+\d{1,2}(?:[:.]\d{2})?\b"
+    r"|\bкажд(?:ый|ое|ую|ые)\b|\bежедневно\b|\bеженедельно\b"
+    r"|\bпо\s+(?:будням|выходным|понедельникам|вторникам|средам|четвергам"
+    r"|пятницам|субботам|воскресеньям)\b"
+    r"|\btomorrow\b|\bin\s+\d+\b|\bevery\b|\bdaily\b|\bat\s+\d",
     re.IGNORECASE,
 )
 
@@ -69,8 +90,15 @@ INTENT_SYSTEM_PROMPT = (
     "- Requested phrases like «every weekday» cannot be expressed exactly; "
     "use the closest slot only when it keeps the user's intent (weekday "
     "work requests ≈ daily), otherwise answer {\"reminder\": false}.\n"
-    "- If at fire time the user wants the bot to ask its AI model (news "
-    "briefing, daily summary, birthday ideas...), prefix TEXT with 'ai: '.\n"
+    "- Decide PLAIN vs AI. PLAIN: the user must do something themselves "
+    "(call mom, drink water, buy bread) — TEXT is just that note. AI: at fire "
+    "time the bot itself must fetch or produce something (weather, news, "
+    "exchange rates, a summary, ideas, «покажи», «пришли», «расскажи») — "
+    "prefix TEXT with 'ai: ' and make the rest a self-contained request. The "
+    "bot can search the web when the AI request runs.\n"
+    "- A message with a time phrase but no word «remind» (e.g. «завтра в 9 "
+    "утра покажи погоду в москве») is still a reminder request when it asks "
+    "the bot to do something at that time.\n"
     "- TEXT is the reminder itself without any time phrase.\n\n"
     "Examples:\n"
     '«напомни завтра в 5 вечера позвонить маме» → '
@@ -79,6 +107,15 @@ INTENT_SYSTEM_PROMPT = (
     '{"reminder": true, "spec": "in 30 minutes", "text": "check the oven"}\n'
     '«every morning say hi» → '
     '{"reminder": true, "spec": "daily at 09:00", "text": "say hi"}\n'
+    '«завтра в 9 утра покажи погоду в москве» → '
+    '{"reminder": true, "spec": "tomorrow at 09:00", '
+    '"text": "ai: покажи погоду в москве"}\n'
+    '«каждый день в 8 присылай новости по ИИ» → '
+    '{"reminder": true, "spec": "daily at 08:00", '
+    '"text": "ai: пришли свежие новости по ИИ"}\n'
+    '«поставь напоминалку на 18:00 купить хлеб» → '
+    '{"reminder": true, "spec": "at 18:00", "text": "купить хлеб"}\n'
+    '«в 5 классе мы учили алгебру» → {"reminder": false}\n'
     '«what can you remind me about?» → {"reminder": false}'
 )
 
@@ -92,9 +129,16 @@ class _ModelAnswer:
     text: str
 
 
-def looks_like_reminder(text: str) -> bool:
-    """Cheap check: does the message even contain reminder-like words?"""
-    return bool(text and _PREFILTER.search(text))
+def looks_like_reminder(text: str, limit: int | None = None) -> bool:
+    """Cheap check: reminder words or a schedule phrase at the message start.
+
+    Only the first ``limit`` characters are inspected (default
+    ``REMINDER_PREFILTER_CHARS``); a trigger further in is not a request.
+    """
+    if not text:
+        return False
+    head = text[: limit or config.reminder_prefilter_chars]
+    return bool(_TRIGGER_WORDS.search(head) or _SCHEDULE_PHRASE.search(head))
 
 
 def _extract_json(answer: str) -> _ModelAnswer | None:

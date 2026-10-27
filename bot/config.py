@@ -348,6 +348,11 @@ def _mcp_server_entry(name: str, entry: Any) -> dict[str, Any] | None:
     cwd = entry.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
         server["cwd"] = cwd.strip()
+    allowed = entry.get("allowed_tools")
+    if isinstance(allowed, list) and all(isinstance(a, str) for a in allowed):
+        server["allowed_tools"] = [a.strip() for a in allowed if a.strip()]
+    elif allowed is not None:
+        log.warning("MCP server %r has invalid allowed_tools; using the default", name)
     return server
 
 
@@ -694,6 +699,11 @@ class Config:
     max_extracted_chars: int = field(
         default_factory=lambda: _env_int("MAX_EXTRACTED_CHARS", 15_000)
     )
+    # Time budget for parsing one document (PDF/DOCX/XLSX/PPTX) or fetched
+    # page, seconds. The parsers run in their own small thread pool.
+    document_parse_timeout: float = field(
+        default_factory=lambda: _env_float("DOCUMENT_PARSE_TIMEOUT", 30.0)
+    )
     # Maximum accepted document size (bytes). Telegram bots can download
     # up to 20 MB, so values above that are clamped.
     max_document_bytes: int = field(
@@ -765,8 +775,9 @@ class Config:
     # --- MCP (Model Context Protocol) providers ---
     # The chat model gets tools exposed by one or more MCP servers. The main
     # use case is the Obsidian "second brain": search and read personal notes
-    # through the ``brain`` server. The whole feature is admin-only by default
-    # (MCP_ADMIN_ONLY) because the notes are private.
+    # through the ``brain`` server. The whole feature is owner-only by default
+    # (MCP_ADMIN_ONLY: only ADMIN_IDS, not promoted admins) because the notes
+    # are private.
     enable_mcp: bool = field(
         default_factory=lambda: _env_bool("MCP_ENABLED", True)
     )
@@ -807,6 +818,18 @@ class Config:
     mcp_max_rounds: int = field(
         default_factory=lambda: _env_int("MCP_MAX_ROUNDS", 2)
     )
+    # Which MCP tools the model may see and call (names as the server reports
+    # them, comma-separated; "*" = everything the server offers). Servers whose
+    # ``.mcp.json`` entry has its own ``allowed_tools`` list use that instead.
+    # NOTE: the default is the current read-only set of the Obsidian «second
+    # brain» server and may be changed in the future (new read tools, or write
+    # tools if they are ever deliberately enabled); anything not listed is
+    # hidden from the model and refused even if the server offers it.
+    mcp_allowed_tools: str = field(
+        default_factory=lambda: _env(
+            "MCP_ALLOWED_TOOLS", default="search_notes,get_chunk,get_note,list_notes"
+        )
+    )
     # Upper bound for one tool result added to the model context.
     mcp_max_result_chars: int = field(
         default_factory=lambda: _env_int("MCP_MAX_RESULT_CHARS", 12_000)
@@ -840,6 +863,21 @@ class Config:
     # of the chat flow is unaffected and guests never reach the detection.
     reminder_freeform: bool = field(
         default_factory=lambda: _env_bool("REMINDER_FREEFORM", True)
+    )
+    # Сколько первых символов сообщения просматривает дешёвый префильтр
+    # намерений (напоминание / рисование): ключевые слова дальше не ищутся.
+    reminder_prefilter_chars: int = field(
+        default_factory=lambda: _env_int("REMINDER_PREFILTER_CHARS", 64)
+    )
+    # Единый классификатор намерений запроса (services/request_intent.py):
+    # рисование / напоминание / ссылка / документ. Выключен — прежнее поведение.
+    request_intent: bool = field(
+        default_factory=lambda: _env_bool("REQUEST_INTENT", True)
+    )
+    # Максимум символов, уходящих в нейросеть при классификации намерения
+    # (оборванное последнее слово отбрасывается).
+    request_intent_max_chars: int = field(
+        default_factory=lambda: _env_int("REQUEST_INTENT_MAX_CHARS", 256)
     )
     # IANA timezone used to interpret "at 15:30" / "daily at 9:00" and to
     # display fire times (Linux: system tzdata; Windows: the tzdata package).
@@ -896,6 +934,13 @@ class Config:
     )
     export_max_messages: int = field(
         default_factory=lambda: _env_int("EXPORT_MAX_MESSAGES", 200)
+    )
+
+    # --- Постоянная клавиатура меню ---
+    # Reply-клавиатура под полем ввода в личке (модели, персона, картинки,
+    # напоминания, экспорт, очистка, настройки, статистика, справка).
+    enable_reply_menu: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_REPLY_MENU", True)
     )
 
     # Simultaneous AI requests allowed per user (protects the paid API).
@@ -1120,6 +1165,7 @@ class Config:
         # Document & link analysis limits. Telegram bots cannot download
         # files larger than 20 MB, so the document cap stops there.
         self.max_extracted_chars = max(2_000, min(self.max_extracted_chars, 100_000))
+        self.document_parse_timeout = max(5.0, min(self.document_parse_timeout, 300.0))
         self.max_document_bytes = max(
             1_048_576, min(self.max_document_bytes, 20 * 1024 * 1024)
         )
@@ -1130,6 +1176,12 @@ class Config:
         )
         self.link_crawl_max_fetches = max(
             1, min(self.link_crawl_max_fetches, 100)
+        )
+        self.reminder_prefilter_chars = max(
+            16, min(self.reminder_prefilter_chars, 512)
+        )
+        self.request_intent_max_chars = max(
+            32, min(self.request_intent_max_chars, 1024)
         )
         # OCR pages and transcript size bound the paid tokens of one request.
         self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))

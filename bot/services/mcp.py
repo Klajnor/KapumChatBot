@@ -21,8 +21,9 @@ Design notes:
   ``DATABASE_URL`` — are never inherited by third-party MCP code, and
   ``${VAR}`` references to them in the config are refused. Anything a server
   needs beyond the allowlist must be listed explicitly in its ``env``.
-* The feature is **admin-only by default** (``MCP_ADMIN_ONLY``): notes and
-  personal knowledge bases must not leak to other users of the bot.
+* The feature is **owner-only by default** (``MCP_ADMIN_ONLY``): notes and
+  personal knowledge bases belong to the owner (``ADMIN_IDS``) and must not
+  leak to anyone else — admins promoted from the admin menu included.
 
 See README → «🧠 MCP-провайдер „Второй мозг“ (Obsidian)».
 """
@@ -85,6 +86,23 @@ class MCPServerConfig:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
+    # None — use MCP_ALLOWED_TOOLS; otherwise this server's own list.
+    allowed_tools: list[str] | None = None
+
+    def permits(self, tool_name: str) -> bool:
+        """True when the model may see and call ``tool_name`` of this server.
+
+        Default-deny: a tool the server adds later (a write or delete tool, say)
+        stays invisible until it is listed in ``MCP_ALLOWED_TOOLS`` (or the
+        server's ``allowed_tools``). ``"*"`` allows everything. The current
+        list is the read-only set of the second-brain server and may change.
+        """
+        allowed = (
+            self.allowed_tools
+            if self.allowed_tools is not None
+            else [part.strip() for part in config.mcp_allowed_tools.split(",")]
+        )
+        return "*" in allowed or tool_name in allowed
 
 
 @dataclass(slots=True)
@@ -257,13 +275,16 @@ def _format_tool_result(result: Any) -> str:
 def mcp_available(telegram_id: int | None) -> bool:
     """True when MCP tools may be offered to this user.
 
-    With the default ``MCP_ADMIN_ONLY=true`` only IDs from ``ADMIN_IDS`` get
-    the tools; everyone else chats exactly as before.
+    With the default ``MCP_ADMIN_ONLY=true`` only the owners (IDs from
+    ``ADMIN_IDS``) get the tools. Admins promoted at runtime from the admin
+    menu are deliberately excluded: they can be granted by an owner without
+    being trusted with the owner's private notes. Everyone else chats exactly
+    as before.
     """
     if not config.enable_mcp or not config.mcp_servers:
         return False
     if config.mcp_admin_only:
-        return telegram_id is not None and config.is_admin(telegram_id)
+        return telegram_id is not None and config.is_owner(telegram_id)
     return True
 
 
@@ -307,6 +328,7 @@ class MCPClient:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._tools: list[MCPTool] | None = None
+        self.hidden_tools: list[str] = []  # offered by the server, not allowed
         self._closed = False
 
     @property
@@ -388,6 +410,7 @@ class MCPClient:
             return self._tools
         await self.start()
         tools: list[MCPTool] = []
+        hidden: list[str] = []
         cursor: str | None = None
         for _ in range(20):  # pagination guard
             params: dict[str, Any] = {}
@@ -402,6 +425,9 @@ class MCPClient:
                 if not isinstance(item, dict) or not item.get("name"):
                     continue
                 name = str(item["name"])
+                if not self.server.permits(name):
+                    hidden.append(name)
+                    continue
                 tools.append(
                     MCPTool(
                         server=self.server.name,
@@ -415,10 +441,20 @@ class MCPClient:
             if not cursor:
                 break
         self._tools = tools
+        self.hidden_tools = hidden
+        if hidden:
+            logger.info(
+                "MCP %r: %d tool(s) not in the allowlist and hidden: %s",
+                self.server.name,
+                len(hidden),
+                ", ".join(hidden[:20]),
+            )
         return tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Invoke one tool and flatten the result into text."""
+        if not self.server.permits(name):  # defence in depth: never reach the server
+            raise MCPError(f"MCP tool {name!r} is not allowed")
         await self.start()
         result = await self._request(
             "tools/call",
@@ -628,6 +664,11 @@ class MCPManager:
                     for key, value in (raw.get("env") or {}).items()
                 },
                 cwd=raw.get("cwd"),
+                allowed_tools=(
+                    [str(tool) for tool in raw["allowed_tools"]]
+                    if isinstance(raw.get("allowed_tools"), list)
+                    else None
+                ),
             )
             client = MCPClient(server, timeout=float(config.mcp_timeout))
             self._clients[name] = client
@@ -720,6 +761,7 @@ class MCPManager:
                     "name": name,
                     "running": client.running,
                     "tools": tools,
+                    "hidden": list(client.hidden_tools),
                     "error": error,
                 }
             )

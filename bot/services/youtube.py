@@ -69,10 +69,10 @@ def parse_json3(raw: bytes | str) -> str:
         segments = event.get("segs")
         if not segments:
             continue
-        text = " ".join("".join(seg.get("utf8", "") for seg in segments).split())
+        text = " ".join("".join(seg.get("utf8") or "" for seg in segments).split())
         if not text:
             continue
-        start = event.get("tStartMs", 0) / 1000
+        start = (event.get("tStartMs") or 0) / 1000
         index = int(start // _BUCKET_SECONDS)
         if index != bucket:
             bucket = index
@@ -160,7 +160,7 @@ def _load_transcript(video_id: str) -> Transcript:
 
     try:
         text = parse_json3(body)
-    except (ValueError, AttributeError) as exc:
+    except (ValueError, AttributeError, TypeError) as exc:
         logger.warning("Unreadable caption track for %s: %s", video_id, exc)
         raise YouTubeError("The captions of this video could not be read.") from exc
     if not text.strip():

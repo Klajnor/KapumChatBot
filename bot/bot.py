@@ -27,6 +27,7 @@ bot_username: str = config.bot_username
 _COMMANDS = [
     BotCommand(command="start", description="Start / welcome"),
     BotCommand(command="help", description="Show all commands"),
+    BotCommand(command="menu", description="Show the button menu"),
     BotCommand(command="models", description="Choose an AI model"),
     BotCommand(command="model", description="Show the current model"),
     BotCommand(command="image", description="Generate an image from a prompt"),

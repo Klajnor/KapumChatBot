@@ -875,7 +875,11 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
                     return ["127.0.0.1"]
                 return real_resolve(host)
 
-            with patch.object(documents, "_resolve_public_ips", fake_resolve):
+            # The local test server listens on a random port; real fetches are
+            # limited to 80/443 (see test_fetch_refuses_non_web_ports).
+            with patch.object(documents, "_resolve_public_ips", fake_resolve), patch.object(
+                documents, "_ALLOWED_PORTS", frozenset({port})
+            ):
                 body, final_url, content_type = await documents._fetch_body(
                     f"http://127.0.0.1:{port}/ok"
                 )

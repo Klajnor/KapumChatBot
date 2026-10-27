@@ -401,9 +401,10 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         ai.assert_not_awaited()
         disable.assert_awaited_once_with(1)
 
-    async def test_exhausted_daily_quota_does_not_disable_reminder(self):
-        """Regression: reminders are free, so an exhausted *question* budget
-        must not switch them off — only losing authorization may."""
+    async def test_exhausted_daily_quota_skips_run_but_keeps_reminder(self):
+        """An exhausted *question* budget skips the paid run (it is charged
+        like a typed question) but must not switch the reminder off — only
+        losing authorization may."""
         from bot.services import reminders
         from bot.services.access import AccessResult as AR
 
@@ -420,7 +421,8 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        exhausted = AR(allowed=True, role="allowed", remaining=0)
+        authorized = AR(allowed=True, role="allowed", remaining=0)
+        limit_hit = AR(allowed=False, role="allowed", message="limit")
         answer = SimpleNamespace(
             content="ok", elapsed=1.0, total_tokens=5, input_tokens=2,
             output_tokens=3, tool_calls=[],
@@ -433,8 +435,13 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(reminders, "async_session_factory", fake_session),
             patch.object(reminders, "UserService", return_value=service),
-            patch.object(reminders, "check_access", AsyncMock(return_value=exhausted)),
+            patch.object(
+                reminders,
+                "check_access",
+                AsyncMock(side_effect=[authorized, limit_hit]),
+            ),
             patch.object(reminders, "_disable_reminder", AsyncMock()) as disable,
+            patch.object(reminders, "_send_html", AsyncMock()) as notice,
             patch.object(reminders, "_send_markdown", AsyncMock(return_value=True)),
             patch.object(reminders, "search_configured", return_value=False),
             patch.object(
@@ -445,7 +452,9 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await reminders._fire_ai(due)
         disable.assert_not_awaited()
-        ai.assert_awaited_once()
+        ai.assert_not_awaited()
+        notice.assert_awaited_once()
+        self.assertIn("skipped", notice.await_args.args[1])
 
     async def test_fire_time_probe_ignores_quota(self):
         """The gate must ask 'still authorized?', never 'any quota left?'."""

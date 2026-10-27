@@ -813,7 +813,7 @@ async def _digest_action(
     elif action == "dgt":
         await _show_time(callback)
     elif action == "dgh":
-        if not arg.isdigit() or not 0 <= int(arg) <= 23:
+        if not (arg.isascii() and arg.isdigit()) or not 0 <= int(arg) <= 23:
             await safe_answer_callback(callback)
             return
         await digest.set_setting(digest.SETTING_TIME, f"{int(arg):02d}:00")
@@ -850,7 +850,7 @@ async def _resolve_channel(message: Message, text: str) -> tuple[Any, str]:
     ref: Any
     if chat is not None:
         ref = chat.id
-    elif text.lstrip("-").isdigit():
+    elif text.isascii() and text.lstrip("-").isdigit() and len(text) <= 20:
         ref = int(text)
     elif text.startswith("@") and len(text) > 1:
         ref = text.split()[0]

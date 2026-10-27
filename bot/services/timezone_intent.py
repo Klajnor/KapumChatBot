@@ -5,6 +5,10 @@ model proposes one IANA zone name, and the handler shows the user the
 current time in that zone for confirmation before anything is saved. The
 returned name is re-validated against :mod:`zoneinfo`, so a hallucinated
 zone can never reach the database.
+
+Intended behaviour (not a gap): this lookup is a tiny one-off helper of the
+``/timezone`` dialog and does NOT consume the daily question quota. The dialog
+is only open on request, expires after 10 minutes and ignores forwarded text.
 """
 
 from __future__ import annotations

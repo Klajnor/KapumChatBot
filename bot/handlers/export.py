@@ -319,7 +319,7 @@ async def cb_export_answer(callback: CallbackQuery) -> None:
         await safe_answer_callback(callback, "🚫 Export is disabled.", show_alert=True)
         return
     parts = (callback.data or "").split(":")
-    if len(parts) != 3 or parts[1] not in _FORMATS or not parts[2].isdigit():
+    if len(parts) != 3 or parts[1] not in _FORMATS or not (parts[2].isascii() and parts[2].isdigit()):
         await safe_answer_callback(callback)
         return
 

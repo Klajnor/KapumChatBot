@@ -41,6 +41,7 @@ from bot.services.ai_client import (
     is_vision_model,
 )
 from bot.services.documents import (
+    DocumentParseTimeout,
     FetchedPage,
     clip_extracted,
     detect_file_type,
@@ -63,6 +64,7 @@ from bot.services.mcp import (
 from bot.services.outgoing_files import files_tool, prepare_files
 from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
+from bot.services.request_intent import Intent, classify_request
 from bot.services.rich import (
     RICH_LIMIT,
     next_draft_id,
@@ -82,6 +84,7 @@ from bot.services.search import (
 from bot.services.telegram_utils import (
     edit_formatted,
     format_timing,
+    is_forwarded,
     is_reply_to_bot,
     mentions_bot,
     safe_answer,
@@ -1269,12 +1272,17 @@ async def _answer_with_ai(
     *,
     user: User | None = None,
     model_override: str | None = None,
+    intent_text: str | None = None,
+    from_voice: bool = False,
 ) -> None:
     """Produce the assistant reply for ``text``: a message and/or an image.
 
     ``model_override`` answers once with another model without touching the
     user's stored setting; ``user`` lets callback handlers pass the pressing
     user explicitly (a bot message's ``from_user`` is the bot itself).
+    ``intent_text`` is the user's own words (without quoted/fetched context):
+    when given and ``REQUEST_INTENT`` is on, the request is classified and the
+    image/sticker tools are offered only for an image intent.
     """
     user = user or message.from_user
     if user is None:
@@ -1282,6 +1290,11 @@ async def _answer_with_ai(
 
     settings = await service.get_user_settings(user.id)
     model = model_override or settings["model"]
+    intent: Intent | None = None
+    if config.request_intent and intent_text is not None:
+        intent = await classify_request(
+            intent_text, model, from_voice=from_voice, skip_reminder=True
+        )
     history = await service.get_history(message.chat.id, user_id=user.id)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": settings["system_prompt"]},
@@ -1301,9 +1314,12 @@ async def _answer_with_ai(
     )
 
     tools: list[dict[str, Any]] = []
-    if config.enable_image_generation:
+    # Without an image intent (when classification ran) the model is not even
+    # offered the generation tools, so it cannot draw by accident.
+    allow_images = intent is None or intent is Intent.IMAGE
+    if config.enable_image_generation and allow_images:
         tools.append(IMAGE_TOOL)
-    if config.enable_sticker_generation:
+    if config.enable_sticker_generation and allow_images:
         tools.append(STICKER_TOOL)
     if config.enable_file_replies:
         tools.append(files_tool())
@@ -1567,6 +1583,7 @@ async def handle_text(message: Message) -> None:
             # A message that is essentially bare links is expanded with the
             # fetched page content. Runs after the access check on purpose:
             # only authorized users may make the server issue HTTP requests.
+            own_text = text
             if config.enable_link_analysis:
                 text = await _expand_links_with_content(message, text)
             # Replies to text/media messages and forwards carry their
@@ -1576,7 +1593,15 @@ async def handle_text(message: Message) -> None:
             await message.bot.send_chat_action(
                 chat_id=message.chat.id, action=ChatAction.TYPING
             )
-            await _answer_with_ai(message, service, text, access)
+            await _answer_with_ai(
+                message,
+                service,
+                text,
+                access,
+                # A forward is somebody else's words: no intent from it, the
+                # image tools stay as before.
+                intent_text=None if is_forwarded(message) else own_text,
+            )
         except Exception:
             # A crash after the quota was taken must not bill the user for a
             # request that never produced an answer; refund_access is a no-op
@@ -1673,10 +1698,28 @@ async def _handle_voice(message: Message) -> None:
             f"🎤 <b>Recognized</b>{asr_timing}:\n<i>{html.escape(transcript)}</i>",
         )
 
+        # A spoken «напомни завтра в 9…» is a reminder, exactly like typed
+        # text. Creation is free, so the question taken for this voice
+        # message is given back. Links are NOT expanded for voice: speech
+        # recognition may have distorted the address.
+        if await maybe_freeform_reminder(message, transcript):
+            await refund_access(service, user.id, access)
+            return
+
         await message.bot.send_chat_action(
             chat_id=message.chat.id, action=ChatAction.TYPING
         )
-        await _answer_with_ai(message, service, transcript, access)
+        # A forwarded voice note (or a reply quoting someone) carries somebody
+        # else's words: frame it as data, exactly like forwarded text, so it
+        # cannot steer the MCP / file tools.
+        await _answer_with_ai(
+            message,
+            service,
+            _with_quoted_context(message, transcript),
+            access,
+            intent_text=None if is_forwarded(message) else transcript,
+            from_voice=True,
+        )
     except Exception:
         if access is not None:
             await refund_access(service, user.id, access)
@@ -1771,7 +1814,18 @@ async def _handle_document(message: Message) -> None:
 
         ocr_note = ""
         async with waiting(message):
-            extracted = await extract_document_text(file_type, data)
+            try:
+                extracted = await extract_document_text(file_type, data)
+            except DocumentParseTimeout:
+                await refund_access(service, user.id, access)
+                await safe_answer(
+                    message,
+                    "⏱️ <b>The file took too long to process.</b>\n\n"
+                    f"Parsing is limited to {config.document_parse_timeout:g} s. "
+                    "Try a smaller file or fewer pages. Your question was not "
+                    "counted.",
+                )
+                return
             if not extracted and file_type == "pdf" and config.enable_pdf_ocr:
                 await safe_answer(
                     message,

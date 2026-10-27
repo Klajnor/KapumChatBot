@@ -38,6 +38,13 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def get_dialog_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Cancel button under a menu dialog prompt (image / reminder)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✖ Cancel", callback_data="menu:cancel")
+    return builder.as_markup()
+
+
 def get_enhance_choice_keyboard() -> InlineKeyboardMarkup:
     """Ask where to enhance the photo: local server pipeline or AI redraw."""
     builder = InlineKeyboardBuilder()

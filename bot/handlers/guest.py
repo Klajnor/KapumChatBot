@@ -27,7 +27,11 @@ from bot.handlers.chat import (
 from bot.services import limits
 from bot.services.access import AccessResult, check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client, is_vision_model
-from bot.services.documents import detect_file_type, extract_document_text
+from bot.services.documents import (
+    DocumentParseTimeout,
+    detect_file_type,
+    extract_document_text,
+)
 from bot.services.intent import (
     VISION_FOR_GEN_PROMPT,
     detect_intent,
@@ -289,7 +293,18 @@ async def _build_reply(
             )
         extracted = None
         if len(data) <= config.max_document_bytes:
-            extracted = await extract_document_text(file_type, data)
+            try:
+                extracted = await extract_document_text(file_type, data)
+            except DocumentParseTimeout:
+                await refund_access(service, caller_id, access)
+                return GuestReply(
+                    text=(
+                        "⏱️ The file took too long to process "
+                        f"(limit {config.document_parse_timeout:g} s). "
+                        "Try a smaller file."
+                    ),
+                    mode="plain",
+                )
         if not extracted:
             await refund_access(service, caller_id, access)
             return GuestReply(

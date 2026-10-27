@@ -41,8 +41,25 @@ class TestPrefilter(unittest.IsolatedAsyncioTestCase):
             "remind me in 30 minutes",
             "Set a reminder about the report",
             "What is my reminder status?",
+            "поставь напоминалку на завтра",
+            "устнови напоминалку в 18:00",
+            "создай напоминание про отчёт",
         ):
             self.assertTrue(looks_like_reminder(text), text)
+
+    def test_matches_schedule_without_reminder_word(self):
+        for text in (
+            "завтра в 9 утра покажи погоду в москве",
+            "каждый день в 8 присылай новости",
+            "через 2 часа пришли курс доллара",
+            "tomorrow at 9 show me the weather",
+        ):
+            self.assertTrue(looks_like_reminder(text), text)
+
+    def test_only_first_chars_are_inspected(self):
+        text = "а" * 70 + " напомни завтра"
+        self.assertFalse(looks_like_reminder(text))
+        self.assertTrue(looks_like_reminder(text, limit=200))
 
     def test_ignores_ordinary_chat(self):
         for text in (

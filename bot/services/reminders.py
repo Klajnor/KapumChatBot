@@ -12,9 +12,12 @@ double fire on the next tick. Fires run as independent tasks: one slow AI
 request does not hold up the other reminders.
 
 A reminder in ``ai_mode`` sends its stored prompt to the user's model at
-fire time and delivers the answer. Scheduled AI requests do NOT consume the
-interactive daily quota — their cost is bounded by the reminder limits
-(``REMINDER_LIMIT`` / ``REMINDER_RECURRING_LIMIT`` / minimum interval).
+fire time and delivers the answer. Creating a reminder is free, but every
+scheduled AI run costs one question from the daily quota, like a typed one
+(admins are unlimited); with the budget spent the run is skipped and the
+reminder kept, and a failed run is refunded. The reminder limits
+(``REMINDER_LIMIT`` / ``REMINDER_RECURRING_LIMIT`` / minimum interval) bound
+the rate on top of that.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from bot.bot import bot
 from bot.config import config
 from bot.database.repository import ReminderRepository, UserRepository
 from bot.database.session import async_session_factory
-from bot.services.access import check_access
+from bot.services.access import check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
 from bot.services.search import (
@@ -566,6 +569,14 @@ async def _run_ai_prompt(
             )
 
 
+async def _refund_ai_run(user_id: int, access: Any) -> None:
+    """Give the question back when a scheduled AI run produced no answer."""
+    if access is None or not getattr(access, "consumed", False):
+        return
+    async with async_session_factory() as session:
+        await refund_access(UserService(session), user_id, access)
+
+
 async def _fire_ai(due: DueReminder) -> None:
     """Run the stored prompt through the user's model and deliver the answer."""
     async with async_session_factory() as session:
@@ -581,6 +592,14 @@ async def _fire_ai(due: DueReminder) -> None:
         gate = await check_access(
             service, due.user_id, consume=False, require_quota=False
         )
+        # A scheduled AI request is a paid model call (with web search), so it
+        # costs one question exactly like a typed one — otherwise an exhausted
+        # daily budget could be bypassed with «/remind in 5 minutes ai: ...».
+        # Only an authorized non-guest is charged (guests would burn their
+        # free-trial messages); admins are unlimited and consume nothing.
+        access = None
+        if gate.allowed and gate.role != "guest":
+            access = await check_access(service, due.user_id)
 
     if not gate.allowed or gate.role == "guest":
         # Guests may not hold scheduled AI reminders at all (see /remind).
@@ -593,8 +612,29 @@ async def _fire_ai(due: DueReminder) -> None:
         await _disable_reminder(due.id)
         return
 
-    result, elapsed = await _run_ai_prompt(due, settings, history)
+    if access is not None and not access.allowed:
+        # Out of questions for today: skip this run but keep the reminder (a
+        # recurring one tries again at its next fire time).
+        logger.info(
+            "Reminder %s: user %s has no questions left today; run skipped",
+            due.id,
+            due.user_id,
+        )
+        await _send_html(
+            due.chat_id,
+            "⏳ <b>Scheduled AI request skipped</b> — your daily question "
+            "limit is used up.\n"
+            f"<i>Prompt: {html.escape(due.text[:300])}</i>",
+        )
+        return
+
+    try:
+        result, elapsed = await _run_ai_prompt(due, settings, history)
+    except Exception:
+        await _refund_ai_run(due.user_id, access)
+        raise
     if not result.content:
+        await _refund_ai_run(due.user_id, access)
         await _send_html(
             due.chat_id,
             "❌ <b>Scheduled AI request failed</b> — the model returned no "

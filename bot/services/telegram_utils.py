@@ -236,6 +236,14 @@ def is_reply_to_bot(message: Message) -> bool:
     )
 
 
+def is_forwarded(message: Message) -> bool:
+    """True for a forwarded message: its text was written by somebody else."""
+    return (
+        getattr(message, "forward_origin", None) is not None
+        or getattr(message, "forward_date", None) is not None
+    )
+
+
 # --- Guest mode ------------------------------------------------------------
 
 

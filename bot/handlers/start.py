@@ -3,11 +3,13 @@ from __future__ import annotations
 import html
 
 from aiogram import Router
+from aiogram.enums import ChatType
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from bot.bot import get_bot_username
 from bot.config import config
+from bot.keyboards.reply import menu_for_user
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import user_service
 
@@ -30,6 +32,7 @@ _BASE_COMMANDS = (
     "🧹 /clear — clear conversation history\n"
     "📊 /stats — your usage statistics (private chat only)\n"
     "⚙️ /settings — current settings (private chat only)\n"
+    "🧭 /menu — show the button menu\n"
     "❓ /help — all commands"
 )
 
@@ -72,6 +75,12 @@ async def cmd_start(message: Message) -> None:
         is_allowed = await service.is_allowed_user(user.id)
 
     safe_name = html.escape(user.first_name or "there")
+    # Persistent button menu: private chats of admins / whitelisted users only.
+    menu = (
+        await menu_for_user(user.id)
+        if message.chat.type == ChatType.PRIVATE
+        else None
+    )
 
     if config.is_admin(user.id):
         welcome_text = (
@@ -91,7 +100,7 @@ async def cmd_start(message: Message) -> None:
             f"{_guest_mode_hint()}\n\n"
             f"<i>Let's get started! 🚀</i>"
         )
-        await message.answer(welcome_text)
+        await message.answer(welcome_text, reply_markup=menu)
     elif is_allowed:
         await message.answer(
             f"👋 <b>Welcome back, {safe_name}!</b>\n\n"
@@ -100,7 +109,8 @@ async def cmd_start(message: Message) -> None:
             f"{_BASE_COMMANDS}\n\n"
             f"⚠️ <b>Daily limit:</b> {config.daily_limit} questions per day"
             f"{_guest_mode_hint()}\n\n"
-            f"<i>Happy chatting! 🚀</i>"
+            f"<i>Happy chatting! 🚀</i>",
+            reply_markup=menu,
         )
     else:
         await message.answer(

@@ -38,6 +38,7 @@ from bot.services.reminders import (
     remind_usage,
 )
 from bot.services.telegram_utils import (
+    is_forwarded,
     safe_answer,
     safe_answer_callback,
     safe_edit_text,
@@ -95,7 +96,8 @@ def _confirmation(
     if parsed.ai_mode:
         lines.append(
             "🤖 <b>AI request</b> — at fire time this prompt is sent to your "
-            "model and the answer is delivered here."
+            "model (with web search when needed) and the answer is delivered "
+            "here."
         )
     lines.append("")
     lines.append("Manage: /reminders (pause / resume / delete buttons) · /delreminder " + str(reminder_id))
@@ -146,6 +148,16 @@ async def cmd_remind(message: Message) -> None:
     if not config.enable_reminders:
         await safe_answer(message, "⚠️ Reminders are disabled on this bot.")
         return
+    # A forwarded "/remind ..." was written by someone else: a reminder must
+    # come from the user's own hands, and an AI reminder keeps sending a model
+    # request with that text on a schedule.
+    if is_forwarded(message):
+        await safe_answer(
+            message,
+            "⚠️ <b>Reminders cannot be created from a forwarded message.</b>\n\n"
+            "Type the /remind command yourself.",
+        )
+        return
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -160,6 +172,20 @@ async def cmd_remind(message: Message) -> None:
             tz = get_timezone(await service.get_reminder_timezone(user.id))
             await safe_answer(message, remind_usage(user_tz_name=str(tz)))
         return
+
+    await create_reminder_from_text(message, parts[1])
+
+
+async def create_reminder_from_text(message: Message, argument: str) -> bool:
+    """Parse ``<when> <text>`` and create the reminder; True when it was created.
+
+    The body of ``/remind`` and of the reply-menu dialog. Every failure has
+    already been explained to the user, so a caller only decides whether to
+    keep waiting for another attempt.
+    """
+    user = message.from_user
+    if user is None:
+        return False
 
     async with user_service() as service:
         await service.register_user(
@@ -184,25 +210,26 @@ async def cmd_remind(message: Message) -> None:
                     "Guests cannot create reminders."
                 ),
             )
-            return
+            return False
 
         # The wall-clock slots (at / tomorrow at / daily / weekly) are
         # interpreted in the user's personal zone (/timezone) when they set
         # one, otherwise in REMINDER_TIMEZONE.
         tz = get_timezone(await service.get_reminder_timezone(user.id))
-        parsed = parse_reminder(parts[1], tz=tz)
+        parsed = parse_reminder(argument, tz=tz)
         if isinstance(parsed, str):  # an error/help message for the user
             await safe_answer(message, parsed)
-            return
+            return False
 
         reminder_id, error = await create_reminder_record(
             service, user.id, message.chat.id, parsed
         )
         if error is not None:
             await safe_answer(message, error)
-            return
+            return False
 
     await safe_answer(message, _confirmation(reminder_id, parsed, tz))
+    return True
 
 
 async def maybe_freeform_reminder(message: Message, text: str) -> bool:
@@ -218,6 +245,10 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
     if user is None:
         return False
     if not config.enable_reminders or not config.reminder_freeform:
+        return False
+    # Forwarded text is somebody else's: never a reminder request. Returning
+    # False lets it continue as a (untrusted-wrapped) chat message.
+    if is_forwarded(message):
         return False
     # Layer 1: the cheap pre-filter. Messages without any reminder-like word
     # continue as chat without paying for detection.
@@ -269,7 +300,7 @@ PER_PAGE = 6
 async def _render_list(
     user_id: int, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """The /reminders text and its control keyboard (None markup when empty).
+    """The /reminders text and its control keyboard.
 
     Every callback carries the owner id so that, in a group, only the person
     who opened the list can press its buttons.
@@ -290,11 +321,15 @@ async def _render_list(
             for r in reminders
         ]
 
+    new_button = InlineKeyboardButton(
+        text="➕ New reminder", callback_data=f"rem:new:{user_id}"
+    )
     if not rows:
         return (
             ("📭 <b>No active reminders.</b>\n\n"
-            "Create one with /remind — the full format list is in /help."),
-            None,
+            "Create one with the button below or with /remind — the full "
+            "format list is in /help."),
+            InlineKeyboardMarkup(inline_keyboard=[[new_button]]),
         )
 
     pages = (len(rows) + PER_PAGE - 1) // PER_PAGE
@@ -351,7 +386,8 @@ async def _render_list(
             )
         builder.row(*nav)
     builder.row(
-        InlineKeyboardButton(text="🗑 Delete all", callback_data=f"rem:all:{user_id}")
+        new_button,
+        InlineKeyboardButton(text="🗑 Delete all", callback_data=f"rem:all:{user_id}"),
     )
     return "\n\n".join(blocks), builder.as_markup()
 
@@ -465,7 +501,7 @@ async def cmd_delreminder(message: Message) -> None:
             count = await service.delete_all_reminders(user.id)
             await safe_answer(message, f"✅ Deleted {count} reminder(s).")
             return
-        if not argument.isdigit():
+        if not (argument.isascii() and argument.isdigit()):
             await safe_answer(
                 message,
                 "⚠️ Pass the reminder number: <code>/delreminder 12</code> "
@@ -634,6 +670,8 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
     user = message.from_user
     if user is None or _get_dialog(user.id, message.chat.id) is None:
         return False
+    if is_forwarded(message):
+        return False  # a forwarded text is not the user's answer
 
     lowered = text.strip().lower().rstrip("!.")
     if lowered in ("cancel", "отмена", "не надо", "стоп"):

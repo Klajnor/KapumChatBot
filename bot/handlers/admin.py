@@ -57,7 +57,7 @@ def _parse_target(raw: str) -> tuple[int | None, str | None]:
             value = value[len(prefix) :]
             break
     value = value.lstrip("@").strip()
-    if value.isdigit():
+    if value.isascii() and value.isdigit() and len(value) <= 18:
         return int(value), None
     return None, value or None
 
@@ -343,9 +343,18 @@ async def cmd_admin_stats(message: Message) -> None:
 
 
 @router.message(Command("mcp"))
-@_admin_required
 async def cmd_mcp(message: Message) -> None:
-    """Handle /mcp — show configured MCP servers, their status and tools."""
+    """Handle /mcp — show configured MCP servers, their status and tools.
+
+    Owners only (``ADMIN_IDS``): the servers expose the owner's private notes,
+    and the status call may start the server processes.
+    """
+    user = message.from_user
+    if user is None or not config.is_owner(user.id):
+        await message.answer(
+            "⛔ <b>Access denied.</b> This command is for the bot owner only."
+        )
+        return
     if not config.enable_mcp:
         await message.answer(
             "ℹ️ <b>MCP is disabled.</b>\n\n"
@@ -378,8 +387,15 @@ async def cmd_mcp(message: Message) -> None:
             lines.append(f"   • <code>{html.escape(str(name))}</code>")
         if len(tools) > 15:
             lines.append(f"   … +{len(tools) - 15} more")
+        hidden = entry.get("hidden") or []
+        if hidden:
+            shown = ", ".join(html.escape(str(name)) for name in hidden[:10])
+            more = f" … +{len(hidden) - 10}" if len(hidden) > 10 else ""
+            lines.append(
+                f"   🚫 Hidden (not in <code>MCP_ALLOWED_TOOLS</code>): {shown}{more}"
+            )
     lines.append("")
-    lines.append(f"🔐 Admin-only: <b>{'yes' if config.mcp_admin_only else 'no'}</b>")
+    lines.append(f"🔐 Owner-only: <b>{'yes' if config.mcp_admin_only else 'no'}</b>")
     if config.mcp_config_file:
         lines.append(
             f"📄 Config: <code>{html.escape(config.mcp_config_file)}</code>"

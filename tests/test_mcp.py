@@ -247,6 +247,48 @@ class MCPConfigTests(unittest.TestCase):
         self.assertIn('"answer": 42', structured)
 
 
+class MCPAllowlistTests(unittest.TestCase):
+    def test_default_allows_only_the_read_only_second_brain_tools(self) -> None:
+        server = MCPServerConfig(name="brain", command="x")
+        for name in ("search_notes", "get_chunk", "get_note", "list_notes"):
+            self.assertTrue(server.permits(name), name)
+        for name in ("write_note", "delete_note", "update_note", "run_shell"):
+            self.assertFalse(server.permits(name), name)
+
+    def test_env_setting_and_per_server_override(self) -> None:
+        saved = config.mcp_allowed_tools
+        try:
+            config.mcp_allowed_tools = "a, b"
+            self.assertTrue(MCPServerConfig(name="s", command="x").permits("b"))
+            self.assertFalse(MCPServerConfig(name="s", command="x").permits("c"))
+            own = MCPServerConfig(name="s", command="x", allowed_tools=["c"])
+            self.assertTrue(own.permits("c"))
+            self.assertFalse(own.permits("a"))
+            config.mcp_allowed_tools = "*"
+            self.assertTrue(MCPServerConfig(name="s", command="x").permits("anything"))
+            self.assertFalse(
+                MCPServerConfig(name="s", command="x", allowed_tools=[]).permits("a")
+            )
+        finally:
+            config.mcp_allowed_tools = saved
+
+    def test_allowed_tools_is_read_from_mcp_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(
+                json.dumps({"mcpServers": {
+                    "brain": {"command": "/x/python", "allowed_tools": ["get_note", " "]},
+                    "plain": {"command": "/x/python"},
+                    "bad": {"command": "/x/python", "allowed_tools": "get_note"},
+                }}),
+                encoding="utf-8",
+            )
+            servers = _load_mcp_servers("", str(path), allow_unpinned_config=True)
+        self.assertEqual(servers["brain"]["allowed_tools"], ["get_note"])
+        self.assertNotIn("allowed_tools", servers["plain"])
+        self.assertNotIn("allowed_tools", servers["bad"])  # invalid → default
+
+
 class MCPAccessTests(unittest.TestCase):
     def test_admin_only_by_default(self) -> None:
         saved = (
@@ -254,14 +296,17 @@ class MCPAccessTests(unittest.TestCase):
             config.mcp_admin_only,
             config.mcp_servers,
             config.admin_ids,
+            config.extra_admin_ids,
         )
         try:
             config.enable_mcp = True
             config.mcp_admin_only = True
             config.mcp_servers = {"brain": {"command": "python", "args": []}}
             config.admin_ids = [42]
+            config.extra_admin_ids = {44}  # promoted admin: not an owner
             self.assertTrue(mcp_available(42))
             self.assertFalse(mcp_available(43))
+            self.assertFalse(mcp_available(44))
             self.assertFalse(mcp_available(None))
 
             config.mcp_admin_only = False
@@ -272,6 +317,7 @@ class MCPAccessTests(unittest.TestCase):
                 config.mcp_admin_only,
                 config.mcp_servers,
                 config.admin_ids,
+                config.extra_admin_ids,
             ) = saved
 
     def test_mcp_hint_is_applied_once_and_removable(self) -> None:
@@ -406,6 +452,7 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
                 name="fake",
                 command=sys.executable,
                 args=[str(script)],
+                allowed_tools=["*"],  # the fake server's tools are not in the default list
             ),
             timeout=20,
         )
@@ -413,6 +460,37 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.client.close()
         self._tmp.cleanup()
+
+    async def test_allowlist_hides_and_blocks_other_tools(self) -> None:
+        script = Path(self._tmp.name) / "fake_mcp_server.py"
+        client = MCPClient(
+            MCPServerConfig(
+                name="fake", command=sys.executable, args=[str(script)],
+                allowed_tools=["echo"],
+            ),
+            timeout=20,
+        )
+        try:
+            tools = await client.list_tools()
+            self.assertEqual([tool.name for tool in tools], ["echo"])
+            self.assertEqual(client.hidden_tools, ["fail"])
+            self.assertEqual(await client.call_tool("echo", {"text": "x"}), "echo: x")
+            with self.assertRaises(MCPError):
+                await client.call_tool("fail", {})  # refused before the server
+        finally:
+            await client.close()
+
+    async def test_default_allowlist_is_read_only_set(self) -> None:
+        script = Path(self._tmp.name) / "fake_mcp_server.py"
+        client = MCPClient(
+            MCPServerConfig(name="fake", command=sys.executable, args=[str(script)]),
+            timeout=20,
+        )
+        try:
+            self.assertEqual(await client.list_tools(), [])  # echo/fail not listed
+            self.assertEqual(client.hidden_tools, ["echo", "fail"])
+        finally:
+            await client.close()
 
     async def test_relative_command_is_refused_by_default(self) -> None:
         """A bare ``python`` would be resolved through PATH: fail closed."""

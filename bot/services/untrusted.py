@@ -13,9 +13,12 @@ any message list — including the history loaded from the database.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 TAG = "<untrusted_content"
+
+_FRAME_TAG_RE = re.compile(r"<(\s*/?\s*untrusted_content)", re.IGNORECASE)
 
 # Appended to the system prompt while untrusted content is in the context.
 UNTRUSTED_SYSTEM_HINT = (
@@ -34,7 +37,12 @@ def wrap_untrusted(kind: str, body: str) -> str:
 
     ``kind`` is a short label for the logs/reader ("document", "web",
     "quoted", "search", "forward").
+
+    The body cannot break out of the frame: any ``<untrusted_content`` or
+    ``</untrusted_content`` inside it (a page or document imitating the closing
+    tag to smuggle in a fake "User request:") is neutralised.
     """
+    body = _FRAME_TAG_RE.sub(r"&lt;\1", body)
     return f'<untrusted_content source="{kind}">\n{body}\n</untrusted_content>'
 
 

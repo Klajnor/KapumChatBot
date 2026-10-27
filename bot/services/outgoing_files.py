@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import unicodedata
@@ -115,6 +117,48 @@ def safe_filename(raw: str) -> str | None:
     return f"{stem[:_MAX_NAME_LENGTH]}.{ext}"
 
 
+# Ячейка, начинающаяся с этих символов, исполняется Excel/LibreOffice как
+# формула (=HYPERLINK(...), DDE через =cmd|...). Это CSV injection.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_NUMBER_RE = re.compile(r"^[+-]?(\d+([.,]\d+)?|[.,]\d+)([eE][+-]?\d+)?%?$")
+
+
+def _safe_cell(cell: str) -> str:
+    """Prefix a formula-looking cell with an apostrophe; plain numbers stay."""
+    if cell and cell[0] in _FORMULA_PREFIXES and not _NUMBER_RE.match(cell.strip()):
+        return "'" + cell
+    return cell
+
+
+def _guess_delimiter(text: str, ext: str) -> str:
+    if ext == "tsv":
+        return "\t"
+    head = "\n".join(text.splitlines()[:5])
+    counts = {delimiter: head.count(delimiter) for delimiter in (",", ";", "\t", "|")}
+    best = max(counts, key=lambda delimiter: counts[delimiter])
+    return best if counts[best] else ","
+
+
+def neutralize_spreadsheet_formulas(text: str, ext: str) -> str:
+    """Make a CSV/TSV safe to open in a spreadsheet application.
+
+    Cells that would be interpreted as formulas (``=``, ``+``, ``-``, ``@``,
+    leading tab/CR) get a leading apostrophe; ordinary numbers like ``-5`` are
+    left alone. Other formats are returned unchanged.
+    """
+    if ext not in ("csv", "tsv"):
+        return text
+    delimiter = _guess_delimiter(text, ext)
+    try:
+        rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    except csv.Error:
+        rows = [line.split(delimiter) for line in text.splitlines()]
+    out = io.StringIO()
+    writer = csv.writer(out, delimiter=delimiter, lineterminator="\n")
+    writer.writerows([[_safe_cell(cell) for cell in row] for row in rows])
+    return out.getvalue()
+
+
 def prepare_files(arguments: dict[str, Any]) -> PreparedFiles:
     """Validate the ``send_files`` tool arguments.
 
@@ -146,6 +190,7 @@ def prepare_files(arguments: dict[str, Any]) -> PreparedFiles:
         if "\x00" in content:
             result.rejected.append((requested, "binary content"))
             continue
+        content = neutralize_spreadsheet_formulas(content, name.rpartition(".")[2])
         data = content.encode("utf-8")
         if len(data) > max_bytes:
             result.rejected.append((requested, "file too large"))
