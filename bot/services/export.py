@@ -29,11 +29,6 @@ from typing import Any
 from bot.bot import get_bot_username
 from bot.config import config
 
-try:  # optional dependency: without fpdf2 only Markdown export is available.
-    from fpdf.enums import XPos, YPos
-except ImportError:  # pragma: no cover - exercised on servers without fpdf2
-    XPos = YPos = None  # type: ignore[assignment]
-
 logger = logging.getLogger(__name__)
 
 # --- Entry model --------------------------------------------------------------
@@ -148,7 +143,7 @@ def _pdf_safe(text: str) -> str:
 
 
 def _font_paths() -> dict[str, str] | None:
-    """DejaVu TTFs bundled with matplotlib (regular / bold / mono)."""
+    """DejaVu TTFs bundled with matplotlib (regular / bold / italic / mono)."""
     try:
         from matplotlib import font_manager as fm
     except Exception:  # noqa: BLE001 - matplotlib missing -> no PDF
@@ -157,6 +152,10 @@ def _font_paths() -> dict[str, str] | None:
         regular = fm.findfont(fm.FontProperties(family="DejaVu Sans"))
         bold = fm.findfont(fm.FontProperties(family="DejaVu Sans", weight="bold"))
         mono = fm.findfont(fm.FontProperties(family="DejaVu Sans Mono"))
+        italic = fm.findfont(fm.FontProperties(family="DejaVu Sans", style="oblique"))
+        bold_italic = fm.findfont(
+            fm.FontProperties(family="DejaVu Sans", weight="bold", style="oblique")
+        )
     except Exception:  # noqa: BLE001 - font resolution failed
         return None
     if not regular or not os.path.exists(regular):
@@ -165,6 +164,10 @@ def _font_paths() -> dict[str, str] | None:
         "regular": regular,
         "bold": bold if bold and os.path.exists(bold) else regular,
         "mono": mono if mono and os.path.exists(mono) else regular,
+        "italic": italic if italic and os.path.exists(italic) else regular,
+        "bolditalic": (
+            bold_italic if bold_italic and os.path.exists(bold_italic) else regular
+        ),
     }
 
 
@@ -177,59 +180,16 @@ def pdf_available() -> bool:
     return _font_paths() is not None
 
 
-def _mc(pdf: Any, height: float, text: str, **kwargs: Any) -> None:
-    """``multi_cell`` that returns to the left margin on the next line.
-
-    fpdf2 ≥2.7 defaults ``new_x`` to RIGHT, which would leave zero width for
-    the following full-width cell; pin the cursor back explicitly.
-    """
-    pdf.multi_cell(0, height, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT, **kwargs)
-
-
-def _render_entry_pdf(pdf: Any, entry: ExportEntry) -> None:
-    """Render one entry (role heading + Markdown-aware content) into the PDF."""
-    heading = "Assistant" if entry.role == "assistant" else "User"
-    stamp = _format_ts(entry.created_at)
-    if stamp:
-        heading += f" - {stamp}"
-    if entry.role == "assistant" and entry.model:
-        heading += f"  [{entry.model}]"
-
-    pdf.set_font("DejaVu", "B", 12)
-    pdf.set_text_color(30, 80, 160)
-    _mc(pdf, 6, heading)
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(1)
-
-    in_code = False
-    for raw_line in entry.content.split("\n"):
-        line = raw_line.rstrip()
-        if line.lstrip().startswith("```"):
-            in_code = not in_code
-            continue
-        if in_code:
-            pdf.set_font("DejaVuMono", "", 9)
-            pdf.set_fill_color(244, 244, 244)
-            _mc(pdf, 4.6, _EMOJI_RE.sub("", line) or " ", fill=True)
-            continue
-        if not line.strip():
-            pdf.ln(2.5)
-            continue
-        pdf.set_font("DejaVu", "", 10.5)
-        _mc(pdf, 5.4, _pdf_safe(line))
-    pdf.ln(2)
-    pdf.set_draw_color(200, 200, 200)
-    y = pdf.get_y()
-    pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
-    pdf.ln(4)
-
-
 def render_pdf(
     entries: list[ExportEntry], *, title: str, meta: list[str]
 ) -> bytes | None:
-    """Render the export as a PDF; None when fpdf2/fonts are unavailable."""
+    """Render the export as a PDF; None when fpdf2/fonts are unavailable.
+
+    The layout itself (headings, tables, formulas, code) lives in
+    ``bot/services/export_pdf.py``.
+    """
     try:
-        from fpdf import FPDF
+        import fpdf  # noqa: F401
     except Exception:  # noqa: BLE001 - fpdf2 not installed
         logger.warning("fpdf2 is not installed; PDF export unavailable")
         return None
@@ -239,35 +199,9 @@ def render_pdf(
         return None
 
     try:
-        pdf = FPDF(format="A4")
-        pdf.set_margins(15, 15, 15)
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_font("DejaVu", "", fonts["regular"])
-        pdf.add_font("DejaVu", "B", fonts["bold"])
-        pdf.add_font("DejaVuMono", "", fonts["mono"])
-        pdf.add_page()
+        from bot.services.export_pdf import build_pdf
 
-        pdf.set_font("DejaVu", "B", 17)
-        _mc(pdf, 9, _EMOJI_RE.sub("", title))
-        pdf.ln(1)
-        pdf.set_font("DejaVu", "", 9.5)
-        pdf.set_text_color(90, 90, 90)
-        for item in meta:
-            _mc(pdf, 5, _EMOJI_RE.sub("", item))
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(3)
-
-        for entry in entries:
-            _render_entry_pdf(pdf, entry)
-
-        pdf.set_font("DejaVu", "", 8.5)
-        pdf.set_text_color(120, 120, 120)
-        footer = "Exported from Kapum ChatBot"
-        username = get_bot_username()
-        if username:
-            footer += f" (@{username})"
-        _mc(pdf, 5, footer)
-        return bytes(pdf.output())
+        return build_pdf(entries, title=title, meta=meta, fonts=fonts)
     except Exception:
         logger.exception("PDF rendering failed")
         return None

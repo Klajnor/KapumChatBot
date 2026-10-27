@@ -1837,6 +1837,43 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(data)
         self.assertTrue(data.startswith(b"%PDF-"))
 
+    def test_render_pdf_rich_markdown(self):
+        if not export_service.pdf_available():
+            self.skipTest("fpdf2 or Unicode fonts unavailable")
+        import io
+
+        import pdfplumber
+
+        content = (
+            "# Заголовок\n\nТекст **жирный**, [ссылка](https://d.test), $x^2$.\n\n"
+            "| A | B |\n|:--|--:|\n| 1 | **2** |\n\n"
+            "- пункт\n  - вложенный\n1. один\n\n> цитата\n\n"
+            "```py\nprint(1)\n```\n\n$$\\frac{a}{b}$$\n"
+        )
+        data = export_service.render_pdf(
+            [export_service.ExportEntry(role="assistant", content=content)],
+            title="T", meta=["Scope: x"],
+        )
+        self.assertIsNotNone(data)
+        with pdfplumber.open(io.BytesIO(data)) as doc:
+            text = "".join(page.extract_text() or "" for page in doc.pages)
+            images = sum(len(page.images) for page in doc.pages)
+        for fragment in ("Заголовок", "жирный", "ссылка", "вложенный", "цитата", "print(1)"):
+            self.assertIn(fragment, text)
+        self.assertNotIn("**", text)
+        self.assertNotIn("```", text)
+        self.assertGreaterEqual(images, 1)  # display formula rendered as a picture
+
+    def test_pdf_inline_spans_nest_styles(self):
+        from bot.services import export_pdf
+
+        spans = export_pdf._spans("a **b *c*** [d](https://x.y) `e`")
+        by_text = {text: style for text, style in spans}
+        self.assertTrue(by_text["b "].bold)
+        self.assertTrue(by_text["c"].bold and by_text["c"].italic)
+        self.assertEqual(by_text["d"].link, "https://x.y")
+        self.assertTrue(by_text["e"].code)
+
     def test_render_pdf_without_fpdf_returns_none(self):
         import sys
 
