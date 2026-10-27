@@ -260,6 +260,7 @@ class IntentAccessGateTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={"model": "m", "temperature": 0.7, "max_tokens": 100}
             ),
@@ -287,6 +288,7 @@ class IntentAccessGateTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={"model": "m", "temperature": 0.7, "max_tokens": 100}
             ),
@@ -372,6 +374,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         )
         session = SimpleNamespace(close=AsyncMock())
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={
                     "system_prompt": "s", "model": "m",
@@ -409,6 +412,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         )
         session = SimpleNamespace(close=AsyncMock())
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={
                     "system_prompt": "s", "model": "m",
@@ -418,7 +422,8 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         )
         exhausted = AR(allowed=True, role="allowed", remaining=0)
         answer = SimpleNamespace(
-            content="ok", elapsed=1.0, total_tokens=5, input_tokens=2, output_tokens=3
+            content="ok", elapsed=1.0, total_tokens=5, input_tokens=2,
+            output_tokens=3, tool_calls=[],
         )
 
         @asynccontextmanager
@@ -431,6 +436,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(reminders, "check_access", AsyncMock(return_value=exhausted)),
             patch.object(reminders, "_disable_reminder", AsyncMock()) as disable,
             patch.object(reminders, "_send_markdown", AsyncMock(return_value=True)),
+            patch.object(reminders, "search_configured", return_value=False),
             patch.object(
                 reminders.ai_client,
                 "chat_completion_result",
@@ -451,6 +457,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         )
         session = SimpleNamespace(close=AsyncMock())
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={
                     "system_prompt": "s", "model": "m",
@@ -474,13 +481,14 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(reminders, "check_access", side_effect=fake_check),
             patch.object(reminders, "_disable_reminder", AsyncMock()),
             patch.object(reminders, "_send_markdown", AsyncMock(return_value=True)),
+            patch.object(reminders, "search_configured", return_value=False),
             patch.object(
                 reminders.ai_client,
                 "chat_completion_result",
                 AsyncMock(
                     return_value=SimpleNamespace(
                         content="ok", elapsed=1.0, total_tokens=1,
-                        input_tokens=1, output_tokens=1,
+                        input_tokens=1, output_tokens=1, tool_calls=[],
                     )
                 ),
             ),
@@ -488,6 +496,46 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
             await reminders._fire_ai(due)
         self.assertIs(captured.get("consume"), False)
         self.assertIs(captured.get("require_quota"), False)
+
+    async def test_ai_reminder_can_search_the_web(self):
+        """A scheduled AI request gets the search tool and runs its loop."""
+        from bot.services import reminders
+        from bot.services.ai_client import ToolCall
+
+        due = reminders.DueReminder(
+            id=5, user_id=11, chat_id=11, text="news?", ai_mode=True, schedule=None
+        )
+        settings = {
+            "system_prompt": "sys", "model": "m",
+            "temperature": 0.5, "max_tokens": 100,
+        }
+        asked = SimpleNamespace(
+            content="", elapsed=1.0, total_tokens=1, input_tokens=1,
+            output_tokens=1,
+            tool_calls=[ToolCall(id="c1", name="search_web", arguments={"query": "x"})],
+        )
+        final = SimpleNamespace(
+            content="done", elapsed=2.0, total_tokens=1, input_tokens=1,
+            output_tokens=1, tool_calls=[],
+        )
+        chat = AsyncMock(side_effect=[asked, final])
+        search = AsyncMock(return_value=[])
+        with (
+            patch.object(reminders, "search_configured", return_value=True),
+            patch.object(reminders, "search_web", search),
+            patch.object(reminders.ai_client, "chat_with_tools", chat),
+        ):
+            result, elapsed = await reminders._run_ai_prompt(
+                due, settings, [{"role": "user", "content": "earlier"}]
+            )
+        self.assertEqual(result.content, "done")
+        self.assertEqual(elapsed, 3.0)
+        search.assert_awaited_once()
+        first_messages = chat.await_args_list[0].kwargs["messages"]
+        self.assertIn("search_web", first_messages[0]["content"])
+        self.assertIn("Текущая дата", first_messages[0]["content"])
+        self.assertEqual(first_messages[1]["content"], "earlier")
+        self.assertEqual(first_messages[2]["content"], "news?")
 
     async def test_guest_role_reminder_is_disabled(self):
         from bot.services import reminders
@@ -498,6 +546,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         )
         session = SimpleNamespace(close=AsyncMock())
         service = SimpleNamespace(
+            get_history=AsyncMock(return_value=[]),
             get_user_settings=AsyncMock(
                 return_value={
                     "system_prompt": "s", "model": "m",

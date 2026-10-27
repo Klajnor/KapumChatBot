@@ -25,6 +25,7 @@ import html
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from aiogram.exceptions import (
     TelegramAPIError,
@@ -38,9 +39,19 @@ from bot.config import config
 from bot.database.repository import ReminderRepository, UserRepository
 from bot.database.session import async_session_factory
 from bot.services.access import check_access
-from bot.services.ai_client import ai_client
+from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
+from bot.services.search import (
+    SEARCH_TOOL,
+    apply_search_hint,
+    build_assistant_tool_message,
+    build_tool_response,
+    format_search_results,
+    search_configured,
+    search_web,
+)
 from bot.services.telegram_utils import format_timing, throttle
+from bot.services.untrusted import apply_untrusted_hint, messages_have_untrusted_content
 from bot.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -471,11 +482,96 @@ async def _disable_reminder(reminder_id: int) -> None:
         logger.warning("Could not disable reminder %s: %s", reminder_id, exc)
 
 
+async def _run_ai_prompt(
+    due: DueReminder, settings: dict, history: list[dict[str, str]] | None = None
+) -> tuple[ChatResult, float]:
+    """Answer the stored prompt by the same rules as an interactive question.
+
+    Same system prompt, chat history and hints as the chat handler
+    (``apply_search_hint`` / ``apply_untrusted_hint``) plus the current date,
+    and the same ``search_web`` tool-loop bounded by ``MAX_SEARCH_ROUNDS``.
+    The history is read-only context: the scheduled prompt and its answer are
+    not written back to it.
+
+    Intended behaviour (not a gap): images, stickers and MCP are never offered
+    to a scheduled run — nobody is watching an unattended run, and MCP exposes
+    the admin's private notes. Returns the final result and the total time
+    spent over all rounds.
+    """
+    now = datetime.datetime.now(datetime.UTC).astimezone(get_timezone())
+    system = (
+        f"{settings['system_prompt']}\n\n"
+        f"Текущая дата и время: {now:%Y-%m-%d %H:%M} ({now.tzname()})."
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        *(history or []),
+        {"role": "user", "content": due.text},
+    ]
+    model = settings["model"]
+    search_ready = search_configured()
+    tools = [SEARCH_TOOL] if search_ready else None
+    if search_ready:
+        apply_search_hint(messages)
+
+    elapsed = 0.0
+    rounds = 0
+    while True:
+        if messages_have_untrusted_content(messages):
+            apply_untrusted_hint(messages)
+        if tools:
+            result = await ai_client.chat_with_tools(
+                messages=messages,
+                model=model,
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+                tools=tools,
+            )
+        else:
+            result = await ai_client.chat_completion_result(
+                messages=messages,
+                model=model,
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+            )
+        elapsed += result.elapsed
+        calls = [call for call in result.tool_calls if call.name == "search_web"]
+        if not calls or not tools:
+            return result, elapsed
+        if rounds >= config.max_search_rounds:
+            # Budget spent: one final tools-less request for an answer.
+            tools = None
+            if result.content:
+                return result, elapsed
+            messages.append(build_assistant_tool_message(result.content, calls))
+            for call in calls:
+                messages.append(
+                    build_tool_response(
+                        call.id,
+                        "Лимит веб-поиска на этот вопрос исчерпан. Ответь из "
+                        "уже собранной информации.",
+                    )
+                )
+            continue
+        rounds += 1
+        messages.append(build_assistant_tool_message(result.content, calls))
+        for call in calls:
+            query = str(call.arguments.get("query") or "").strip()
+            max_results = call.arguments.get("max_results")
+            if not isinstance(max_results, int) or isinstance(max_results, bool):
+                max_results = None
+            found = await search_web(query, max_results) if query else []
+            messages.append(
+                build_tool_response(call.id, format_search_results(query, found))
+            )
+
+
 async def _fire_ai(due: DueReminder) -> None:
     """Run the stored prompt through the user's model and deliver the answer."""
     async with async_session_factory() as session:
         service = UserService(session)
         settings = await service.get_user_settings(due.user_id)
+        history = await service.get_history(due.chat_id, user_id=due.user_id)
         # Access is re-checked at fire time, not only when the reminder is
         # created: a user who was removed from the allow-list (or an admin
         # dropped from ADMIN_IDS) must not keep spending money on scheduled AI
@@ -497,15 +593,7 @@ async def _fire_ai(due: DueReminder) -> None:
         await _disable_reminder(due.id)
         return
 
-    result = await ai_client.chat_completion_result(
-        messages=[
-            {"role": "system", "content": settings["system_prompt"]},
-            {"role": "user", "content": due.text},
-        ],
-        model=settings["model"],
-        temperature=settings["temperature"],
-        max_tokens=settings["max_tokens"],
-    )
+    result, elapsed = await _run_ai_prompt(due, settings, history)
     if not result.content:
         await _send_html(
             due.chat_id,
@@ -516,7 +604,7 @@ async def _fire_ai(due: DueReminder) -> None:
         return
 
     footer = format_timing(
-        result.elapsed,
+        elapsed,
         model=settings["model"],
         tokens=result.total_tokens,
         input_tokens=result.input_tokens,
