@@ -627,6 +627,20 @@ class Config:
     enable_sticker_generation: bool = field(
         default_factory=lambda: _env_bool("ENABLE_STICKER_GENERATION", True)
     )
+    # Let the AI answer with text files (json, xml, txt, md, ...) as Telegram
+    # documents. Only a fixed allowlist of non-executable text formats.
+    enable_file_replies: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_FILE_REPLIES", True)
+    )
+    # Maximum number of files in one reply; the surplus is dropped and the
+    # user is told the limit was exceeded.
+    reply_files_max: int = field(
+        default_factory=lambda: _env_int("REPLY_FILES_MAX", 10)
+    )
+    # Maximum size of one generated file (bytes).
+    reply_file_max_bytes: int = field(
+        default_factory=lambda: _env_int("REPLY_FILE_MAX_BYTES", 1_000_000)
+    )
     # Maximum voice-message size accepted for transcription (bytes).
     voice_max_bytes: int = field(
         default_factory=lambda: _env_int("VOICE_MAX_BYTES", 7_500_000)

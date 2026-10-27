@@ -60,6 +60,7 @@ from bot.services.mcp import (
     mcp_manager,
     remove_mcp_hint,
 )
+from bot.services.outgoing_files import files_tool, prepare_files
 from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.rich import (
@@ -846,6 +847,78 @@ async def generate_and_send_sticker(
     return True
 
 
+async def send_reply_files(
+    message: Message,
+    arguments: dict[str, Any],
+    *,
+    service: UserService | None = None,
+    user_id: int | None = None,
+    model: str | None = None,
+) -> bool:
+    """Send the files requested via the ``send_files`` tool. True if any sent.
+
+    Only allowlisted text formats pass validation (see ``outgoing_files``).
+    Files beyond ``REPLY_FILES_MAX`` are dropped and the user is told so.
+    """
+    prepared = prepare_files(arguments)
+    if not prepared.files:
+        await safe_answer(
+            message,
+            "❌ <b>Could not prepare the file.</b>\n\n"
+            "Only plain-text formats are supported (txt, md, json, xml, csv, "
+            "yaml, …); executables, scripts and HTML are never sent.",
+        )
+        return False
+
+    await message.bot.send_chat_action(
+        chat_id=message.chat.id, action=ChatAction.UPLOAD_DOCUMENT
+    )
+    sent_names: list[str] = []
+    for filename, data in prepared.files:
+        for attempt in range(2):
+            try:
+                await throttle.wait(message.chat.id)
+                await message.answer_document(
+                    BufferedInputFile(data, filename=filename)
+                )
+                sent_names.append(filename)
+                break
+            except TelegramRetryAfter as exc:
+                if attempt >= 1:
+                    break
+                await asyncio.sleep(float(exc.retry_after) + 0.1)
+            except TelegramAPIError as exc:
+                logger.error("Sending the file %s failed: %s", filename, exc)
+                break
+
+    notes: list[str] = []
+    if prepared.over_limit:
+        notes.append(
+            f"⚠️ <b>File limit exceeded:</b> at most {config.reply_files_max} "
+            f"files per reply. Sent {len(sent_names)}, skipped "
+            f"{prepared.over_limit}."
+        )
+    if len(sent_names) < len(prepared.files):
+        notes.append(
+            f"⚠️ {len(prepared.files) - len(sent_names)} file(s) could not be sent."
+        )
+    if prepared.rejected:
+        skipped = ", ".join(html.escape(name or "?") for name, _ in prepared.rejected)
+        notes.append(f"⚠️ Skipped (unsupported or invalid): {skipped}")
+    if notes:
+        await safe_answer(message, "\n".join(notes))
+
+    if sent_names and service is not None and user_id is not None:
+        await service.add_message(
+            chat_id=message.chat.id,
+            user_id=user_id,
+            role="assistant",
+            content="[Sent files] " + ", ".join(sent_names),
+            model=model,
+        )
+    return bool(sent_names)
+
+
 # --- Access helpers --------------------------------------------------------
 
 
@@ -1232,6 +1305,8 @@ async def _answer_with_ai(
         tools.append(IMAGE_TOOL)
     if config.enable_sticker_generation:
         tools.append(STICKER_TOOL)
+    if config.enable_file_replies:
+        tools.append(files_tool())
     search_ready = search_configured()
     if search_ready:
         tools.append(SEARCH_TOOL)
@@ -1300,6 +1375,13 @@ async def _answer_with_ai(
                 (call for call in result.tool_calls if call.name == "generate_sticker"),
                 None,
             )
+            file_call = next(
+                (
+                    call for call in result.tool_calls
+                    if call.name == "send_files" and config.enable_file_replies
+                ),
+                None,
+            )
             search_calls = (
                 [call for call in result.tool_calls if call.name == "search_web"]
                 if search_ready
@@ -1326,6 +1408,7 @@ async def _answer_with_ai(
                 handled_calls
                 and image_call is None
                 and sticker_call is None
+                and file_call is None
                 and (can_search or can_mcp)
             ):
                 if can_search:
@@ -1378,10 +1461,24 @@ async def _answer_with_ai(
             title_source=text,
             reply_markup=_retry_markup(message, saved.id if saved else None),
         )
-    elif image_call is None and sticker_call is None and printer is not None:
+    elif (
+        image_call is None
+        and sticker_call is None
+        and file_call is None
+        and printer is not None
+    ):
         await printer.discard()
 
-    if sticker_call is not None:
+    if file_call is not None:
+        if not await send_reply_files(
+            message,
+            file_call.arguments,
+            service=service,
+            user_id=user.id,
+            model=model,
+        ) and not result.content:
+            await refund_access(service, user.id, access)
+    elif sticker_call is not None:
         prompt = str(sticker_call.arguments.get("prompt") or text).strip() or text
         if not await generate_and_send_sticker(
             message,

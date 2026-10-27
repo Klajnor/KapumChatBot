@@ -294,6 +294,9 @@ cp .env.example .env
 | `ENABLE_VOICE` | Распознавать голосовые сообщения (`true`/`false`) |
 | `ENABLE_IMAGE_GENERATION` | Разрешить ответ картинкой (`true`/`false`) |
 | `ENABLE_STICKER_GENERATION` | Разрешить ответ Telegram-стикером (`/sticker` и tool `generate_sticker`) (`true`/`false`) |
+| `ENABLE_FILE_REPLIES` | Разрешить ответ текстовыми файлами (tool `send_files`; json, xml, txt, md, csv, yaml и т.п., без исполняемых) (`true`/`false`) |
+| `REPLY_FILES_MAX` | Максимум файлов в одном ответе (по умолчанию 10; лишние не отправляются, пользователь уведомляется) |
+| `REPLY_FILE_MAX_BYTES` | Максимальный размер одного файла в байтах (по умолчанию 1 000 000) |
 | `VOICE_MAX_BYTES` | Максимальный размер исходного аудио (по умолчанию 7,5 МБ; Base64 укладывается в 10 МБ) |
 | `MAX_SYSTEM_PROMPT_LENGTH` | Максимальная длина системного промпта в символах (по умолчанию 2048) |
 | `MAX_GUEST_TEXT_LENGTH` | Максимальная длина текста guest-запроса (по умолчанию 4000) |
