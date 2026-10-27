@@ -81,6 +81,17 @@ class OfficeExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Sheet: Empty", text)  # empty sheets are skipped
         self.assertIn("hello world", text)  # newlines inside a cell are flattened
 
+    async def test_xlsx_uncalculated_formulas_fall_back_to_text(self):
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "=1+2"  # без кэша: data_only вернул бы None
+        buffer = BytesIO()
+        wb.save(buffer)
+        text = await extract_document_text("xlsx", buffer.getvalue())
+        self.assertIn("=1+2", text)
+
     async def test_pptx_slides_tables_and_notes(self):
         text = await extract_document_text("pptx", _pptx())
         self.assertIn("## Slide 1", text)

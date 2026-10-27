@@ -232,35 +232,49 @@ def _extract_xlsx(data: bytes) -> str | None:
     if _ooxml_too_large(data, "XLSX"):
         return None
     try:
-        workbook = openpyxl.load_workbook(
-            BytesIO(data), read_only=True, data_only=True
-        )
-        try:
-            parts: list[str] = []
-            collected = 0
-            for sheet in workbook.worksheets[:_MAX_SHEETS]:
-                lines = [f"## Sheet: {sheet.title}"]
-                for index, row in enumerate(sheet.iter_rows(values_only=True)):
-                    if index >= _MAX_SHEET_ROWS or collected >= config.max_extracted_chars:
-                        break
-                    cells = [_cell_text(value) for value in row]
-                    while cells and not cells[-1]:
-                        cells.pop()
-                    if not any(cells):
-                        continue
-                    line = " | ".join(cells)
-                    lines.append(line)
-                    collected += len(line)
-                if len(lines) > 1:
-                    parts.append("\n".join(lines))
-                if collected >= config.max_extracted_chars:
-                    break
-        finally:
-            workbook.close()
-        return "\n\n".join(parts) or None
+        # Первый проход — кэшированные значения. Если пусто (файл создан
+        # библиотекой без пересчёта формул или с неверным <dimension>), второй
+        # проход сбрасывает размеры листа и показывает формулы как текст.
+        text = _read_xlsx_sheets(openpyxl, data, data_only=True)
+        if not text:
+            text = _read_xlsx_sheets(openpyxl, data, data_only=False)
+        if not text:
+            logger.warning("XLSX contains no readable cells")
+        return text
     except Exception as exc:  # noqa: BLE001 - a broken XLSX must not kill a reply
         logger.error("XLSX text extraction failed: %s", exc)
         return None
+
+
+def _read_xlsx_sheets(openpyxl: Any, data: bytes, *, data_only: bool) -> str | None:
+    """Rows of every sheet as text; ``data_only=False`` keeps formulas as ``=...``."""
+    workbook = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=data_only)
+    try:
+        parts: list[str] = []
+        collected = 0
+        for sheet in workbook.worksheets[:_MAX_SHEETS]:
+            if hasattr(sheet, "reset_dimensions"):
+                # Неверный <dimension> в read-only режиме обрезает чтение.
+                sheet.reset_dimensions()
+            lines = [f"## Sheet: {sheet.title}"]
+            for index, row in enumerate(sheet.iter_rows(values_only=True)):
+                if index >= _MAX_SHEET_ROWS or collected >= config.max_extracted_chars:
+                    break
+                cells = [_cell_text(value) for value in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if not any(cells):
+                    continue
+                line = " | ".join(cells)
+                lines.append(line)
+                collected += len(line)
+            if len(lines) > 1:
+                parts.append("\n".join(lines))
+            if collected >= config.max_extracted_chars:
+                break
+        return "\n\n".join(parts) or None
+    finally:
+        workbook.close()
 
 
 def _shape_texts(shapes: Any) -> list[str]:

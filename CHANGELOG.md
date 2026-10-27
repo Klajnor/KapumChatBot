@@ -5,6 +5,8 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-10-27
+- **XLSX: файлы без кэша формул и с неверным размером листа.** Парсер читал только кэшированные значения (`data_only`), поэтому таблица, созданная скриптом/pandas/openpyxl и ни разу не открытая в Excel, выглядела пустой, и бот отвечал «Could not extract any text». Теперь при пустом первом проходе книга перечитывается с формулами как текстом (`=SUM(A1:A3)`), а для каждого листа вызывается `reset_dimensions()` (неверный `<dimension>` в read-only режиме обрезал чтение). Тест: `tests/test_office_documents.py` (+1).
+
 - **AI-напоминания: поиск и история чата.** Запланированный запрос (`ai:`) раньше уходил модели «голым» — только системный промпт и текст. Теперь `_run_ai_prompt` в `services/reminders.py` собирает его по правилам обычного вопроса: системный промпт пользователя, история чата (`get_history`, только чтение), подсказки `apply_search_hint`/`apply_untrusted_hint`, текущая дата в таймзоне напоминаний и инструмент `search_web` с тем же циклом, ограниченным `MAX_SEARCH_ROUNDS` (по исчерпании — финальный запрос без инструментов); время в футере суммируется по раундам. **Задуманное поведение:** картинки, стикеры и MCP в запланированном запуске не предлагаются (за экраном никого нет, MCP открывает личные заметки админа), а промпт и ответ в историю не записываются. Тесты: `tests/test_audit_fixes.py` (+1, моки обновлены).
 
 - **Таймзона напоминаний: исправления.** `next_occurrence` перезаписывала переданную зону глобальной `REMINDER_TIMEZONE`, поэтому daily/weekly напоминания пересчитывались не в зоне владельца; возобновление (Resume) напоминания из паузы тоже считало в глобальной зоне — теперь зона владельца передаётся в обоих местах. Диалог `/timezone` получил TTL 10 минут и привязку к чату, где он начат (забытый диалог больше не перехватывает обычные сообщения, а диалог из лички — сообщения в группе); кнопки ✅/❌ несут предложенную зону, старая кнопка не подтвердит более свежего кандидата. Тесты в `tests/test_reminder_timezone.py` (+6).
@@ -259,6 +261,7 @@
   session management (stats, models, prompt, clear, help, start, image, admin).
 
 ### Fixed
+- **XLSX без кэша формул.** `_extract_xlsx` в `services/documents.py` читал только `data_only=True`; файл без пересчёта формул давал `None`. Добавлен второй проход (`_read_xlsx_sheets(..., data_only=False)`, формулы как текст) и `reset_dimensions()` для листов в read-only режиме; при полностью пустой книге пишется предупреждение `XLSX contains no readable cells`.
 - **Reminder timezone.** `next_occurrence` shadowed its `tz` argument with the global zone, so daily/weekly reminders ignored the owner's `/timezone`; `toggle_reminder` (resume) did not pass the owner's zone either. The `/timezone` dialog now expires after 10 minutes, is bound to the chat it started in, and its confirm/reject buttons carry the proposed zone.
 - **Brave search pointed at the wrong host** — `_search_brave` used
   `https://api.brave.com/res/v1/web/search`, which answers **200 with an HTML
