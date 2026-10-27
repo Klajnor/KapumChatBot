@@ -195,7 +195,7 @@ async def main() -> None:
                 "MCP: %d server(s) configured (%s), owner-only=%s",
                 len(config.mcp_servers),
                 ", ".join(config.mcp_servers),
-                config.mcp_admin_only,
+                config.mcp_owner_only,
             )
         elif config.enable_mcp:
             logger.info(

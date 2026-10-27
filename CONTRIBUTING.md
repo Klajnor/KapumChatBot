@@ -14,7 +14,7 @@ pip install pytest pytest-asyncio ruff
 
 # 3. Copy and fill the configuration
 cp .env.example .env
-#   → set BOT_TOKEN, AI_API_KEY, ADMIN_IDS at minimum
+#   → set BOT_TOKEN, AI_API_KEY, OWNER_IDS at minimum
 
 # 4. Run the tests
 pytest tests/ -v

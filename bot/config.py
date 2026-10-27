@@ -22,6 +22,13 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+# Legacy env names still read as aliases: old name -> new name.
+_RENAMED_ENV: dict[str, str] = {
+    "ADMIN_IDS": "OWNER_IDS",
+    "MCP_ADMIN_ONLY": "MCP_OWNER_ONLY",
+}
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -591,8 +598,9 @@ class Config:
         default_factory=lambda: _env_int("IMAGE_TIMEOUT", 300)
     )
 
-    # --- Admin ---
-    admin_ids: list[int] = field(default_factory=list)
+    # --- Access ---
+    # Owners from OWNER_IDS (legacy name: ADMIN_IDS): never demoted or blocked.
+    owner_ids: list[int] = field(default_factory=list)
     # Admins promoted at runtime from the admin menu (stored in the database).
     extra_admin_ids: set[int] = field(default_factory=set)
 
@@ -776,13 +784,15 @@ class Config:
     # The chat model gets tools exposed by one or more MCP servers. The main
     # use case is the Obsidian "second brain": search and read personal notes
     # through the ``brain`` server. The whole feature is owner-only by default
-    # (MCP_ADMIN_ONLY: only ADMIN_IDS, not promoted admins) because the notes
-    # are private.
+    # (MCP_OWNER_ONLY: only OWNER_IDS, not promoted admins) because the notes
+    # are private. MCP_ADMIN_ONLY is the legacy name of the same switch.
     enable_mcp: bool = field(
         default_factory=lambda: _env_bool("MCP_ENABLED", True)
     )
-    mcp_admin_only: bool = field(
-        default_factory=lambda: _env_bool("MCP_ADMIN_ONLY", True)
+    mcp_owner_only: bool = field(
+        default_factory=lambda: _env_bool(
+            "MCP_OWNER_ONLY", _env_bool("MCP_ADMIN_ONLY", True)
+        )
     )
     # Claude-style .mcp.json with a "mcpServers" object (path to the file or
     # its directory). Empty — no file is read.
@@ -1108,15 +1118,15 @@ class Config:
     )
 
     def __post_init__(self) -> None:
-        """Parse admin IDs after initialization."""
-        raw = os.getenv("ADMIN_IDS", "")
-        self.admin_ids = []
+        """Parse owner IDs after initialization."""
+        raw = _env("OWNER_IDS", "ADMIN_IDS")
+        self.owner_ids = []
         for chunk in raw.split(","):
             chunk = chunk.strip()
             if not chunk:
                 continue
             try:
-                self.admin_ids.append(int(chunk))
+                self.owner_ids.append(int(chunk))
             except ValueError:
                 continue
 
@@ -1268,18 +1278,22 @@ class Config:
         return self.ai_models[0]
 
     def is_owner(self, telegram_id: int) -> bool:
-        """True for IDs from ``ADMIN_IDS``: they can never be demoted or blocked."""
-        return telegram_id in self.admin_ids
+        """True for IDs from ``OWNER_IDS``: they can never be demoted or blocked."""
+        return telegram_id in self.owner_ids
 
     def is_admin(self, telegram_id: int) -> bool:
         """True for owners and for admins promoted from the admin menu."""
-        return telegram_id in self.admin_ids or telegram_id in self.extra_admin_ids
+        return telegram_id in self.owner_ids or telegram_id in self.extra_admin_ids
 
     def validate(self) -> None:
         """Validate that required config values are present."""
-        if not self.admin_ids:
-            logging.getLogger(__name__).warning(
-                "ADMIN_IDS is empty or invalid: admin commands are unavailable"
+        log = logging.getLogger(__name__)
+        for old, new in _RENAMED_ENV.items():
+            if os.getenv(old, "").strip() and not os.getenv(new, "").strip():
+                log.warning("%s is deprecated, rename it to %s in .env", old, new)
+        if not self.owner_ids:
+            log.warning(
+                "OWNER_IDS is empty or invalid: admin commands are unavailable"
             )
         missing: list[str] = []
         if not self.bot_token:

@@ -39,7 +39,7 @@ class TestDigestTestButton(DBTest):
     def _run(self, coro_fn):
         patches = [
             patch("bot.services.digest.async_session_factory", self._factory),
-            patch.object(config, "admin_ids", [ADMIN]),
+            patch.object(config, "owner_ids", [ADMIN]),
             patch.object(config, "extra_admin_ids", set()),
             patch.object(panel, "_show", AsyncMock()),
             patch.object(panel, "safe_answer_callback", AsyncMock()),

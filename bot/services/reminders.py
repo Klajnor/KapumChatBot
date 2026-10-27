@@ -584,8 +584,8 @@ async def _fire_ai(due: DueReminder) -> None:
         settings = await service.get_user_settings(due.user_id)
         history = await service.get_history(due.chat_id, user_id=due.user_id)
         # Access is re-checked at fire time, not only when the reminder is
-        # created: a user who was removed from the allow-list (or an admin
-        # dropped from ADMIN_IDS) must not keep spending money on scheduled AI
+        # created: a user who was removed from the allow-list (or an owner
+        # dropped from OWNER_IDS) must not keep spending money on scheduled AI
         # calls forever. ``require_quota=False`` matters here — a reminder is a
         # scheduled request, not a new question, so an exhausted *daily*
         # question budget must NOT disable it (only losing authorization may).

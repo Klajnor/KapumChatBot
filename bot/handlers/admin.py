@@ -346,7 +346,7 @@ async def cmd_admin_stats(message: Message) -> None:
 async def cmd_mcp(message: Message) -> None:
     """Handle /mcp — show configured MCP servers, their status and tools.
 
-    Owners only (``ADMIN_IDS``): the servers expose the owner's private notes,
+    Owners only (``OWNER_IDS``): the servers expose the owner's private notes,
     and the status call may start the server processes.
     """
     user = message.from_user
@@ -395,7 +395,7 @@ async def cmd_mcp(message: Message) -> None:
                 f"   🚫 Hidden (not in <code>MCP_ALLOWED_TOOLS</code>): {shown}{more}"
             )
     lines.append("")
-    lines.append(f"🔐 Owner-only: <b>{'yes' if config.mcp_admin_only else 'no'}</b>")
+    lines.append(f"🔐 Owner-only: <b>{'yes' if config.mcp_owner_only else 'no'}</b>")
     if config.mcp_config_file:
         lines.append(
             f"📄 Config: <code>{html.escape(config.mcp_config_file)}</code>"

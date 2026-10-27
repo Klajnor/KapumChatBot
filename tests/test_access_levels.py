@@ -17,7 +17,7 @@ class TestAccessLevels(DBTest):
     def _run(self, coro_fn):
         patches = (
             patch("bot.database.session.async_session_factory", self._factory),
-            patch.object(config, "admin_ids", [OWNER]),
+            patch.object(config, "owner_ids", [OWNER]),
             patch.object(config, "extra_admin_ids", set()),
             patch.object(config, "daily_limit", 3),
             patch.object(config, "allow_guest_access", True),
@@ -87,7 +87,7 @@ class TestAccessLevels(DBTest):
     def test_menu_permissions(self):
         self.assertFalse(_can_manage(OWNER, "owner"))
         self.assertFalse(_can_manage(ADMIN, "owner"))
-        with patch.object(config, "admin_ids", [OWNER]):
+        with patch.object(config, "owner_ids", [OWNER]):
             self.assertTrue(_can_manage(OWNER, "admin"))
             self.assertFalse(_can_manage(ADMIN, "admin"))
         self.assertTrue(_can_manage(ADMIN, "user"))

@@ -36,7 +36,7 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(default=False)
     guest_messages_used: Mapped[int] = mapped_column(Integer, default=0)
     # Access level set from the admin menu. ``is_admin`` above only mirrors
-    # ADMIN_IDS (owners); ``granted_admin`` is an admin promoted at runtime.
+    # OWNER_IDS (owners); ``granted_admin`` is an admin promoted at runtime.
     granted_admin: Mapped[bool] = mapped_column(default=False, server_default=false())
     blocked: Mapped[bool] = mapped_column(default=False, server_default=false())
     # Personal reminders timezone: IANA name. NULL means "use the global

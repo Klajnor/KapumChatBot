@@ -38,33 +38,33 @@ class BroadcastAuthTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(data=data, from_user=SimpleNamespace(id=user_id))
 
     def test_owner_is_accepted(self):
-        with patch.object(config, "admin_ids", [111]):
+        with patch.object(config, "owner_ids", [111]):
             self.assertEqual(
                 admin._pending_owner(self._callback("broadcast:send:111", 111), "send"),
                 111,
             )
 
     def test_another_admin_cannot_confirm(self):
-        with patch.object(config, "admin_ids", [111, 222]):
+        with patch.object(config, "owner_ids", [111, 222]):
             self.assertIsNone(
                 admin._pending_owner(self._callback("broadcast:send:111", 222), "send")
             )
 
     def test_non_admin_cannot_confirm(self):
-        with patch.object(config, "admin_ids", [111]):
+        with patch.object(config, "owner_ids", [111]):
             self.assertIsNone(
                 admin._pending_owner(self._callback("broadcast:send:111", 999), "send")
             )
 
     def test_malformed_callback_data_is_rejected(self):
-        with patch.object(config, "admin_ids", [111]):
+        with patch.object(config, "owner_ids", [111]):
             for data in ("broadcast:send:", "broadcast:send:abc", "broadcast:send", ""):
                 self.assertIsNone(
                     admin._pending_owner(self._callback(data, 111), "send"), data
                 )
 
     def test_wrong_action_is_rejected(self):
-        with patch.object(config, "admin_ids", [111]):
+        with patch.object(config, "owner_ids", [111]):
             # A "cancel" payload must not authorize a "send".
             self.assertIsNone(
                 admin._pending_owner(self._callback("broadcast:cancel:111", 111), "send")
@@ -80,7 +80,7 @@ class BroadcastAuthTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         with (
-            patch.object(config, "admin_ids", [111, 222]),
+            patch.object(config, "owner_ids", [111, 222]),
             patch.object(admin, "safe_answer_callback", AsyncMock()) as ack,
             patch.object(admin, "_deliver_broadcast", AsyncMock()) as deliver,
         ):
@@ -99,7 +99,7 @@ class BroadcastAuthTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         with (
-            patch.object(config, "admin_ids", [1]),
+            patch.object(config, "owner_ids", [1]),
             patch.object(admin, "user_service") as us,
         ):
             await admin.cmd_broadcast(message)
@@ -335,6 +335,33 @@ class ConfigValidationTests(unittest.TestCase):
         ):
             cfg = Config()
             self.assertGreaterEqual(cfg.max_album_bytes, cfg.max_photo_bytes)
+
+
+class RenamedEnvTests(unittest.TestCase):
+    """OWNER_IDS / MCP_OWNER_ONLY win; the legacy ADMIN_* names still work."""
+
+    def test_owner_ids_take_precedence_over_legacy_name(self):
+        with patch.dict(os.environ, {"OWNER_IDS": "1, 2", "ADMIN_IDS": "3"}):
+            self.assertEqual(Config().owner_ids, [1, 2])
+
+    def test_legacy_admin_ids_still_define_owners(self):
+        with patch.dict(os.environ, {"OWNER_IDS": "", "ADMIN_IDS": "3,x"}):
+            cfg = Config()
+            self.assertEqual(cfg.owner_ids, [3])
+            self.assertTrue(cfg.is_owner(3))
+
+    def test_legacy_mcp_admin_only_is_honoured(self):
+        with patch.dict(os.environ, {"MCP_OWNER_ONLY": "", "MCP_ADMIN_ONLY": "false"}):
+            self.assertFalse(Config().mcp_owner_only)
+        with patch.dict(os.environ, {"MCP_OWNER_ONLY": "true", "MCP_ADMIN_ONLY": "false"}):
+            self.assertTrue(Config().mcp_owner_only)
+
+    def test_legacy_name_logs_a_deprecation_warning(self):
+        with patch.dict(os.environ, {"OWNER_IDS": "", "ADMIN_IDS": "3"}):
+            cfg = Config()
+            with self.assertLogs("bot.config", level="WARNING") as logs:
+                cfg.validate()
+        self.assertTrue(any("ADMIN_IDS is deprecated" in line for line in logs.output))
 
 
 class ReminderIntervalTests(unittest.TestCase):
@@ -598,7 +625,7 @@ class AccessProbeTests(unittest.IsolatedAsyncioTestCase):
             get_daily_usage_remaining=AsyncMock(return_value=0),
             consume_daily_usage=AsyncMock(),
         )
-        with patch.object(config, "admin_ids", []):
+        with patch.object(config, "owner_ids", []):
             probe = await check_access(service, 1, consume=False, require_quota=False)
             strict = await check_access(service, 1, consume=False)
         self.assertTrue(probe.allowed)
@@ -615,7 +642,7 @@ class AccessProbeTests(unittest.IsolatedAsyncioTestCase):
             get_guest_messages_remaining=AsyncMock(return_value=0),
         )
         with (
-            patch.object(config, "admin_ids", []),
+            patch.object(config, "owner_ids", []),
             patch.object(config, "allow_guest_access", False),
         ):
             probe = await check_access(service, 2, consume=False, require_quota=False)

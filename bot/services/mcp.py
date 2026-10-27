@@ -21,8 +21,8 @@ Design notes:
   ``DATABASE_URL`` — are never inherited by third-party MCP code, and
   ``${VAR}`` references to them in the config are refused. Anything a server
   needs beyond the allowlist must be listed explicitly in its ``env``.
-* The feature is **owner-only by default** (``MCP_ADMIN_ONLY``): notes and
-  personal knowledge bases belong to the owner (``ADMIN_IDS``) and must not
+* The feature is **owner-only by default** (``MCP_OWNER_ONLY``): notes and
+  personal knowledge bases belong to the owner (``OWNER_IDS``) and must not
   leak to anyone else — admins promoted from the admin menu included.
 
 See README → «🧠 MCP-провайдер „Второй мозг“ (Obsidian)».
@@ -275,15 +275,15 @@ def _format_tool_result(result: Any) -> str:
 def mcp_available(telegram_id: int | None) -> bool:
     """True when MCP tools may be offered to this user.
 
-    With the default ``MCP_ADMIN_ONLY=true`` only the owners (IDs from
-    ``ADMIN_IDS``) get the tools. Admins promoted at runtime from the admin
+    With the default ``MCP_OWNER_ONLY=true`` only the owners (IDs from
+    ``OWNER_IDS``) get the tools. Admins promoted at runtime from the admin
     menu are deliberately excluded: they can be granted by an owner without
     being trusted with the owner's private notes. Everyone else chats exactly
     as before.
     """
     if not config.enable_mcp or not config.mcp_servers:
         return False
-    if config.mcp_admin_only:
+    if config.mcp_owner_only:
         return telegram_id is not None and config.is_owner(telegram_id)
     return True
 

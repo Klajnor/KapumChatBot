@@ -4,7 +4,7 @@ Opened with ``/admin``. Every button is a callback ``adm:<action>[:<id>[:<arg>]]
 and is re-checked against the *live* admin list, so a forged callback or a
 demoted admin's old menu cannot change anything.
 
-Levels: guest < user (whitelisted) < admin < owner (``ADMIN_IDS``). Admins manage
+Levels: guest < user (whitelisted) < admin < owner (``OWNER_IDS``). Admins manage
 guests and users; only owners promote/demote admins. Owners and other admins
 cannot be limited or blocked by an admin.
 """

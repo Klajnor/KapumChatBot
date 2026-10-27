@@ -541,7 +541,7 @@ def format_stats(reports: list[ChannelReport]) -> str:
 
 
 def admin_ids() -> list[int]:
-    return sorted({*config.admin_ids, *config.extra_admin_ids})
+    return sorted({*config.owner_ids, *config.extra_admin_ids})
 
 
 async def notify_admins(text: str, only: int | None = None) -> None:

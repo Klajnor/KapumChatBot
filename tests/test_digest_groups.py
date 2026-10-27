@@ -38,7 +38,7 @@ class TestGroupDigest(DBTest):
         patches = [
             patch("bot.services.digest.async_session_factory", self._factory),
             patch("bot.services.digest._channel_ids", None),
-            patch.object(config, "admin_ids", [ADMIN]),
+            patch.object(config, "owner_ids", [ADMIN]),
             patch.object(config, "extra_admin_ids", set()),
         ]
         for p in patches:

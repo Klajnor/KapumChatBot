@@ -290,33 +290,33 @@ class MCPAllowlistTests(unittest.TestCase):
 
 
 class MCPAccessTests(unittest.TestCase):
-    def test_admin_only_by_default(self) -> None:
+    def test_owner_only_by_default(self) -> None:
         saved = (
             config.enable_mcp,
-            config.mcp_admin_only,
+            config.mcp_owner_only,
             config.mcp_servers,
-            config.admin_ids,
+            config.owner_ids,
             config.extra_admin_ids,
         )
         try:
             config.enable_mcp = True
-            config.mcp_admin_only = True
+            config.mcp_owner_only = True
             config.mcp_servers = {"brain": {"command": "python", "args": []}}
-            config.admin_ids = [42]
+            config.owner_ids = [42]
             config.extra_admin_ids = {44}  # promoted admin: not an owner
             self.assertTrue(mcp_available(42))
             self.assertFalse(mcp_available(43))
             self.assertFalse(mcp_available(44))
             self.assertFalse(mcp_available(None))
 
-            config.mcp_admin_only = False
+            config.mcp_owner_only = False
             self.assertTrue(mcp_available(43))
         finally:
             (
                 config.enable_mcp,
-                config.mcp_admin_only,
+                config.mcp_owner_only,
                 config.mcp_servers,
-                config.admin_ids,
+                config.owner_ids,
                 config.extra_admin_ids,
             ) = saved
 
