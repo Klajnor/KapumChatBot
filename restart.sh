@@ -47,4 +47,8 @@ systemctl restart "$SERVICE"
 systemctl --no-pager --lines=0 status "$SERVICE" || true
 
 echo "Лог (Ctrl+C для выхода):"
-exec journalctl -u "$SERVICE" -f
+# Без exec: иначе при запуске через `source`/`. restart.sh` он заменяет
+# оболочку терминала, и Ctrl+C закрывает сессию. Ctrl+C гасит только
+# journalctl, скрипт завершается штатно с кодом 0.
+trap 'echo; echo "Выход из лога."; exit 0' INT TERM
+journalctl -u "$SERVICE" -f || true
