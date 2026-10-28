@@ -796,13 +796,45 @@ async def _digest_action(
             await _digest_show(callback, "ℹ️ Channel not found.")
         else:
             b = InlineKeyboardBuilder()
+            b.row(_button("🧪 Test", f"adm:dgct:{chat_id}"))
             b.row(_button("🗑 Remove", f"adm:dgx:{chat_id}"), _button("◀ Digest", "adm:dg"))
             await _show(
                 callback,
                 f"📡 <b>{html.escape(title or str(chat_id))}</b>\n<code>{chat_id}</code>\n\n"
-                "Removing it also deletes the stored messages.",
+                "<b>Test</b> sends this channel's summary to you in a private message "
+                "(nothing is posted to the channel).\n"
+                "Removing the channel also deletes the stored messages.",
                 b.as_markup(),
             )
+    elif action == "dgct":
+        try:
+            chat_id = int(arg)
+        except ValueError:
+            await safe_answer_callback(callback)
+            return
+        title = dict(await digest.list_channels()).get(chat_id)
+        if title is None:
+            await _digest_show(callback, "ℹ️ Channel not found.")
+            return
+        await safe_answer_callback(callback, "Summarizing…")
+        await _show(
+            callback,
+            f"⏳ <b>Summarizing {html.escape(title or str(chat_id))}…</b>",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+        try:
+            report = await digest.run_channel_test(chat_id, title, actor)
+            if report.posted:
+                notice = "🧪 Test sent to your private chat."
+            elif report.error == digest.NO_MESSAGES:
+                notice = "➖ Nothing stored for this channel yet (is the bot an admin there?)"
+            else:
+                notice = f"⚠️ Test failed: {html.escape(report.error or 'unknown error')}"
+        except Exception:
+            logger.exception("Channel digest test failed")
+            notice = "❌ The test failed, see the log."
+        await _digest_show(callback, notice)
+        return
     elif action == "dgx":
         try:
             removed = await digest.remove_channel(int(arg))

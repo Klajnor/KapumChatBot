@@ -405,6 +405,57 @@ async def run_test(samples: list, admin_id: int) -> ChannelReport:
     return report
 
 
+async def run_channel_test(chat_id: int, title: str, admin_id: int) -> ChannelReport:
+    """Summarise one channel the way the daily run does, but only for ``admin_id``.
+
+    Same window, context and model as ``_digest_channel``; the summary goes to
+    the admin's private chat. Nothing is posted to the channel, the window is
+    not moved and no stored messages are pruned.
+    """
+    model, prompt = await get_model(), await get_prompt()
+    report = ChannelReport(chat_id=chat_id, title=title, model=model, test=True)
+    until = datetime.datetime.now(datetime.UTC)
+    async with async_session_factory() as session:
+        repo = DigestRepository(session)
+        channel = await repo.get_channel(chat_id)
+        if channel is None:
+            report.error = "channel was removed"
+            return report
+        since = _utc(channel.last_digest_at) if channel.last_digest_at else until - _DEFAULT_WINDOW
+        messages = await repo.messages_between(chat_id, since, until)
+        context = []
+        if 0 < len(messages) < config.digest_min_messages and config.digest_context_messages > 0:
+            context = await repo.messages_up_to(chat_id, since, config.digest_context_messages)
+        if not messages and config.digest_context_messages > 0:
+            messages = await repo.messages_up_to(chat_id, until, config.digest_context_messages)
+            report.recent_only = bool(messages)
+        if not messages:
+            report.error = NO_MESSAGES
+            return report
+        report.messages, report.context = len(messages), len(context)
+        report.first_at, report.last_at = _span(context, messages)
+        text = build_input(
+            messages, context, config.digest_max_input_chars, recent_only=report.recent_only
+        )
+
+    result = await _ask(text, model, prompt)
+    report.input_tokens, report.output_tokens = result.input_tokens, result.output_tokens
+    if result.model:
+        report.model = result.model
+    if not result.content:
+        report.error = "the model returned no answer"
+        return report
+    report.posted = await _deliver(
+        admin_id, f"🧪 **Тестовое саммари · {title or chat_id}**\n\n{result.content}"
+    )
+    if result.varied:
+        await show_prompt(admin_id, "🎲 Prompt used (reworded)", result.prompt)
+    if not report.posted:
+        report.error = "could not send the summary"
+    await notify_admins(format_stats([report]), only=admin_id)
+    return report
+
+
 async def _deliver(chat_id: int, markdown: str) -> bool:
     """Post the summary as a rich message; HTML, then plain text, as fallbacks."""
     if await send_rich_to(bot, chat_id, markdown):
