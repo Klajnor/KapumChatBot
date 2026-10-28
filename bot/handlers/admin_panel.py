@@ -63,6 +63,9 @@ _awaiting: dict[int, tuple[str, int | None]] = {}  # admin -> (kind, target id)
 # Digest test: admin -> messages collected so far and the status message to update.
 _test_state: dict[int, dict[str, Any]] = {}
 
+# Reset-to-default buttons apply only after this word is typed back (case-sensitive).
+CONFIRM_WORD = "CONFIRM"
+
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -342,10 +345,24 @@ async def cb_admin(callback: CallbackQuery) -> None:
     await safe_answer_callback(callback)
 
 
-def _cancel_markup() -> InlineKeyboardMarkup:
+def _cancel_markup(back: str = "adm:home") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="✖ Cancel", callback_data="adm:home")
+    b.button(text="✖ Cancel", callback_data=back)
     return b.as_markup()
+
+
+async def _ask_reset(
+    callback: CallbackQuery, actor: int, key: str, target: int | None, what: str, back: str
+) -> None:
+    """Ask for ``CONFIRM`` before resetting ``what``; the reply goes to on_admin_input."""
+    _awaiting[actor] = (f"reset:{key}", target)
+    await _show(
+        callback,
+        f"♻️ <b>Reset {what} to the default?</b>\n\n"
+        f"Type <code>{CONFIRM_WORD}</code> (case-sensitive) to proceed. "
+        "Anything else cancels.",
+        _cancel_markup(back),
+    )
 
 
 async def _show_stats(callback: CallbackQuery) -> None:
@@ -409,28 +426,32 @@ async def _user_action(
             )
             await safe_answer_callback(callback)
             return
+        if arg == "d":
+            await _ask_reset(
+                callback, actor, "lim", target, "the daily limit", f"adm:u:{target}"
+            )
+            await safe_answer_callback(callback)
+            return
+        try:
+            delta = int(arg)
+        except ValueError:
+            await safe_answer_callback(callback)
+            return
         async with user_service() as service:
-            if arg == "d":
-                await service.set_daily_limit(target, None)
-                notice = "♻️ Limit reset to the default."
-            else:
-                try:
-                    delta = int(arg)
-                except ValueError:
-                    await safe_answer_callback(callback)
-                    return
-                current = await service.get_daily_limit(target)
-                new = max(0, min(MAX_LIMIT, current + delta))
-                await service.set_daily_limit(target, new)
-                notice = f"📊 Limit is now {new}."
+            current = await service.get_daily_limit(target)
+            new = max(0, min(MAX_LIMIT, current + delta))
+            await service.set_daily_limit(target, new)
+        notice = f"📊 Limit is now {new}."
     elif action == "rst":
         async with user_service() as service:
             done = await service.reset_daily_usage(target)
         notice = "🔄 Today's usage reset." if done else "ℹ️ No usage today."
     elif action == "rsp":
-        async with user_service() as service:
-            await service.set_system_prompt(target, config.default_system_prompt)
-        notice = "🧹 System prompt reset to the default."
+        await _ask_reset(
+            callback, actor, "rsp", target, "the system prompt", f"adm:u:{target}"
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "grant":
         profile = await _fetch_profile(target)
         async with user_service() as service:
@@ -509,6 +530,10 @@ async def on_admin_input(message: Message) -> None:
     kind, target = _awaiting.pop(actor)
     text = (message.text or "").strip()
 
+    if kind.startswith("reset:"):
+        await _confirm_reset(message, actor, kind.removeprefix("reset:"), target, text)
+        return
+
     if kind in ("dgadd", "dgprompt", "dgtime", "dgmod", "dgtemp"):
         await _digest_input(message, actor, kind, text)
         return
@@ -556,6 +581,40 @@ async def on_admin_input(message: Message) -> None:
     await message.answer(card, reply_markup=markup)
 
 
+async def _confirm_reset(
+    message: Message, actor: int, key: str, target: int | None, text: str
+) -> None:
+    """Apply a reset asked by _ask_reset if ``text`` is exactly CONFIRM_WORD."""
+    confirmed = text == CONFIRM_WORD
+    cancelled = "✖ Not confirmed — nothing changed."
+
+    if key in _DIGEST_RESETS:
+        setting, _what, _back, done = _DIGEST_RESETS[key]
+        if confirmed:
+            await digest.set_setting(setting, None)
+        screen, markup = await _digest_screen(done if confirmed else cancelled)
+        await message.answer(screen, reply_markup=markup)
+        return
+    if key not in ("lim", "rsp") or target is None:
+        return
+
+    notice = cancelled
+    if confirmed:
+        # Rights are re-checked: the target's level may have changed meanwhile.
+        async with user_service() as service:
+            level = await service.get_level(target)
+            if not _can_manage(actor, level) or (key == "lim" and level != "user"):
+                notice = "⚠️ This account cannot be changed."
+            elif key == "lim":
+                await service.set_daily_limit(target, None)
+                notice = "♻️ Limit reset to the default."
+            else:
+                await service.set_system_prompt(target, config.default_system_prompt)
+                notice = "🧹 System prompt reset to the default."
+    card, markup = await _render_card(actor, target, notice)
+    await message.answer(card, reply_markup=markup)
+
+
 # --- Channel digest ----------------------------------------------------------------
 
 # A prompt of up to MAX_PROMPT_CHARS does not fit an HTML screen together with
@@ -566,6 +625,24 @@ _TEMPERATURES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
 MAX_PROMPT_CHARS = 4096
 _SHOWN_PROMPT_CHARS = 1500
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
+_DIGEST_RESETS = {  # action -> (setting, what is reset, cancel callback, notice)
+    "dgd": (
+        digest.SETTING_PROMPT, "the digest prompt", "adm:dg",
+        "♻️ Prompt reset to the default.",
+    ),
+    "dgmd": (
+        digest.SETTING_MODIFIER, "the modifier prompt", "adm:dg",
+        "♻️ Modifier prompt reset to the default.",
+    ),
+    "dgkd": (
+        digest.SETTING_TEMPERATURE, "the temperature", "adm:dgk",
+        "♻️ Temperature reset to the default.",
+    ),
+    "dgtd": (
+        digest.SETTING_TIME, "the run time", "adm:dgt",
+        "♻️ Run time reset to the default.",
+    ),
+}
 
 
 def _run_notice(result: digest.DigestResult) -> str:
@@ -759,9 +836,9 @@ async def _digest_action(
             _digest_cancel(),
         )
         await _send_prompt(callback, "Current digest prompt", await digest.get_prompt())
-    elif action == "dgd":
-        await digest.set_setting(digest.SETTING_PROMPT, None)
-        await _digest_show(callback, "♻️ Prompt reset to the default.")
+    elif action in _DIGEST_RESETS:
+        _setting, what, back, _done = _DIGEST_RESETS[action]
+        await _ask_reset(callback, actor, action, None, what, back)
     elif action == "dgv":
         enabled = not await digest.get_vary()
         await digest.set_setting(digest.SETTING_VARY, "1" if enabled else "0")
@@ -780,9 +857,6 @@ async def _digest_action(
             _digest_cancel(),
         )
         await _send_prompt(callback, "Current modifier prompt", await digest.get_modifier())
-    elif action == "dgmd":
-        await digest.set_setting(digest.SETTING_MODIFIER, None)
-        await _digest_show(callback, "♻️ Modifier prompt reset to the default.")
     elif action == "dgk":
         current = await digest.get_temperature()
         b = InlineKeyboardBuilder()
@@ -814,9 +888,6 @@ async def _digest_action(
             "🌡 <b>Temperature</b>\n\nSend a number from 0 to 2, e.g. <code>0.8</code>.",
             _digest_cancel(),
         )
-    elif action == "dgkd":
-        await digest.set_setting(digest.SETTING_TEMPERATURE, None)
-        await _digest_show(callback, "♻️ Temperature reset to the default.")
     elif action in ("dgq", "dgqr"):
         await _digest_test_action(callback, actor, action)
         return
@@ -836,9 +907,6 @@ async def _digest_action(
             f"({html.escape(config.reminder_timezone or 'UTC')}), e.g. <code>08:30</code>.",
             _digest_cancel(),
         )
-    elif action == "dgtd":
-        await digest.set_setting(digest.SETTING_TIME, None)
-        await _digest_show(callback, "♻️ Run time reset to the default.")
     elif action == "dgrun":
         await safe_answer_callback(callback, "Running…")
         await _show(callback, "⏳ <b>Digest is running…</b>", InlineKeyboardMarkup(inline_keyboard=[]))
