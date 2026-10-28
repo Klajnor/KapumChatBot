@@ -398,11 +398,7 @@ async def run_test(samples: list, admin_id: int) -> ChannelReport:
         return report
     report.posted = await _deliver(admin_id, f"🧪 **Тестовое саммари**\n\n{result.content}")
     if result.varied:
-        await notify_admins(
-            "🎲 <b>Prompt used (reworded)</b>\n"
-            f"<blockquote>{html.escape(result.prompt[:3500])}</blockquote>",
-            only=admin_id,
-        )
+        await show_prompt(admin_id, "🎲 Prompt used (reworded)", result.prompt)
     if not report.posted:
         report.error = "could not send the summary"
     await notify_admins(format_stats([report]), only=admin_id)
@@ -414,6 +410,15 @@ async def _deliver(chat_id: int, markdown: str) -> bool:
     if await send_rich_to(bot, chat_id, markdown):
         return True
     return await _send_markdown(chat_id, markdown)
+
+
+async def show_prompt(chat_id: int, title: str, prompt: str) -> bool:
+    """Show a prompt in full, through the same rich → HTML → plain chain.
+
+    The prompt can be longer than one HTML message (up to 4096 characters
+    plus escaping), so it is not squeezed into the admin panel's screens.
+    """
+    return await _deliver(chat_id, f"**{title}**\n\n{prompt}")
 
 
 # --- One channel -------------------------------------------------------------------

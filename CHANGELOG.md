@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-10-28
+- **Саммари: промпт до 4096 символов.** Лимит промпта и модификатора в `/admin → Digest` поднят с 2000 до 4096 символов (`admin_panel.MAX_PROMPT_CHARS`). Такой промпт не помещается в HTML-экран панели вместе с остальными строками, поэтому главный экран саммари показывает превью (до 1500 символов, дальше «…»), а экраны «✏️ Prompt» и «🎲 Modifier prompt» присылают текущий промпт целиком отдельным сообщением по общей схеме доставки — rich-сообщение, затем HTML, затем plain (новый `digest.show_prompt`). Так же теперь показывается и переписанный модификатором промпт в тесте саммари — раньше он обрезался до 3500 символов. Тесты: `tests/test_digest_test.py` (+1).
+
+### 2026-10-28
 - **Конфиг: `ADMIN_IDS` → `OWNER_IDS`, `MCP_ADMIN_ONLY` → `MCP_OWNER_ONLY`.** Переменная всегда задавала владельцев (уровень owner: нельзя понизить/заблокировать, только им доступен MCP), а обычных админов назначают в меню `/admin` — старое имя путало. Новые имена читаются первыми; старые остаются алиасами (используются, если новое не задано), при их использовании `validate()` пишет в лог предупреждение «… is deprecated, rename it to … in .env». Существующий `.env` продолжает работать без правок. В коде `config.admin_ids` → `config.owner_ids`, `config.mcp_admin_only` → `config.mcp_owner_only`. Обновлены `.env.example`, README (таблица переменных, раздел MCP, таблица ролей — владелец и назначенный админ теперь отдельными строками), CLAUDE.md/AGENTS.md, CONTRIBUTING.md. Тесты: `tests/test_audit_fixes.py` (+4, `RenamedEnvTests`).
 
 ### 2026-10-28
@@ -83,6 +86,7 @@
 ### [Unreleased]
 
 ### Changed
+- **Digest prompt up to 4096 characters.** `MAX_PROMPT_CHARS` 2000 → 4096 for both the digest prompt and the modifier. The digest screen keeps an HTML preview clipped to `_SHOWN_PROMPT_CHARS` (1500) so it fits one message; the edit screens (`dgp`, `dgmp`) and the reworded prompt of a test run are sent in full via `digest.show_prompt` → `_deliver` (rich message via `send_rich_to`, then HTML/plain via `_send_markdown`). The prompt is rendered as Markdown, like an answer.
 - **Owner env names.** `OWNER_IDS` replaces `ADMIN_IDS` and `MCP_OWNER_ONLY` replaces `MCP_ADMIN_ONLY` (the values always meant owners — IDs that can never be demoted or blocked and that alone get MCP; regular admins are promoted from `/admin` and kept in `extra_admin_ids`). Legacy names are read as fallbacks via `_env("OWNER_IDS", "ADMIN_IDS")` and a nested `_env_bool`; `_RENAMED_ENV` drives a deprecation warning in `Config.validate()` when only the old name is set. Attribute renames: `Config.owner_ids`, `Config.mcp_owner_only`. `SECURITY_AUDIT.md` and `plans/` keep the old names as historical records.
 
 ### Added

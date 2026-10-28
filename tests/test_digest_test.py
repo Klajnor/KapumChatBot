@@ -115,3 +115,18 @@ class TestDigestTestButton(DBTest):
                 self.assertIn(expected, buttons)
 
         self._run(go)
+
+    def test_edit_screens_send_the_whole_prompt_through_the_rich_chain(self):
+        async def go() -> None:
+            prompt = "p" * panel.MAX_PROMPT_CHARS
+            await digest.set_setting(digest.SETTING_PROMPT, prompt)
+            callback = _callback()
+            callback.message.chat.id = ADMIN
+            with patch.object(digest, "send_rich_to", AsyncMock(return_value=True)) as rich:
+                await panel._digest_action(callback, ADMIN, "dgp", ["adm", "dgp"])
+            chat_id, markdown = rich.await_args.args[1:]
+            self.assertEqual(chat_id, ADMIN)
+            self.assertTrue(markdown.endswith(prompt))  # not clipped
+            self.assertEqual(panel._awaiting.pop(ADMIN), ("dgprompt", None))
+
+        self._run(go)

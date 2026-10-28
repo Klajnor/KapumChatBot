@@ -558,11 +558,13 @@ async def on_admin_input(message: Message) -> None:
 
 # --- Channel digest ----------------------------------------------------------------
 
-# Both screens show the whole prompt; with the other lines they must fit one
-# Telegram message (4096 characters, HTML escaping included).
+# A prompt of up to MAX_PROMPT_CHARS does not fit an HTML screen together with
+# the other lines (4096 characters, escaping included): the digest screen shows
+# a clipped preview, and the edit screens send the whole prompt separately
+# through the rich → HTML → plain chain (digest.show_prompt).
 _TEMPERATURES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
-MAX_PROMPT_CHARS = 2000
-_SHOWN_PROMPT_CHARS = 2400  # only older, longer saved prompts get clipped
+MAX_PROMPT_CHARS = 4096
+_SHOWN_PROMPT_CHARS = 1500
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
 
 
@@ -614,6 +616,14 @@ def _clip_prompt(prompt: str) -> str:
     if len(prompt) <= _SHOWN_PROMPT_CHARS:
         return prompt
     return prompt[:_SHOWN_PROMPT_CHARS] + "…"
+
+
+async def _send_prompt(callback: CallbackQuery, title: str, prompt: str) -> None:
+    """The whole prompt as a separate message below the panel."""
+    chat = getattr(callback.message, "chat", None)
+    chat_id = chat.id if chat is not None else callback.from_user.id
+    if not await digest.show_prompt(chat_id, title, prompt):
+        logger.warning("Could not show the digest prompt to %s", chat_id)
 
 
 async def _digest_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
@@ -744,11 +754,11 @@ async def _digest_action(
         _awaiting[actor] = ("dgprompt", None)
         await _show(
             callback,
-            "✏️ <b>Digest prompt</b>\n\nCurrent:\n"
-            f"<blockquote>{html.escape(_clip_prompt(await digest.get_prompt()))}</blockquote>\n"
+            "✏️ <b>Digest prompt</b>\n\nThe current prompt is in the next message.\n"
             f"Send the new system prompt (up to {MAX_PROMPT_CHARS} characters).",
             _digest_cancel(),
         )
+        await _send_prompt(callback, "Current digest prompt", await digest.get_prompt())
     elif action == "dgd":
         await digest.set_setting(digest.SETTING_PROMPT, None)
         await _digest_show(callback, "♻️ Prompt reset to the default.")
@@ -765,11 +775,11 @@ async def _digest_action(
             "🎲 <b>Modifier prompt</b>\n\n"
             "Before every run the digest prompt is sent to the model together with "
             "this instruction, and the reworded prompt is used for the summary.\n\n"
-            "Current:\n"
-            f"<blockquote>{html.escape(_clip_prompt(await digest.get_modifier()))}</blockquote>\n"
+            "The current modifier is in the next message.\n"
             f"Send the new modifier prompt (up to {MAX_PROMPT_CHARS} characters).",
             _digest_cancel(),
         )
+        await _send_prompt(callback, "Current modifier prompt", await digest.get_modifier())
     elif action == "dgmd":
         await digest.set_setting(digest.SETTING_MODIFIER, None)
         await _digest_show(callback, "♻️ Modifier prompt reset to the default.")
