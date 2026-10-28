@@ -458,7 +458,7 @@ async def run_channel_test(chat_id: int, title: str, admin_id: int) -> ChannelRe
 
 async def _deliver(chat_id: int, markdown: str) -> bool:
     """Post the summary as a rich message; HTML, then plain text, as fallbacks."""
-    if await send_rich_to(bot, chat_id, markdown):
+    if config.rich_messages and await send_rich_to(bot, chat_id, markdown):
         return True
     return await _send_markdown(chat_id, markdown)
 

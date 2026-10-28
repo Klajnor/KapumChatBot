@@ -44,6 +44,7 @@ from bot.database.session import async_session_factory
 from bot.services.access import check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
+from bot.services.rich import send_rich_to
 from bot.services.search import (
     SEARCH_TOOL,
     apply_search_hint,
@@ -53,7 +54,7 @@ from bot.services.search import (
     search_configured,
     search_web,
 )
-from bot.services.telegram_utils import format_timing, throttle
+from bot.services.telegram_utils import format_timing, throttle, with_timing
 from bot.services.untrusted import apply_untrusted_hint, messages_have_untrusted_content
 from bot.services.user_service import UserService
 
@@ -651,6 +652,12 @@ async def _fire_ai(due: DueReminder) -> None:
         output_tokens=result.output_tokens,
     )
     markdown = f"🔔 **Scheduled AI request**\n_{due.text[:300]}_\n\n{result.content}"
+    # Same delivery chain as an interactive answer: rich message first, then
+    # the HTML/plain fallback.
+    if config.rich_messages and await send_rich_to(
+        bot, due.chat_id, with_timing(markdown, footer)
+    ):
+        return
     if footer:
         markdown = f"{markdown}\n\n{footer}"
     await _send_markdown(due.chat_id, markdown)
