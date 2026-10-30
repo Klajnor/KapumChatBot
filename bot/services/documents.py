@@ -728,7 +728,14 @@ class _PinnedResolver(aiohttp.resolver.AbstractResolver):
         return None
 
 
-async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
+async def _fetch_body(
+    url: str,
+    *,
+    max_bytes: int | None = None,
+    headers: dict[str, str] | None = None,
+    text_only: bool = True,
+    timeout_seconds: float | None = None,
+) -> tuple[bytes | None, str, str | None]:
     """GET ``url`` following redirects manually; validate every hop.
 
     Returns ``(body, final_url, content_type)``. On any refusal or failure
@@ -738,9 +745,20 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
     an internal address without giving us a chance to check it. Every hop
     (including the first URL) is resolved once, screened for public addresses,
     and the request is pinned to exactly those addresses.
+
+    Для изображений используется тот же сетевой шлюз с ``text_only=False``
+    и собственным лимитом. Явные заголовки не передаются на другой origin.
     """
-    timeout = aiohttp.ClientTimeout(total=config.link_fetch_timeout)
+    timeout = aiohttp.ClientTimeout(
+        total=config.link_fetch_timeout if timeout_seconds is None else timeout_seconds
+    )
+    limit = _MAX_FETCH_BYTES if max_bytes is None else max_bytes
     try:
+        try:
+            initial = urlsplit(url)
+        except ValueError:
+            return None, url, None
+        origin = (initial.scheme, initial.netloc)
         for _ in range(_MAX_REDIRECTS + 1):
             try:
                 parsed = urlsplit(url)
@@ -766,7 +784,14 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
                 async with aiohttp.ClientSession(
                     timeout=timeout, connector=connector
                 ) as session, session.get(
-                    url, headers=_FETCH_HEADERS, allow_redirects=False
+                    url,
+                    # Авторизация не должна следовать на другой origin.
+                    headers=(
+                        headers if headers is not None
+                        and (parsed.scheme, parsed.netloc) == origin
+                        else _FETCH_HEADERS
+                    ),
+                    allow_redirects=False,
                 ) as resp:
                     if resp.status in (301, 302, 303, 307, 308):
                         location = resp.headers.get("Location")
@@ -795,13 +820,13 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
                         or "xhtml" in content_type
                         or not content_type
                     )
-                    if not allowed:
+                    if text_only and not allowed:
                         logger.info(
                             "Skipping non-text content type %r", content_type
                         )
                         return None, url, None
                     declared = resp.content_length
-                    if declared is not None and declared > _MAX_FETCH_BYTES:
+                    if declared is not None and declared > limit:
                         logger.info("Page is too large (%d bytes)", declared)
                         return None, url, None
                     # StreamReader.read(n) отдаёт только то, что уже в буфере,
@@ -810,15 +835,15 @@ async def _fetch_body(url: str) -> tuple[bytes | None, str, str | None]:
                     total = 0
                     async for chunk in resp.content.iter_chunked(65536):
                         total += len(chunk)
-                        if total > _MAX_FETCH_BYTES:
-                            logger.info("Page exceeds %d bytes", _MAX_FETCH_BYTES)
+                        if total > limit:
+                            logger.info("Download exceeds %d bytes", limit)
                             return None, url, None
                         chunks.append(chunk)
                     return b"".join(chunks), str(resp.url), content_type
             finally:
                 await connector.close()
-    except (TimeoutError, aiohttp.ClientError, OSError) as exc:
-        logger.warning("URL fetch failed for %s: %s", urlsplit(url).netloc, exc)
+    except (TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+        logger.warning("URL fetch failed (%s)", type(exc).__name__)
         return None, url, None
     return None, url, None
 

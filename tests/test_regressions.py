@@ -270,17 +270,12 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_image_host_never_receives_api_key(self):
         client = AIClient(api_key="test-key", base_url="https://api.example.test/compatible-mode/v1")
-        response = MagicMock()
-        response.status = 403
-        response.read = AsyncMock(return_value=b"denied")
-        request = MagicMock()
-        request.__aenter__ = AsyncMock(return_value=response)
-        session = MagicMock()
-        session.get.return_value = request
-        with patch.object(client, "_get_download_session", AsyncMock(return_value=session)):
+        with patch.object(
+            documents, "_fetch_body", AsyncMock(return_value=(None, "", None))
+        ) as fetch:
             self.assertIsNone(await client.download_image("https://storage.example.test/image"))
-        session.get.assert_called_once()
-        self.assertIsNone(session.get.call_args.kwargs["headers"])
+        fetch.assert_awaited_once()
+        self.assertIsNone(fetch.call_args.kwargs["headers"])
 
     async def test_large_audio_is_rejected_before_request(self):
         client = AIClient(api_key="test-key")

@@ -1022,7 +1022,7 @@ class Config:
     # the bot creates an anonymous account itself and caches the token in
     # TELEGRAPH_ACCOUNT_FILE. The file holds a secret: keep it out of git.
     enable_telegraph: bool = field(
-        default_factory=lambda: _env_bool("TELEGRAPH_ENABLED", True)
+        default_factory=lambda: _env_bool("TELEGRAPH_ENABLED", False)
     )
     telegraph_api_url: str = field(
         default_factory=lambda: _env(

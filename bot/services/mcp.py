@@ -147,7 +147,9 @@ def _expand_env(value: str) -> str:
 
     def replace(match: re.Match[str]) -> str:
         name, default = match.group(1), match.group(2)
-        if name.upper() in _SECRET_ENV_NAMES:
+        if name.upper() in _SECRET_ENV_NAMES or re.fullmatch(
+            r"(?:MODEL_\d+|FALLBACK_MODEL)_API_KEY", name.upper()
+        ):
             logger.warning(
                 "MCP config references the bot secret %r; expansion refused", name
             )

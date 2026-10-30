@@ -526,9 +526,6 @@ class AIClient:
             or _derive_native_base_url(self.base_url)
         )
         self._session: aiohttp.ClientSession | None = None
-        # Downloads use their own session: presigned storage URLs reject the
-        # API's Authorization header (see ``download_image``).
-        self._download_session: aiohttp.ClientSession | None = None
         # Provider model IDs reported as available, per provider base URL
         # (a missing / ``None`` entry = unknown).
         self._available_ids: dict[str, set[str] | None] = {}
@@ -550,29 +547,11 @@ class AIClient:
             )
         return self._session
 
-    async def _get_download_session(self) -> aiohttp.ClientSession:
-        """Session for fetching generated files — **without** default headers.
-
-        Generated images are returned as presigned Alibaba Cloud OSS URLs: the
-        signature lives in the query string, and OSS answers ``403`` when the
-        request also carries an ``Authorization`` header ("only one auth
-        mechanism allowed"). Session-level headers in aiohttp are merged into
-        every request and cannot be dropped per call, so downloads need a
-        separate, header-free session.
-        """
-        if self._download_session is None or self._download_session.closed:
-            self._download_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=config.image_timeout),
-            )
-        return self._download_session
-
     async def close(self) -> None:
-        """Close the underlying HTTP sessions."""
-        for attribute in ("_session", "_download_session"):
-            session = getattr(self, attribute)
-            if session is not None and not session.closed:
-                await session.close()
-            setattr(self, attribute, None)
+        """Close the underlying HTTP session."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     # --- Model catalog -----------------------------------------------------
 
@@ -1516,16 +1495,19 @@ class AIClient:
         Tries anonymously first — presigned OSS URLs answer ``403`` when an
         ``Authorization`` header is present — then falls back to an
         authenticated request only when the file is served by the API itself.
-        The presigned query string is never logged.
+        Every hop is DNS-pinned to public IPs on web ports; the body is read
+        incrementally under a byte limit, even without Content-Length.
         """
         if not url:
             return None
 
-        safe_url = url.split("?", 1)[0]
-        timeout = aiohttp.ClientTimeout(total=config.image_timeout)
+        from bot.services.documents import _fetch_body
 
         # Never forward the API key to an external image/storage host.
-        source = urlsplit(url)
+        try:
+            source = urlsplit(url)
+        except ValueError:
+            return None
         trusted_origins = {
             (parsed.scheme, parsed.netloc)
             for parsed in (urlsplit(self.base_url), urlsplit(self.native_base_url))
@@ -1533,39 +1515,14 @@ class AIClient:
         header_variants = [None]
         if (source.scheme, source.netloc) in trusted_origins:
             header_variants.append(self._headers)
-        for attempt, headers in enumerate(header_variants, start=1):
-            try:
-                session = await self._get_download_session()
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    declared = resp.content_length
-                    if isinstance(declared, int) and declared > MAX_DOWNLOAD_BYTES:
-                        logger.error("Image at %s is too large (%d bytes)", safe_url, declared)
-                        return None
-                    body = await resp.read()
-                    if len(body) > MAX_DOWNLOAD_BYTES:
-                        logger.error("Image at %s is too large", safe_url)
-                        return None
-                    if resp.status == 200 and body:
-                        return body
-                    logger.warning(
-                        "Image download attempt %d failed (status %s) for %s: %s",
-                        attempt,
-                        resp.status,
-                        safe_url,
-                        body[:300],
-                    )
-            except (TimeoutError, aiohttp.ClientError) as exc:
-                logger.error("Image download failed for %s: %s", safe_url, exc)
-                return None
-            except Exception as exc:  # noqa: BLE001 - a bad URL must not kill a reply
-                logger.warning(
-                    "Image download attempt %d errored for %s: %s",
-                    attempt,
-                    safe_url,
-                    exc,
-                )
-
-        logger.error("Image download failed for %s (all attempts)", safe_url)
+        for headers in header_variants:
+            body, _final_url, _content_type = await _fetch_body(
+                url, max_bytes=MAX_DOWNLOAD_BYTES, headers=headers,
+                text_only=False, timeout_seconds=config.image_timeout,
+            )
+            if body:
+                return body
+        logger.error("Image download failed")
         return None
 
     # --- Internals ---------------------------------------------------------

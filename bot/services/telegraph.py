@@ -347,7 +347,7 @@ async def _get_session() -> aiohttp.ClientSession:
             timeout=aiohttp.ClientTimeout(total=config.telegraph_timeout),
             # telegra.ph is regionally blocked on some networks: honour
             # HTTPS_PROXY from the environment when one is configured.
-            trust_env=True,
+            trust_env=False,
         )
     return _session
 

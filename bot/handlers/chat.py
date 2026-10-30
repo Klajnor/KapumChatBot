@@ -1327,7 +1327,7 @@ async def _answer_with_ai(
     if search_ready:
         tools.append(SEARCH_TOOL)
         apply_search_hint(messages)
-    # MCP tools (the Obsidian "second brain") are exposed to admins only by
+    # MCP tools (the Obsidian "second brain") are exposed to owners only by
     # default; a server that fails to start simply contributes no tools.
     mcp_ready = mcp_available(user.id)
     if mcp_ready:
@@ -1382,6 +1382,15 @@ async def _answer_with_ai(
                 result = await _single_shot(messages, model, settings, tools_arg)
 
             total_elapsed += result.elapsed
+
+            # Ответ модели — недоверенный ввод. Отсутствие инструмента в
+            # каталоге само по себе не запрещает модели вернуть его имя.
+            offered = {
+                tool["function"]["name"] for tool in (tools_arg or [])
+            }
+            result.tool_calls = [
+                call for call in result.tool_calls if call.name in offered
+            ]
 
             image_call = next(
                 (call for call in result.tool_calls if call.name == "generate_image"),
@@ -1450,6 +1459,7 @@ async def _answer_with_ai(
                 # results already gathered.
                 logger.info("Tool round limit reached; forcing a final answer")
                 result = await _single_shot(messages, model, settings, None)
+                result.tool_calls = []
                 total_elapsed += result.elapsed
             break
 
