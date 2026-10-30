@@ -1418,14 +1418,14 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generate_sticker_converts_to_webp(self):
         from bot.services.ai_client import AIClient, ImageResult
-        from bot.services.stickers import to_sticker_webp
+        from bot.services.stickers import StickerResult, to_sticker_webp
 
         client = AIClient(api_key="test-key")
         png = self._png_bytes(768, 768)
         source = ImageResult(url="http://x/img.png", data=png, elapsed=1.0)
         with (
             patch.object(client, "generate_image_result", AsyncMock(return_value=source)),
-            patch("bot.services.ai_client.prepare_sticker", AsyncMock(return_value=to_sticker_webp(png))) as prepare,
+            patch("bot.services.ai_client.prepare_sticker_result", AsyncMock(return_value=StickerResult(data=to_sticker_webp(png)))) as prepare,
         ):
             result = await client.generate_sticker("a cat")
         prepare.assert_awaited_once_with(png)

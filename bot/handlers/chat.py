@@ -82,6 +82,7 @@ from bot.services.search import (
     search_web,
 )
 from bot.services.sticker_sets import add_keyboard, save_sticker
+from bot.services.stickers import sticker_error_message
 from bot.services.telegram_utils import (
     edit_formatted,
     format_timing,
@@ -803,8 +804,8 @@ async def generate_and_send_sticker(
         await safe_answer(
             message,
             "❌ <b>Could not generate the sticker.</b>\n\n"
-            "Generation or background removal failed, timed out, or the sticker "
-            "processor is busy. Please try again later. No question quota is charged.",
+            f"{html.escape(sticker_error_message(result.error))}\n\n"
+            "No question quota is charged.",
         )
         return False
 

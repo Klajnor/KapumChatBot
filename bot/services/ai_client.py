@@ -26,7 +26,7 @@ from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
     STICKER_MAX_BYTES,
     STICKER_SIZE,
-    prepare_sticker,
+    prepare_sticker_result,
     to_sticker_webp,
 )
 
@@ -427,6 +427,8 @@ class ImageResult:
     url: str | None = None
     data: bytes | None = None
     elapsed: float = 0.0
+    # Безопасный внутренний код причины: сырой ответ провайдера не передаётся в чат.
+    error: str | None = None
 
 
 def _guess_mime(image_bytes: bytes) -> str:
@@ -1326,20 +1328,37 @@ class AIClient:
             timeout=config.image_timeout,
             fail_fast_on_quota=False,
         )
-        if status != 200 or not data:
+        if status != 200 or not data or not isinstance(data, dict):
             logger.error("Image generation failed (status %s)", status)
-            return ImageResult(elapsed=time.monotonic() - started)
+            error = {
+                None: "generation_connection",
+                200: "generation_invalid_response",
+                400: "generation_rejected",
+                401: "generation_auth",
+                403: "generation_forbidden",
+                404: "generation_not_found",
+                429: "generation_rate_limit",
+            }.get(status, "generation_unavailable" if status is not None and 500 <= status < 600 else "generation_failed")
+            return ImageResult(elapsed=time.monotonic() - started, error=error)
 
-        image_url = self._extract_image_url(data)
+        try:
+            image_url = self._extract_image_url(data)
+        except (AttributeError, TypeError, IndexError):
+            logger.exception("Malformed image generation response")
+            return ImageResult(elapsed=time.monotonic() - started, error="generation_invalid_response")
+        if image_url is not None and not isinstance(image_url, str):
+            logger.error("Image response contains a non-string URL")
+            return ImageResult(elapsed=time.monotonic() - started, error="generation_invalid_response")
         if not image_url:
             logger.error("Image response has no URL: %s", str(data)[:300])
-            return ImageResult(elapsed=time.monotonic() - started)
+            return ImageResult(elapsed=time.monotonic() - started, error="generation_no_image")
 
         image_bytes = await self.download_image(image_url) if download else None
         return ImageResult(
             url=image_url,
             data=image_bytes,
             elapsed=time.monotonic() - started,
+            error="image_download_failed" if download and image_bytes is None else None,
         )
 
     async def generate_image(
@@ -1369,11 +1388,13 @@ class AIClient:
             full_prompt, model=model, size=size, download=True,
         )
         if result.data is None:
+            if result.error is None:
+                result.error = "image_download_failed" if result.url else "generation_failed"
             return result
         started = time.monotonic()
-        webp = await prepare_sticker(result.data)
+        processed = await prepare_sticker_result(result.data)
         elapsed = (result.elapsed or 0) + time.monotonic() - started
-        return ImageResult(url=result.url, data=webp, elapsed=elapsed)
+        return ImageResult(url=result.url, data=processed.data, elapsed=elapsed, error=processed.error)
 
     async def generate_image_with_references(
         self,

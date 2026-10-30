@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import os
 import sys
@@ -98,9 +99,9 @@ class StickerProcessingTests(unittest.IsolatedAsyncioTestCase):
         def blocked(data):
             started.set()
             release.wait(5)
-            return b"webp"
+            return stickers.StickerResult(data=b"webp")
 
-        with patch.object(stickers, "_pending", None), patch.object(stickers, "_prepare_sticker", blocked), patch.object(config, "sticker_processing_timeout", 0.02):
+        with patch.object(stickers, "_pending", None), patch.object(stickers, "_prepare_sticker_result", blocked), patch.object(config, "sticker_processing_timeout", 0.02):
             try:
                 self.assertIsNone(await stickers.prepare_sticker(b"first"))
                 self.assertTrue(started.is_set())
@@ -117,9 +118,9 @@ class StickerProcessingTests(unittest.IsolatedAsyncioTestCase):
         def blocked(data):
             started.set()
             release.wait(5)
-            return b"webp"
+            return stickers.StickerResult(data=b"webp")
 
-        with patch.object(stickers, "_pending", None), patch.object(stickers, "_prepare_sticker", blocked):
+        with patch.object(stickers, "_pending", None), patch.object(stickers, "_prepare_sticker_result", blocked):
             task = asyncio.create_task(stickers.prepare_sticker(b"first"))
             try:
                 await asyncio.to_thread(started.wait, 2)
@@ -135,6 +136,145 @@ class StickerProcessingTests(unittest.IsolatedAsyncioTestCase):
         for value, expected in (("1", 10), ("9999", 600), ("120", 120)):
             with patch.dict(os.environ, {"STICKER_PROCESSING_TIMEOUT": value}):
                 self.assertEqual(Config().sticker_processing_timeout, expected)
+
+
+class StickerDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    """Причина сбоя проходит до ответа бота, но не раскрывает сырые исключения."""
+
+    def test_dependency_and_invalid_image_diagnostics(self):
+        opaque = png(Image.new("RGB", (40, 40), "white"))
+        with patch.dict(sys.modules, {"rembg": None}):
+            result = stickers._prepare_sticker_result(opaque)
+        self.assertEqual(result.error, "dependency_rembg")
+        self.assertIn("pip install -r requirements.txt", stickers.sticker_error_message(result.error))
+        self.assertEqual(stickers._prepare_sticker_result(b"invalid").error, "invalid_image")
+        self.assertEqual(stickers.to_sticker_webp_result(b"invalid").error, "invalid_image")
+        with patch.dict(sys.modules, {"PIL": None}):
+            self.assertEqual(stickers._prepare_sticker_result(opaque).error, "dependency_pillow")
+
+    def test_model_load_errors_have_actionable_reasons(self):
+        opaque = png(Image.new("RGB", (40, 40), "white"))
+        for error, expected in (
+            (RuntimeError("private download URL with key=secret"), "model_load_failed"),
+            (PermissionError("private cache path"), "model_cache_permission"),
+            (MemoryError("private allocation details"), "out_of_memory"),
+        ):
+            fake = SimpleNamespace(new_session=MagicMock(side_effect=error), remove=MagicMock())
+            with patch.dict(sys.modules, {"rembg": fake}), patch.object(stickers, "_session", None):
+                result = stickers._prepare_sticker_result(opaque)
+            self.assertEqual(result.error, expected)
+            self.assertNotIn("private", stickers.sticker_error_message(result.error))
+            self.assertNotIn("secret", stickers.sticker_error_message(result.error))
+
+    def test_inference_cutout_and_size_errors_are_distinct(self):
+        opaque = png(Image.new("RGB", (40, 40), "white"))
+        fake = SimpleNamespace(new_session=MagicMock(), remove=MagicMock(side_effect=RuntimeError("internal")))
+        with patch.dict(sys.modules, {"rembg": fake}), patch.object(stickers, "_session", object()):
+            self.assertEqual(stickers._prepare_sticker_result(opaque).error, "background_removal_failed")
+            fake.remove.side_effect = None
+            fake.remove.return_value = Image.new("RGBA", (40, 40), "white")
+            self.assertEqual(stickers._prepare_sticker_result(opaque).error, "no_transparency")
+        with patch.object(stickers, "STICKER_MAX_BYTES", 1):
+            self.assertEqual(stickers._prepare_sticker_result(png(subject())).error, "webp_too_large")
+        self.assertEqual(stickers.to_sticker_webp_result(png(Image.new("RGBA", (20, 20)))).error, "empty_image")
+
+    def test_runtime_import_failure_cannot_exit_the_bot(self):
+        opaque = png(Image.new("RGB", (40, 40), "white"))
+        original_import = __import__
+
+        def failed_import(name, *args, **kwargs):
+            if name == "rembg":
+                raise SystemExit("No ONNX backend")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=failed_import):
+            self.assertEqual(stickers._prepare_sticker_result(opaque).error, "runtime_load_failed")
+
+    async def test_busy_and_timeout_have_distinct_codes(self):
+        pending = asyncio.get_running_loop().create_future()
+        try:
+            with patch.object(stickers, "_pending", pending):
+                result = await stickers.prepare_sticker_result(b"image")
+            self.assertEqual(result.error, "processor_busy")
+        finally:
+            pending.cancel()
+        future = asyncio.get_running_loop().create_future()
+        try:
+            with (
+                patch.object(stickers, "_pending", None),
+                patch.object(asyncio.get_running_loop(), "run_in_executor", return_value=future),
+                patch.object(config, "sticker_processing_timeout", 0.01),
+            ):
+                result = await stickers.prepare_sticker_result(b"image")
+                self.assertEqual(result.error, "processing_timeout")
+                self.assertIn("0.01 seconds", stickers.sticker_error_message(result.error))
+                self.assertFalse(future.cancelled())
+        finally:
+            future.cancel()
+
+    async def test_api_status_and_download_failures_are_preserved(self):
+        from bot.services.ai_client import AIClient
+
+        client = AIClient(api_key="test-key")
+        for status, expected in (
+            (None, "generation_connection"), (401, "generation_auth"),
+            (403, "generation_forbidden"), (400, "generation_rejected"),
+            (404, "generation_not_found"), (429, "generation_rate_limit"),
+            (503, "generation_unavailable"), (418, "generation_failed"),
+            (200, "generation_invalid_response"),
+        ):
+            with patch.object(client, "_post_chat", AsyncMock(return_value=(status, None, 0))):
+                result = await client.generate_sticker("cat")
+            self.assertEqual(result.error, expected)
+        with patch.object(client, "_post_chat", AsyncMock(return_value=(200, {"output": {}}, 0))):
+            result = await client.generate_sticker("cat")
+            self.assertEqual(result.error, "generation_no_image")
+        for data in (["invalid"], {"output": ["invalid"]}, {"output": {"results": [{"url": 123}]}}):
+            with patch.object(client, "_post_chat", AsyncMock(return_value=(200, data, 0))):
+                result = await client.generate_sticker("cat")
+            self.assertEqual(result.error, "generation_invalid_response")
+        with (
+            patch.object(client, "_post_chat", AsyncMock(return_value=(200, {"output": {}}, 0))),
+            patch.object(client, "_extract_image_url", return_value="https://example.test/image"),
+            patch.object(client, "download_image", AsyncMock(return_value=None)),
+        ):
+            result = await client.generate_sticker("cat")
+            self.assertEqual(result.error, "image_download_failed")
+
+    async def test_processing_error_propagates_through_ai_client(self):
+        from bot.services.ai_client import AIClient, ImageResult
+
+        client = AIClient(api_key="test-key")
+        with (
+            patch.object(client, "generate_image_result", AsyncMock(return_value=ImageResult(data=b"image", elapsed=1))),
+            patch("bot.services.ai_client.prepare_sticker_result", AsyncMock(return_value=stickers.StickerResult(error="model_load_failed"))),
+        ):
+            result = await client.generate_sticker("cat")
+        self.assertEqual(result.error, "model_load_failed")
+        self.assertIsNone(result.data)
+        self.assertGreaterEqual(result.elapsed, 1)
+
+    async def test_bot_displays_specific_reason_not_raw_exception(self):
+        from bot.handlers import chat
+        from bot.services.ai_client import ImageResult
+
+        @asynccontextmanager
+        async def no_wait(message):
+            yield
+
+        message = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()), chat=SimpleNamespace(id=1))
+        for error in ("dependency_rembg", "processing_timeout", "processor_busy", "private-key-secret <b>raw API response</b>"):
+            with (
+                patch.object(chat, "waiting", no_wait),
+                patch.object(chat.ai_client, "generate_sticker", AsyncMock(return_value=ImageResult(error=error))),
+                patch.object(chat, "safe_answer", AsyncMock()) as answer,
+            ):
+                self.assertFalse(await chat.generate_and_send_sticker(message, "cat"))
+            text = answer.call_args.args[1]
+            self.assertIn(stickers.sticker_error_message(error), html.unescape(text))
+            self.assertIn("No question quota is charged", text)
+            self.assertNotIn("private-key-secret", text)
+            self.assertNotIn("raw API response", text)
 
 
 class StickerSetTests(unittest.IsolatedAsyncioTestCase):
