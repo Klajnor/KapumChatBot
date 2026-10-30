@@ -23,8 +23,8 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 import time
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -142,10 +142,10 @@ _PARSE_WORKERS = 2
 _parse_pool = ThreadPoolExecutor(
     max_workers=_PARSE_WORKERS, thread_name_prefix="docparse"
 )
-# Семафор привязан к event loop (в тестах их несколько), поэтому по одному на loop.
-_parse_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
-    weakref.WeakKeyDictionary()
-)
+# Слот принадлежит реальному потоку, а не ожидающей корутине. Таймаут/отмена
+# запроса не освобождают его: иначе зависшие парсеры создают неограниченную
+# очередь с байтами новых документов. Семафор общий для всех event loop.
+_parse_slots = threading.BoundedSemaphore(_PARSE_WORKERS)
 
 
 def _check_deadline(deadline: float | None) -> None:
@@ -156,25 +156,32 @@ def _check_deadline(deadline: float | None) -> None:
 async def _run_parser(func: Any, *args: Any) -> Any:
     """Run a blocking parser in the dedicated pool under ``DOCUMENT_PARSE_TIMEOUT``.
 
-    The clock starts when the parser actually begins (the semaphore keeps the
-    queue out of the budget). Raises ``DocumentParseTimeout`` on expiry.
+    При занятом пуле сразу возвращает ``DocumentParseTimeout`` без очереди.
+    Слот освобождается только после фактического завершения разбора.
     """
     timeout = config.document_parse_timeout
     loop = asyncio.get_running_loop()
-    gate = _parse_gates.get(loop)
-    if gate is None:
-        gate = _parse_gates[loop] = asyncio.Semaphore(_PARSE_WORKERS)
+    slots = _parse_slots
+    if not slots.acquire(blocking=False):
+        raise DocumentParseTimeout
 
     def job() -> Any:
-        return func(*args, deadline=time.monotonic() + timeout)
-
-    async with gate:
         try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(_parse_pool, job), timeout + 2
-            )
-        except TimeoutError:
-            raise DocumentParseTimeout from None
+            return func(*args, deadline=time.monotonic() + timeout)
+        finally:
+            slots.release()
+
+    try:
+        future = loop.run_in_executor(_parse_pool, job)
+    except BaseException:
+        slots.release()
+        raise
+    # После таймаута исключение фонового парсера тоже должно быть прочитано.
+    future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout + 2)
+    except TimeoutError:
+        raise DocumentParseTimeout from None
 
 
 def _extract_pdf(data: bytes, deadline: float | None = None) -> str | None:

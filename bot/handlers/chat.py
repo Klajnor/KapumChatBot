@@ -1872,7 +1872,16 @@ async def _handle_document(message: Message) -> None:
                     "🔍 <b>No text layer — this looks like a scan.</b> Reading up "
                     f"to {config.pdf_ocr_max_pages} page(s) with a vision model…",
                 )
-                ocr = await ocr_pdf(data)
+                try:
+                    ocr = await ocr_pdf(data)
+                except DocumentParseTimeout:
+                    await refund_access(service, user.id, access)
+                    await safe_answer(
+                        message,
+                        "⏱️ PDF rendering timed out or all document workers are busy. "
+                        "Try a smaller file or try again later. Your question was not counted.",
+                    )
+                    return
                 if ocr is not None:
                     extracted = clip_extracted(ocr.text)
                     ocr_note = (

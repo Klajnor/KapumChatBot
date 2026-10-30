@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from io import BytesIO
 
 from bot.config import config
 from bot.services.ai_client import ai_client
+from bot.services.documents import DocumentParseTimeout, _check_deadline, _run_parser
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,9 @@ class OcrResult:
         return self.pages_read < self.total_pages
 
 
-def _render_pages(data: bytes, max_pages: int) -> tuple[list[bytes], int]:
+def _render_pages(
+    data: bytes, max_pages: int, deadline: float | None = None
+) -> tuple[list[bytes], int]:
     """JPEG bytes of the first pages and the document's total page count."""
     try:
         import pdfplumber
@@ -52,15 +56,32 @@ def _render_pages(data: bytes, max_pages: int) -> tuple[list[bytes], int]:
         return [], 0
     images: list[bytes] = []
     try:
+        _check_deadline(deadline)
         with pdfplumber.open(BytesIO(data)) as pdf:
             total = len(pdf.pages)
             for page in pdf.pages[:max_pages]:
-                picture = page.to_image(resolution=_RENDER_DPI).original.convert("RGB")
+                _check_deadline(deadline)
+                # PDFium растеризует MediaBox до обрезки. thumbnail() после
+                # to_image не защищает от гигантской исходной аллокации.
+                x0, y0, x1, y1 = page.mediabox
+                unit = float(page.page_obj.attrs.get("UserUnit", 1))
+                sides = [float(page.width), float(page.height), abs(x1 - x0), abs(y1 - y0)]
+                if not all(math.isfinite(side) and side > 0 for side in sides):
+                    raise ValueError("Invalid PDF page dimensions")
+                if not math.isfinite(unit) or unit <= 0:
+                    raise ValueError("Invalid PDF UserUnit")
+                longest = max(sides) * max(1, unit)
+                resolution = min(_RENDER_DPI, _MAX_SIDE * 72 / longest)
+                if not math.isfinite(resolution) or resolution < 0.001:
+                    raise ValueError("PDF page dimensions exceed rendering limits")
+                picture = page.to_image(resolution=resolution).original.convert("RGB")
                 picture.thumbnail((_MAX_SIDE, _MAX_SIDE))
                 buffer = BytesIO()
                 picture.save(buffer, format="JPEG", quality=80)
                 images.append(buffer.getvalue())
         return images, total
+    except DocumentParseTimeout:
+        raise
     except Exception as exc:  # noqa: BLE001 - a broken PDF must not kill a reply
         logger.error("PDF page rendering failed: %s", exc)
         return [], 0
@@ -68,7 +89,7 @@ def _render_pages(data: bytes, max_pages: int) -> tuple[list[bytes], int]:
 
 async def ocr_pdf(data: bytes) -> OcrResult | None:
     """Transcribe the first pages of a scanned PDF; None when nothing was read."""
-    images, total = await asyncio.to_thread(_render_pages, data, config.pdf_ocr_max_pages)
+    images, total = await _run_parser(_render_pages, data, config.pdf_ocr_max_pages)
     if not images:
         return None
 

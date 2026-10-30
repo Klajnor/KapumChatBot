@@ -73,24 +73,83 @@ async def _sse_lines(chunks: Any) -> AsyncIterator[str]:
         yield tail
 
 
-async def _transcode_to_wav(audio: bytes) -> bytes | None:
-    """Convert audio to 16 kHz mono WAV with ffmpeg; None when unavailable."""
+_TRANSCODE_TIMEOUT = 60
+_MAX_TRANSCODE_BYTES = 300 * 16_000 * 2 + 65_536  # пять минут PCM16 + WAV-заголовок
+_MAX_TRANSCODE_ERRORS = 65_536
+
+
+async def _transcode_audio(audio: bytes, output_format: str) -> bytes | None:
+    """Декодировать аудио без доступа к сети/файлам, с лимитами и уборкой процесса."""
+    if len(audio) > config.voice_max_bytes:
+        return None
+    process = None
+    tasks: list[asyncio.Task] = []
+
+    async def read_limited(stream: asyncio.StreamReader, limit: int) -> bytes:
+        result = bytearray()
+        while chunk := await stream.read(65_536):
+            if len(result) + len(chunk) > limit:
+                raise ValueError("ffmpeg output limit exceeded")
+            result.extend(chunk)
+        return bytes(result)
+
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error", "-i", "pipe:0",
-            "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1",
+            "ffmpeg", "-nostdin", "-v", "error",
+            "-protocol_whitelist", "pipe",
+            "-format_whitelist", "ogg,mp3,wav,mov,matroska,webm,aac,flac",
+            "-i", "pipe:0", "-map", "0:a:0", "-vn", "-sn", "-dn",
+            "-t", "300", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", "-threads", "1",
+            "-fs", str(_MAX_TRANSCODE_BYTES), "-f", output_format, "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out, err = await asyncio.wait_for(process.communicate(audio), timeout=60)
-    except (TimeoutError, FileNotFoundError, OSError) as exc:
-        logger.warning("ffmpeg transcoding is unavailable: %s", exc)
+
+        async def feed() -> None:
+            try:
+                process.stdin.write(audio)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                process.stdin.close()
+
+        tasks = [
+            asyncio.create_task(feed()),
+            asyncio.create_task(read_limited(process.stdout, _MAX_TRANSCODE_BYTES)),
+            asyncio.create_task(read_limited(process.stderr, _MAX_TRANSCODE_ERRORS)),
+            asyncio.create_task(process.wait()),
+        ]
+        _, out, _err, returncode = await asyncio.wait_for(
+            asyncio.gather(*tasks), timeout=_TRANSCODE_TIMEOUT
+        )
+        return out if returncode == 0 and out else None
+    except (TimeoutError, OSError, ValueError) as exc:
+        logger.warning("ffmpeg conversion failed (%s)", type(exc).__name__)
         return None
-    if process.returncode != 0 or not out:
-        logger.warning("ffmpeg failed: %s", err[:200])
-        return None
-    return out
+    finally:
+        # gather не отменяет остальных участников при ошибке одного reader.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if process is not None:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            # Дренируем оставшиеся pipe-буферы уже убитого процесса, чтобы
+            # wait() не завис на заполненном stdout/stderr.
+            await process.communicate()
+
+
+async def _transcode_to_wav(audio: bytes) -> bytes | None:
+    """Convert audio to bounded 16 kHz mono WAV; None when unavailable."""
+    return await _transcode_audio(audio, "wav")
 
 
 async def _transcode_to_pcm16(audio: bytes, mime: str = "audio/ogg") -> bytes | None:
@@ -100,26 +159,7 @@ async def _transcode_to_pcm16(audio: bytes, mime: str = "audio/ogg") -> bytes | 
     The result has no header — just interleaved 16-bit signed samples
     suitable for the WebSocket Realtime ASR API.
     """
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error",
-            "-i", "pipe:0",
-            "-ac", "1",
-            "-ar", "16000",
-            "-f", "s16le",
-            "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await asyncio.wait_for(process.communicate(audio), timeout=60)
-    except (TimeoutError, FileNotFoundError, OSError) as exc:
-        logger.warning("ffmpeg PCM16 transcoding unavailable: %s", exc)
-        return None
-    if process.returncode != 0 or not out:
-        logger.warning("ffmpeg PCM16 failed: %s", err[:200])
-        return None
-    return out
+    return await _transcode_audio(audio, "s16le")
 
 
 def ffmpeg_available() -> bool:
