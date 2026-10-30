@@ -13,13 +13,13 @@ Supported providers (``SEARCH_PROVIDER``):
 
 Both speak plain HTTPS through aiohttp and need ``SEARCH_API_KEY``. Without a
 key the tool is simply not offered to the model and the bot behaves exactly
-as before. Result URLs are never fetched here — reading a specific page is
-the job of the link-analysis pipeline (``bot/services/documents.py``), which
-is SSRF-guarded.
+as before. Первые результаты читаются через SSRF-защищённый загрузчик
+``bot/services/documents.py`` перед передачей модели для общего саммари.
 """
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -32,6 +32,7 @@ import aiohttp
 
 from bot.config import config
 from bot.services.ai_client import ToolCall
+from bot.services.documents import fetch_url_text
 from bot.services.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,11 @@ PROVIDERS = ("tavily", "brave")
 
 # Snippets are trimmed so one search cannot flood the model's context.
 _SNIPPET_CHARS = 700
+
+# Ограничиваем время, параллелизм и объём контекста глубокого чтения.
+_PAGE_CHARS = 6000
+_PAGE_TIMEOUT = 20
+_PAGE_CONCURRENCY = 4
 
 # Brave wraps matched words in <strong>…</strong>; other providers escape
 # entities. Both are noise (and tags read like markup) inside a tool message.
@@ -63,7 +69,8 @@ SEARCH_TOOL: dict[str, Any] = {
             "user asks about recent events, fresh releases, prices, weather, "
             "sports results, documentation changes or anything else that may "
             "have changed after your training cutoff — or when the user "
-            "explicitly asks to search / find / look something up online."
+            "explicitly asks to search / find / look something up online. "
+            "Reads the first 10 result pages by default for a cited summary."
         ),
         "parameters": {
             "type": "object",
@@ -71,10 +78,6 @@ SEARCH_TOOL: dict[str, Any] = {
                 "query": {
                     "type": "string",
                     "description": "A concise, specific search query.",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "How many results to fetch (1-10, default 5).",
                 },
             },
             "required": ["query"],
@@ -90,6 +93,9 @@ SEARCH_SYSTEM_HINT = (
     "Строй ответ на полученных результатах, цитируй фактически использованные "
     "источники маркерами [n] по номерам результатов и отвечай на русском "
     "языке, если пользователь явно не попросил другой язык."
+    " Поиск читает страницы выдачи: дай общее саммари по прочитанным источникам, "
+    "выдели основные выводы и противоречия. Не выдавай сниппет за прочитанную "
+    "страницу; сообщи о неполном охвате, если часть страниц недоступна."
 )
 
 
@@ -100,6 +106,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
+    page_text: str = ""
 
 
 def search_configured() -> bool:
@@ -217,6 +224,26 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
 # --- Entry point ----------------------------------------------------------------
 
 
+async def _read_result_pages(results: list[SearchResult]) -> None:
+    """Прочитать страницы без обхода ссылок; сбой одной не теряет выдачу."""
+    semaphore = asyncio.Semaphore(_PAGE_CONCURRENCY)
+
+    async def read(item: SearchResult) -> None:
+        async with semaphore:
+            try:
+                async with asyncio.timeout(_PAGE_TIMEOUT):
+                    page = await fetch_url_text(item.url)
+                if page and page.text.strip():
+                    text = page.text.strip()
+                    item.page_text = text[:_PAGE_CHARS]
+                    if len(text) > _PAGE_CHARS:
+                        item.page_text += "\n[Текст страницы сокращён]"
+            except Exception:  # noqa: BLE001 — недоступный источник не ломает ответ
+                logger.warning("Search result page could not be read")
+
+    await asyncio.gather(*(read(item) for item in results))
+
+
 async def search_web(query: str, max_results: int | None = None) -> list[SearchResult]:
     """Run one web search; returns [] on any failure (never raises)."""
     # The query comes from the model's tool call: cap it so a degenerate
@@ -224,7 +251,11 @@ async def search_web(query: str, max_results: int | None = None) -> list[SearchR
     query = (query or "").strip()[:512]
     if not query:
         return []
-    limit = max_results if isinstance(max_results, int) else config.search_max_results
+    limit = (
+        max_results
+        if isinstance(max_results, int) and not isinstance(max_results, bool)
+        else config.search_max_results
+    )
     limit = max(1, min(limit, 10))
     provider = config.search_provider.strip().lower()
     try:
@@ -238,6 +269,8 @@ async def search_web(query: str, max_results: int | None = None) -> list[SearchR
     except Exception:  # search must never break an answer
         logger.exception("Web search failed (%s)", provider)
         return []
+    results = results[:limit]
+    await _read_result_pages(results)
     # The query itself is user/model content: keep it out of the logs.
     logger.info("Web search (%s) -> %d result(s)", provider, len(results))
     return results
@@ -246,7 +279,7 @@ async def search_web(query: str, max_results: int | None = None) -> list[SearchR
 def format_search_results(query: str, results: list[SearchResult]) -> str:
     """Tool-message body: numbered results the model cites as [n].
 
-    The results are third-party page snippets, so they are wrapped as
+    The results contain third-party page text and snippets, so they are wrapped as
     untrusted content (``bot/services/untrusted.py``): a page that tries to
     steer the model stays data. The closing instruction stays outside the
     tags — it is ours, not the web's.
@@ -259,12 +292,22 @@ def format_search_results(query: str, results: list[SearchResult]) -> str:
         )
     blocks = [f"Результаты веб-поиска по запросу {query!r}:"]
     for index, item in enumerate(results, start=1):
-        blocks.append(f"[{index}] {item.title}\n{item.snippet}\nURL: {item.url}")
+        if item.page_text:
+            content = f"Прочитанный текст страницы:\n{item.page_text}"
+        else:
+            content = (
+                "Страницу прочитать не удалось; доступен только сниппет поиска:\n"
+                f"{item.snippet}"
+            )
+        blocks.append(f"[{index}] {item.title}\n{content}\nURL: {item.url}")
     wrapped = wrap_untrusted("search", "\n\n".join(blocks))
     return (
         f"{wrapped}\n\n"
-        "Ответь пользователю, опираясь на эти результаты, где это уместно; "
-        "цитируй использованные источники маркерами [n]."
+        "Ответь пользователю: составь общее саммари по прочитанным страницам "
+        "в контексте вопроса, выдели выводы и расхождения; "
+        "цитируй использованные источники маркерами [n] и укажи их URL. "
+        "Если часть страниц не прочитана, явно сообщи об ограничении охвата. "
+        "Не утверждай, что прочитал недоступные страницы."
     )
 
 

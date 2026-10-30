@@ -803,7 +803,7 @@ class Config:
         default_factory=lambda: _env_int("SEARCH_TIMEOUT", 15)
     )
     search_max_results: int = field(
-        default_factory=lambda: _env_int("SEARCH_MAX_RESULTS", 5)
+        default_factory=lambda: _env_int("SEARCH_MAX_RESULTS", 10)
     )
     # Search rounds allowed per question before the model must answer.
     max_search_rounds: int = field(

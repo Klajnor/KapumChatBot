@@ -1555,6 +1555,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "search_api_key", "tvly-test"),
             patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_url", ""),
+            patch.object(search, "fetch_url_text", AsyncMock(return_value=None)),
             patch.object(
                 search, "_request_json", AsyncMock(return_value=payload)
             ) as req,
@@ -1582,6 +1583,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(config, "search_provider", "brave"),
             patch.object(config, "search_api_key", "BSAkey"),
+            patch.object(search, "fetch_url_text", AsyncMock(return_value=None)),
             patch.object(
                 search, "_request_json", AsyncMock(return_value=payload)
             ) as req,
