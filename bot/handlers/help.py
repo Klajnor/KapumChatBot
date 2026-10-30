@@ -91,6 +91,7 @@ async def cmd_help(message: Message) -> None:
             "• /remove_user &lt;id|@username&gt; — remove a user from the allowed list\n"
             "• /list_users — show all allowed users\n"
             "• /admin_stats — usage statistics for the last 14 days\n"
+            "• /tasks — active operations of all users (private chat only)\n"
             "• /broadcast &lt;text&gt; — send an announcement to every user\n"
             "• /mcp — <i>owner only</i>: MCP servers (the Obsidian «second brain») and their tools\n"
             "• /reset_daily_usage &lt;id&gt; — reset a user's daily usage"

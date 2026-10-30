@@ -30,6 +30,7 @@ from bot.handlers import (
     start,
     stats,
     sticker_sets,
+    tasks,
 )
 from bot.handlers import (
     digest as digest_handler,
@@ -61,6 +62,7 @@ dp.include_router(stats.router)
 # (admin text input) and the catch-all chat router.
 dp.include_router(menu.router)
 dp.include_router(admin.router)
+dp.include_router(tasks.router)
 dp.include_router(admin_panel.router)
 if config.enable_guest_mode:
     dp.include_router(guest.router)

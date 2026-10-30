@@ -11,6 +11,7 @@ from bot.config import config
 from bot.handlers.chat import generate_and_send_image, generate_and_send_sticker
 from bot.services import limits
 from bot.services.access import check_access, guest_hint, refund_access
+from bot.services.operations import tracked
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import user_service
 
@@ -83,6 +84,7 @@ async def generate_image_from_prompt(message: Message, prompt: str) -> None:
     await _run_generation(message, generate_and_send_image, prompt.strip())
 
 
+@tracked("Image / sticker generation")
 async def _run_generation(message: Message, sender: Sender, prompt: str) -> None:
     """Take the user's concurrency slot and generate under it."""
     user = message.from_user

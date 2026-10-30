@@ -20,6 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.bot import bot
 from bot.config import config
 from bot.services.mcp import mcp_manager
+from bot.services.operations import set_stage, tracked
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
 
@@ -577,20 +578,23 @@ async def cb_broadcast_send(callback: CallbackQuery) -> None:
         )
 
     task = asyncio.create_task(
-        _deliver_broadcast(callback.bot, recipients, text, notice),
+        _deliver_broadcast(callback.bot, recipients, text, notice, owner_id=owner),
         name=f"broadcast-{owner}",
     )
     _broadcast_tasks.add(task)
     task.add_done_callback(_broadcast_tasks.discard)
 
 
+@tracked("Broadcast")
 async def _deliver_broadcast(
-    bot: Any, recipients: list[int], text: str, notice: Message | None
+    bot: Any, recipients: list[int], text: str, notice: Message | None,
+    *, owner_id: int | None = None,
 ) -> None:
     """Send ``text`` to every recipient, tolerating individual failures."""
     sent = 0
     failed = 0
     for chat_id in recipients:
+        set_stage(f"Sending: {sent + failed}/{len(recipients)} · failed: {failed}")
         for attempt in range(3):
             try:
                 await bot.send_message(chat_id, text, parse_mode=None)

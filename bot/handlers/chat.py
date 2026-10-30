@@ -61,6 +61,7 @@ from bot.services.mcp import (
     mcp_manager,
     remove_mcp_hint,
 )
+from bot.services.operations import stage, tracked
 from bot.services.outgoing_files import files_tool, prepare_files
 from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
@@ -409,6 +410,7 @@ def _find_urls(text: str) -> list[str]:
     return urls
 
 
+@stage("Reading links")
 async def read_links(
     text: str,
     notify: Any = None,
@@ -727,6 +729,7 @@ async def _safe_answer_photo(message: Message, photo: Any, caption: str) -> bool
     return False
 
 
+@stage("Generating image")
 async def generate_and_send_image(
     message: Message,
     prompt: str,
@@ -778,6 +781,7 @@ async def generate_and_send_image(
     return True
 
 
+@stage("Generating sticker")
 async def generate_and_send_sticker(
     message: Message,
     prompt: str,
@@ -1086,6 +1090,7 @@ class _StreamPrinter:
 # --- Delivery --------------------------------------------------------------
 
 
+@stage("Delivering answer")
 async def deliver_answer(
     message: Message,
     printer: _StreamPrinter | None,
@@ -1191,6 +1196,7 @@ def _mcp_notice(calls: list[ToolCall]) -> str:
     return f"🧠 <b>Second brain</b>{suffix}"
 
 
+@stage("Running tools")
 async def _resolve_tool_round(
     message: Message,
     messages: list[dict[str, Any]],
@@ -1282,6 +1288,7 @@ def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+@stage("Waiting for model / streaming")
 async def _answer_with_ai(
     message: Message,
     service: UserService,
@@ -1561,6 +1568,7 @@ async def _answer_with_ai(
 
 
 @router.message(F.text, ~F.text.startswith("/"))
+@tracked("Chat request")
 async def handle_text(message: Message) -> None:
     """Handle text messages: chat with the AI."""
     user = message.from_user
@@ -1659,6 +1667,8 @@ async def handle_voice(message: Message) -> None:
     await _guarded(message, _handle_voice)
 
 
+@tracked("Voice request")
+@stage("Transcribing audio")
 async def _handle_voice(message: Message) -> None:
     """Handle voice messages: transcribe them, then answer with text or image."""
     user = message.from_user
@@ -1775,6 +1785,8 @@ async def handle_document(message: Message) -> None:
     await _guarded(message, _handle_document)
 
 
+@tracked("Document request")
+@stage("Reading document")
 async def _handle_document(message: Message) -> None:
     """Download an uploaded document, extract its text and ask the AI.
 
@@ -1915,6 +1927,7 @@ async def _handle_document(message: Message) -> None:
         await service.session.close()
 
 
+@tracked("Photo request")
 async def _route_single_photo(
     message: Message,
     *,
@@ -1976,6 +1989,7 @@ async def _route_single_photo(
         await _handle_photo(message, photo_from=photo_from, question=question)
 
 
+@stage("Analyzing photo")
 async def _handle_photo(
     message: Message,
     *,
@@ -2142,6 +2156,7 @@ async def _handle_photo(
 # --- Vision -> generation pipeline ----------------------------------------
 
 
+@stage("Analyzing photo for generation")
 async def _handle_vision_and_generate(
     message: Message,
     *,
@@ -2369,6 +2384,7 @@ async def _handle_enhance_photo(
     )
 
 
+@stage("Enhancing image")
 async def _run_enhancement(
     target: Message,
     user: User,
@@ -2630,6 +2646,8 @@ async def _handle_album_photo(message: Message) -> None:
     await _guarded(first_message, lambda m: _process_album(m, images))
 
 
+@tracked("Photo album")
+@stage("Analyzing album")
 async def _process_album(
     message: Message, images: list[tuple[str, bytes]]
 ) -> None:
@@ -2908,6 +2926,7 @@ async def _process_album(
 
 
 @router.callback_query(F.data.startswith("enh:"))
+@tracked("Photo enhancement")
 async def cb_enhance_choice(callback: CallbackQuery) -> None:
     """Finish a private enhance request after the server/neural choice.
 
@@ -3012,6 +3031,7 @@ async def cb_ask_other_model(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("resend:"))
+@tracked("Retry with another model")
 async def cb_resend_with_model(callback: CallbackQuery) -> None:
     """Re-send the stored last question to the chosen model (one-time)."""
     if callback.data is None or callback.from_user is None or callback.message is None:

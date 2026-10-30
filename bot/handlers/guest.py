@@ -38,6 +38,7 @@ from bot.services.intent import (
     generation_prompt,
 )
 from bot.services.markdown import render, split_chunks
+from bot.services.operations import stage, tracked
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.telegram_utils import (
@@ -206,6 +207,7 @@ def _extract_text(message: Message) -> str:
 # --- Reply pipeline --------------------------------------------------------
 
 
+@stage("Preparing guest answer")
 async def _build_reply(
     message: Message,
     service: UserService,
@@ -550,6 +552,7 @@ async def _build_reply(
 
 
 @router.guest_message()
+@tracked("Guest request")
 async def handle_guest_message(message: Message) -> None:
     """Handle a guest-mode summon: ``@bot`` in any chat or group.
 

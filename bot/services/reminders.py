@@ -44,6 +44,7 @@ from bot.database.session import async_session_factory
 from bot.services.access import check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
+from bot.services.operations import stage, tracked
 from bot.services.rich import send_rich_to
 from bot.services.search import (
     SEARCH_TOOL,
@@ -457,6 +458,7 @@ async def cancel_pending_fires() -> None:
             logger.debug("Reminder task failed during shutdown: %s", exc)
 
 
+@tracked("Reminder")
 async def fire_reminder(due: DueReminder) -> None:
     """Deliver one claimed reminder. Never raises."""
     try:
@@ -486,6 +488,7 @@ async def _disable_reminder(reminder_id: int) -> None:
         logger.warning("Could not disable reminder %s: %s", reminder_id, exc)
 
 
+@stage("Running AI reminder")
 async def _run_ai_prompt(
     due: DueReminder, settings: dict, history: list[dict[str, str]] | None = None
 ) -> tuple[ChatResult, float]:

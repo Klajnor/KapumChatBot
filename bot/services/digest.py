@@ -32,6 +32,7 @@ from bot.config import config
 from bot.database.repository import DigestRepository
 from bot.database.session import async_session_factory
 from bot.services.ai_client import ChatResult, ai_client
+from bot.services.operations import stage, tracked
 from bot.services.reminders import _send_html, _send_markdown, get_timezone
 from bot.services.rich import send_rich_to
 from bot.services.untrusted import apply_untrusted_hint, wrap_untrusted
@@ -340,6 +341,7 @@ async def _vary_prompt(
     return reworded, result
 
 
+@stage("Generating digest")
 async def _ask(text: str, model: str, prompt: str) -> Answer:
     """Summarise ``text``: reword the prompt first (when enabled), then ask.
 
@@ -376,6 +378,7 @@ async def _ask(text: str, model: str, prompt: str) -> Answer:
     )
 
 
+@tracked("Digest test")
 async def run_test(samples: list, admin_id: int) -> ChannelReport:
     """Summarise hand-picked messages (admin menu test) and send the result.
 
@@ -405,6 +408,7 @@ async def run_test(samples: list, admin_id: int) -> ChannelReport:
     return report
 
 
+@tracked("Channel digest test")
 async def run_channel_test(chat_id: int, title: str, admin_id: int) -> ChannelReport:
     """Summarise one channel the way the daily run does, but only for ``admin_id``.
 
@@ -456,6 +460,7 @@ async def run_channel_test(chat_id: int, title: str, admin_id: int) -> ChannelRe
     return report
 
 
+@stage("Delivering digest")
 async def _deliver(chat_id: int, markdown: str) -> bool:
     """Post the summary as a rich message; HTML, then plain text, as fallbacks."""
     if config.rich_messages and await send_rich_to(bot, chat_id, markdown):
@@ -475,8 +480,10 @@ async def show_prompt(chat_id: int, title: str, prompt: str) -> bool:
 # --- One channel -------------------------------------------------------------------
 
 
+@tracked("Group / channel digest")
 async def _digest_channel(
-    chat_id: int, title: str, until: datetime.datetime, model: str, prompt: str
+    chat_id: int, title: str, until: datetime.datetime, model: str, prompt: str,
+    *, owner_id: int | None = None,
 ) -> ChannelReport:
     report = ChannelReport(chat_id=chat_id, title=title, model=model)
     async with async_session_factory() as session:
@@ -627,7 +634,9 @@ async def run_digest(notify: int | None = None) -> DigestResult:
         result = DigestResult()
         for chat_id, title in await list_channels():
             try:
-                report = await _digest_channel(chat_id, title, until, model, prompt)
+                report = await _digest_channel(
+                    chat_id, title, until, model, prompt, owner_id=notify
+                )
             except Exception as exc:
                 logger.exception("Digest for channel %s failed", chat_id)
                 report = ChannelReport(chat_id=chat_id, title=title, error=str(exc)[:200])

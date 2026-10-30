@@ -30,6 +30,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.bot import bot, get_bot_id
 from bot.config import config
 from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
+from bot.handlers.tasks import cb_tasks
 from bot.services import digest
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
@@ -123,8 +124,9 @@ def _home_markup() -> InlineKeyboardMarkup:
     b.button(text="📊 Statistics", callback_data="adm:stats")
     b.button(text="➕ Add user", callback_data="adm:add")
     b.button(text="📰 Digest", callback_data="adm:dg")
+    b.button(text="🔄 Tasks", callback_data="adm:tasks")
     b.button(text="✖ Close", callback_data="adm:close")
-    b.adjust(2, 2, 1)
+    b.adjust(2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -328,6 +330,9 @@ async def cb_admin(callback: CallbackQuery) -> None:
         await _show(callback, text, markup)
     elif action == "stats":
         await _show_stats(callback)
+    elif action == "tasks":
+        await cb_tasks(callback)
+        return
     elif action == "add":
         _awaiting[actor] = ("add", None)
         await _show(

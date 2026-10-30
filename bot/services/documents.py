@@ -35,6 +35,7 @@ from urllib.parse import urljoin, urlsplit
 import aiohttp
 
 from bot.config import config
+from bot.services.operations import stage
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +396,7 @@ def _extract_pptx(data: bytes, deadline: float | None = None) -> str | None:
         return None
 
 
+@stage("Extracting document text")
 async def extract_document_text(file_type: str, data: bytes) -> str | None:
     """Extract readable text from document bytes (None when impossible).
 

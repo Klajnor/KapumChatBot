@@ -33,6 +33,7 @@ import aiohttp
 from bot.config import config
 from bot.services.ai_client import ToolCall
 from bot.services.documents import fetch_url_text
+from bot.services.operations import stage
 from bot.services.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -244,6 +245,7 @@ async def _read_result_pages(results: list[SearchResult]) -> None:
     await asyncio.gather(*(read(item) for item in results))
 
 
+@stage("Searching web / reading results")
 async def search_web(query: str, max_results: int | None = None) -> list[SearchResult]:
     """Run one web search; returns [] on any failure (never raises)."""
     # The query comes from the model's tool call: cap it so a degenerate
