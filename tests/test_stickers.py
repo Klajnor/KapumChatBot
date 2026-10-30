@@ -6,9 +6,11 @@ import html
 import io
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,6 +47,11 @@ def subject() -> Image.Image:
 
 class StickerProcessingTests(unittest.IsolatedAsyncioTestCase):
     """Сегментация предшествует масштабированию; альфа-канал сохраняется."""
+
+    def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_full_subject_and_alpha_survive_webp(self):
         data = stickers.to_sticker_webp(png(subject()))
@@ -140,6 +147,11 @@ class StickerProcessingTests(unittest.IsolatedAsyncioTestCase):
 
 class StickerDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     """Причина сбоя проходит до ответа бота, но не раскрывает сырые исключения."""
+
+    def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_dependency_and_invalid_image_diagnostics(self):
         opaque = png(Image.new("RGB", (40, 40), "white"))
@@ -275,6 +287,93 @@ class StickerDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("No question quota is charged", text)
             self.assertNotIn("private-key-secret", text)
             self.assertNotIn("raw API response", text)
+
+
+class StickerModelCacheTests(unittest.TestCase):
+    """Каталог модели создаётся рядом с проектом, без зависимости от домашней папки службы."""
+
+    def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_config_directory_priority_and_empty_values(self):
+        for configured, legacy, expected in (
+            (None, None, "models/rembg"),
+            (" ", " ", "models/rembg"),
+            (None, "old-cache", "old-cache"),
+            ("custom-cache", "old-cache", "custom-cache"),
+        ):
+            with patch.dict(os.environ):
+                os.environ.pop("STICKER_MODEL_DIR", None)
+                os.environ.pop("U2NET_HOME", None)
+                if configured is not None:
+                    os.environ["STICKER_MODEL_DIR"] = configured
+                if legacy is not None:
+                    os.environ["U2NET_HOME"] = legacy
+                self.assertEqual(Config().sticker_model_dir, expected)
+
+    def test_relative_directory_resolves_from_project_not_cwd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            with (
+                patch.object(stickers, "__file__", str(root / "bot/services/stickers.py")),
+                patch.object(config, "sticker_model_dir", "models/rembg"),
+                patch("os.getcwd", return_value=str(root / "another-cwd")),
+            ):
+                directory = stickers.configure_model_cache()
+                self.assertEqual(directory, root / "models/rembg")
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(os.environ["U2NET_HOME"], str(directory))
+                self.assertEqual(stickers.configure_model_cache(), directory)
+
+    def test_absolute_directory_and_home_expansion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            with patch.object(config, "sticker_model_dir", str(root / "absolute")):
+                self.assertEqual(stickers.configure_model_cache(), root / "absolute")
+            with (
+                patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root)}),
+                patch.object(config, "sticker_model_dir", "~/home-cache"),
+            ):
+                self.assertEqual(stickers.configure_model_cache(), root / "home-cache")
+
+    def test_model_initialization_receives_created_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve() / "new/model-cache"
+
+            def initialize(*args, **kwargs):
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(os.environ["U2NET_HOME"], str(directory))
+                return object()
+
+            fake = SimpleNamespace(new_session=MagicMock(side_effect=initialize), remove=MagicMock(return_value=subject()))
+            with (
+                patch.dict(sys.modules, {"rembg": fake}),
+                patch.object(stickers, "_session", None),
+                patch.object(config, "sticker_model_dir", str(directory)),
+            ):
+                result = stickers._prepare_sticker_result(png(Image.new("RGB", (40, 40), "white")))
+                self.assertIsNotNone(result.data)
+                fake.new_session.assert_called_once()
+
+    def test_permission_and_non_directory_errors_are_explained(self):
+        opaque = png(Image.new("RGB", (40, 40), "white"))
+        with patch.object(stickers, "_session", None), patch.object(Path, "mkdir", side_effect=PermissionError("private path")):
+            result = stickers._prepare_sticker_result(opaque)
+        self.assertEqual(result.error, "model_cache_permission")
+        self.assertIn("STICKER_MODEL_DIR", stickers.sticker_error_message(result.error))
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "not-a-directory"
+            file.write_text("test", encoding="utf-8")
+            with patch.object(stickers, "_session", None), patch.object(config, "sticker_model_dir", str(file)):
+                result = stickers._prepare_sticker_result(opaque)
+            self.assertEqual(result.error, "model_cache_failed")
+
+    def test_transparent_source_needs_no_cache(self):
+        with patch.object(stickers, "configure_model_cache", side_effect=AssertionError("must not create cache")) as configure:
+            self.assertIsNotNone(stickers._prepare_sticker_result(png(subject())).data)
+            configure.assert_not_called()
 
 
 class StickerSetTests(unittest.IsolatedAsyncioTestCase):

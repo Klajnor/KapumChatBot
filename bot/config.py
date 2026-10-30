@@ -666,6 +666,10 @@ class Config:
     sticker_processing_timeout: int = field(
         default_factory=lambda: max(10, min(600, _env_int("STICKER_PROCESSING_TIMEOUT", 120)))
     )
+    # Каталог моделей относительно корня проекта; U2NET_HOME — совместимый алиас rembg.
+    sticker_model_dir: str = field(
+        default_factory=lambda: _env("STICKER_MODEL_DIR") or _env("U2NET_HOME") or "models/rembg"
+    )
     # Let the AI answer with text files (json, xml, txt, md, ...) as Telegram
     # documents. Only a fixed allowlist of non-executable text formats.
     enable_file_replies: bool = field(

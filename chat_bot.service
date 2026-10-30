@@ -14,15 +14,18 @@ WorkingDirectory=/opt/KapumChatBot
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 # Каталоги данных и кэша создаются systemd с владельцем brain:
 #   /var/lib/kapum-chatbot   — chat_bot.db (+ WAL) и telegraph_account.json
-#   /var/cache/kapum-chatbot — кэш шрифтов matplotlib
+#   /var/cache/kapum-chatbot — кэш шрифтов matplotlib и модель rembg
 # В .env на сервере укажите абсолютные пути:
 #   DATABASE_URL=sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db
 #   TELEGRAPH_ACCOUNT_FILE=/var/lib/kapum-chatbot/telegraph_account.json
+#   STICKER_MODEL_DIR=/var/cache/kapum-chatbot/rembg
 StateDirectory=kapum-chatbot
 StateDirectoryMode=0700
 CacheDirectory=kapum-chatbot
 CacheDirectoryMode=0700
 Environment=MPLCONFIGDIR=/var/cache/kapum-chatbot/matplotlib
+# Запасной путь rembg для службы без домашнего каталога. STICKER_MODEL_DIR в .env имеет приоритет.
+Environment=U2NET_HOME=/var/cache/kapum-chatbot/rembg
 # При некоторых случаях разработчик может случайно скопировать кеш со своей машины, на всякий случай сотру его
 ExecStartPre=-/bin/bash /opt/KapumChatBot/scripts/clean_pycache.sh -p /opt/KapumChatBot/bot
 ExecStart=/opt/KapumChatBot/.venv/bin/python -m bot.main

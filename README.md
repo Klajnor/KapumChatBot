@@ -299,6 +299,7 @@ cp .env.example .env
 | `ENABLE_IMAGE_GENERATION` | Разрешить ответ картинкой (`true`/`false`) |
 | `ENABLE_STICKER_GENERATION` | Разрешить ответ Telegram-стикером (`/sticker` и tool `generate_sticker`) (`true`/`false`) |
 | `STICKER_PROCESSING_TIMEOUT` | Таймаут локального удаления фона, включая загрузку модели rembg: 120 с по умолчанию, диапазон 10–600 |
+| `STICKER_MODEL_DIR` | Каталог модели rembg, по умолчанию `models/rembg` от корня проекта; создаётся автоматически. Поддерживает абсолютный путь и `~`. Если не задан, читается `U2NET_HOME` |
 | `ENABLE_FILE_REPLIES` | Разрешить ответ текстовыми файлами (tool `send_files`; json, xml, txt, md, csv, yaml и т.п., без исполняемых) (`true`/`false`) |
 | `REPLY_FILES_MAX` | Максимум файлов в одном ответе (по умолчанию 10; лишние не отправляются, пользователь уведомляется) |
 | `REPLY_FILE_MAX_BYTES` | Максимальный размер одного файла в байтах (по умолчанию 1 000 000) |
@@ -450,14 +451,38 @@ MODEL_1_VISION=true
 и полупрозрачных элементах; нарисованные «шашечки» сами по себе прозрачностью не являются.
 
 При первой обработке rembg скачивает модель u2net (около 176 МБ) и кэширует её
-обычно в `~/.u2net` (путь меняется переменной окружения rembg `U2NET_HOME`). Нужны
-доступ к сети, место на диске и дополнительная RAM для ONNX; GPU не требуется.
+в **`models/rembg` рядом с ботом**, а не в домашнем каталоге пользователя службы.
+Каталог автоматически создаётся перед загрузкой модели, веса не попадают в Git.
+Другой путь можно указать в `.env`:
+
+```dotenv
+STICKER_MODEL_DIR=models/rembg
+# Или абсолютный путь с доступом для пользователя службы:
+# STICKER_MODEL_DIR=/var/lib/kapumchatbot/rembg
+```
+
+Относительный путь считается **от корня проекта**, а не от текущего рабочего
+каталога; поддерживается `~`. Приоритет: `STICKER_MODEL_DIR` → явно заданный
+`U2NET_HOME` → `models/rembg`. Бот передаёт rembg абсолютный путь через `U2NET_HOME`.
+После изменения `.env` перезапустите бота. Существующая модель из старого кэша
+не переносится автоматически: скопируйте `u2net.onnx` в выбранный каталог или
+дождитесь повторного скачивания. Пользователь службы должен иметь доступ
+на чтение/запись; при закрытом для записи каталоге проекта задайте другой путь.
+Не требуется запускать бота от root или выдавать права `777`.
+
+В комплектном `chat_bot.service` запасной `U2NET_HOME` уже указывает на
+`/var/cache/kapum-chatbot/rembg`: systemd создаёт родительский каталог с владельцем
+`brain`, а `ProtectHome=true` не мешает загрузке. Если в `.env` задан
+`STICKER_MODEL_DIR=models/rembg`, замените его для такой установки на
+`STICKER_MODEL_DIR=/var/cache/kapum-chatbot/rembg`, чтобы не писать в root-owned код.
+
+Нужны доступ к сети, место на диске и дополнительная RAM для ONNX; GPU не требуется.
 Сессию модель загружает один раз на процесс. Первый запуск заметно дольше;
 при необходимости увеличьте `STICKER_PROCESSING_TIMEOUT` (по умолчанию 120 с,
 максимум 600). Для предварительной загрузки от имени пользователя службы:
 
 ```bash
-python -c "from rembg import new_session; new_session('u2net', providers=['CPUExecutionProvider'])"
+python -c "from bot.services.stickers import configure_model_cache; configure_model_cache(); from rembg import new_session; new_session('u2net', providers=['CPUExecutionProvider'])"
 ```
 
 Удаление фона и WebP-кодирование работают в отдельном потоке, не блокируя бота.
@@ -1512,6 +1537,7 @@ sudo journalctl -u chat_bot -f
 ```env
 DATABASE_URL=sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db
 TELEGRAPH_ACCOUNT_FILE=/var/lib/kapum-chatbot/telegraph_account.json
+STICKER_MODEL_DIR=/var/cache/kapum-chatbot/rembg
 ```
 
 Перенос существующей базы — один раз, при остановленном сервисе:
@@ -1531,7 +1557,9 @@ ls -l /var/lib/kapum-chatbot          # владелец brain, файлы -rw--
 - `UMask=0077` — БД, WAL-файлы и `telegraph_account.json` создаются с правами
   `0600`, а не `0644`;
 - `StateDirectory=kapum-chatbot` / `CacheDirectory=kapum-chatbot` — каталоги
-  данных и кэша matplotlib создаются с нужным владельцем автоматически;
+  данных, кэша matplotlib и модели rembg создаются с нужным владельцем автоматически;
+- `U2NET_HOME=/var/cache/kapum-chatbot/rembg` — запасной путь к модели, если
+  `STICKER_MODEL_DIR` не задан в `.env`; код не требует прав на запись;
 - `PYTHONDONTWRITEBYTECODE=1` — `.pyc` не пишутся, поэтому код может быть
   read-only, а предзапусковая очистка кэша не нужна;
 - `RestartSec=5s` — при ошибке конфигурации нет шторма рестартов;

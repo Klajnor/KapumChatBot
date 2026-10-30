@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from bot.config import config
@@ -42,8 +44,9 @@ _ERROR_MESSAGES = {
     "dependencies_missing": "Background removal: a required Python dependency is missing. Administrator: run pip install -r requirements.txt in the bot's Python environment and check the server log for the missing module.",
     "runtime_load_failed": "Background removal: rembg or its native CPU runtime could not be loaded. Administrator: check ONNX Runtime/platform compatibility and the server log, then repair the installation and restart.",
     "invalid_image": "Image decoding: the generated file could not be read as an image. Try generating the sticker again; if this repeats, ask the administrator to check the image provider.",
-    "model_load_failed": "Background removal: the u2net model could not be downloaded or loaded. Administrator: check access to the model download host, free disk space and the rembg model cache (U2NET_HOME); see the server log for the underlying error.",
-    "model_cache_permission": "Background removal: access to the model cache was denied. Administrator: give the bot service user read/write access to its rembg cache, or set U2NET_HOME to a writable directory.",
+    "model_load_failed": "Background removal: the u2net model could not be downloaded or loaded. Administrator: check access to the model download host, free disk space and STICKER_MODEL_DIR; see the server log for the underlying error.",
+    "model_cache_permission": "Background removal: access to the model directory was denied. Administrator: give the bot service user read/write access to models/rembg, or set STICKER_MODEL_DIR in .env to a writable directory. Restart the bot after changing the configuration.",
+    "model_cache_failed": "Background removal: the model directory could not be created or configured. Administrator: check STICKER_MODEL_DIR in .env, free disk space and the server log. The path must be a directory, not a file.",
     "out_of_memory": "Local processing: the processor reported insufficient memory. Administrator: free RAM or increase the server's memory, then try again.",
     "background_removal_failed": "Background removal: the local segmentation model failed while processing the image. Try again; if this repeats, the administrator should check the ONNX Runtime error in the server log.",
     "no_transparency": "Background removal: the model did not produce a usable cutout (the result was opaque or completely empty). Try a single clearly outlined subject on a simple background.",
@@ -112,6 +115,18 @@ def to_sticker_webp(image_bytes: bytes, size: int = STICKER_SIZE) -> bytes | Non
     return to_sticker_webp_result(image_bytes, size).data
 
 
+def configure_model_cache() -> Path:
+    """Создать каталог моделей от корня проекта и передать абсолютный путь rembg."""
+    path = Path(config.sticker_model_dir).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    path = path.resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ["U2NET_HOME"] = str(path)
+    logger.info("Sticker model directory: %s", path)
+    return path
+
+
 def _prepare_sticker_result(image_bytes: bytes) -> StickerResult:
     """Удалить фон локальной моделью; сессию переиспользует один рабочий поток."""
     global _session
@@ -124,6 +139,9 @@ def _prepare_sticker_result(image_bytes: bytes) -> StickerResult:
             image = ImageOps.exif_transpose(source).convert("RGBA")
         # Сохраняем нативный вырезанный фон; одной общей полупрозрачности недостаточно.
         if image.getchannel("A").getextrema()[0] != 0:
+            if _session is None:
+                stage = "model_cache_failed"
+                configure_model_cache()
             stage = "runtime_load_failed"
             from rembg import new_session, remove
 
@@ -153,7 +171,7 @@ def _prepare_sticker_result(image_bytes: bytes) -> StickerResult:
         return StickerResult(error=stage)
     except PermissionError:
         logger.exception("Sticker processing permission error (stage=%s)", stage)
-        return StickerResult(error="model_cache_permission" if stage == "model_load_failed" else stage)
+        return StickerResult(error="model_cache_permission" if stage in {"model_cache_failed", "model_load_failed"} else stage)
     except MemoryError:
         logger.exception("Sticker processing ran out of memory (stage=%s)", stage)
         return StickerResult(error="out_of_memory")
