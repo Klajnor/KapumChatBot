@@ -1404,7 +1404,7 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image.format, "WEBP")
         self.assertEqual(image.size, (STICKER_SIZE, STICKER_SIZE))
 
-    def test_to_sticker_webp_center_crops_nonsquare(self):
+    def test_to_sticker_webp_fits_nonsquare(self):
         from bot.services.ai_client import to_sticker_webp
 
         webp = to_sticker_webp(self._png_bytes(800, 400))
@@ -1418,14 +1418,17 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generate_sticker_converts_to_webp(self):
         from bot.services.ai_client import AIClient, ImageResult
+        from bot.services.stickers import to_sticker_webp
 
         client = AIClient(api_key="test-key")
         png = self._png_bytes(768, 768)
         source = ImageResult(url="http://x/img.png", data=png, elapsed=1.0)
-        with patch.object(
-            client, "generate_image_result", AsyncMock(return_value=source)
+        with (
+            patch.object(client, "generate_image_result", AsyncMock(return_value=source)),
+            patch("bot.services.ai_client.prepare_sticker", AsyncMock(return_value=to_sticker_webp(png))) as prepare,
         ):
             result = await client.generate_sticker("a cat")
+        prepare.assert_awaited_once_with(png)
         self.assertIsNotNone(result.data)
         image = self._open(result.data)
         self.assertEqual(image.format, "WEBP")

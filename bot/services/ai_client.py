@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import re
@@ -24,6 +23,12 @@ from bot.config import (
 )
 from bot.services.image_tools import canonical_operations
 from bot.services.science import normalize_formulas
+from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
+    STICKER_MAX_BYTES,
+    STICKER_SIZE,
+    prepare_sticker,
+    to_sticker_webp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -320,12 +325,13 @@ STICKER_TOOL: dict[str, Any] = {
     },
 }
 
-# Appended to the user's prompt so the model produces a clean sticker-style
-# image that survives the center-crop to a 512x512 square.
+# Простой фон облегчает сегментацию; объект должен целиком помещаться в кадр.
 _STICKER_PROMPT_SUFFIX = (
     ", die-cut sticker style, single centered subject, bold clean outlines, "
     "vibrant flat colors, thick white border around the subject, isolated on "
-    "a plain solid white background, no text, no watermark"
+    "a plain solid light gray background, no background patterns, no cast shadow, "
+    "entire subject visible with space around it, "
+    "no text, no watermark"
 )
 
 # Turns the text-to-image endpoint into a faithful photo restorer: the image
@@ -443,44 +449,6 @@ def _image_data_url(image_bytes: bytes) -> str:
     mime = _guess_mime(image_bytes)
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime};base64,{encoded}"
-
-
-# Telegram static-sticker constraints: WebP, one side exactly 512px (other
-# ≤512), file ≤512 KB.
-STICKER_SIZE = 512
-STICKER_MAX_BYTES = 512 * 1024
-
-
-def to_sticker_webp(image_bytes: bytes, size: int = STICKER_SIZE) -> bytes | None:
-    """Convert image bytes into a Telegram-ready sticker (``size``×``size`` WebP).
-
-    The image is center-cropped to a square (no distortion), resized, and
-    re-encoded as WebP with decreasing quality until it fits the 512 KB cap.
-    Returns None when Pillow is unavailable or the bytes are not a valid image.
-    """
-    try:
-        from PIL import Image
-    except ImportError:  # pragma: no cover - Pillow is a declared dependency
-        logger.warning("Pillow is not installed; cannot build a sticker")
-        return None
-    try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        width, height = image.size
-        side = min(width, height)
-        left, top = (width - side) // 2, (height - side) // 2
-        image = image.crop((left, top, left + side, top + side))
-        image = image.resize((size, size), Image.LANCZOS)
-        data = b""
-        for quality in (90, 80, 70, 60, 50, 40):
-            buffer = io.BytesIO()
-            image.save(buffer, format="WEBP", quality=quality, method=6)
-            data = buffer.getvalue()
-            if len(data) <= STICKER_MAX_BYTES:
-                return data
-        return data or None
-    except Exception as exc:  # noqa: BLE001 - a bad image must not kill a reply
-        logger.error("Sticker conversion failed: %s", exc)
-        return None
 
 
 def _extract_usage(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -1395,22 +1363,17 @@ class AIClient:
         model: str | None = None,
         size: str | None = None,
     ) -> ImageResult:
-        """Generate a sticker-style image and return it as a 512×512 WebP.
-
-        The user's prompt gets a sticker-style suffix, the image is generated
-        and downloaded, then center-cropped to a square and re-encoded as WebP
-        so it can be sent as a real Telegram sticker (``answer_sticker``).
-        ``result.data`` holds the WebP bytes, or None when either generation or
-        the conversion failed; ``result.url`` still points at the source image.
-        """
+        """Сгенерировать изображение, удалить фон и вписать в прозрачный WebP 512×512."""
         full_prompt = prompt.strip() + _STICKER_PROMPT_SUFFIX
         result = await self.generate_image_result(
             full_prompt, model=model, size=size, download=True,
         )
         if result.data is None:
             return result
-        webp = to_sticker_webp(result.data)
-        return ImageResult(url=result.url, data=webp, elapsed=result.elapsed)
+        started = time.monotonic()
+        webp = await prepare_sticker(result.data)
+        elapsed = (result.elapsed or 0) + time.monotonic() - started
+        return ImageResult(url=result.url, data=webp, elapsed=elapsed)
 
     async def generate_image_with_references(
         self,

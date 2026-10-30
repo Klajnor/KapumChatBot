@@ -81,6 +81,7 @@ from bot.services.search import (
     search_configured,
     search_web,
 )
+from bot.services.sticker_sets import add_keyboard, save_sticker
 from bot.services.telegram_utils import (
     edit_formatted,
     format_timing,
@@ -802,8 +803,8 @@ async def generate_and_send_sticker(
         await safe_answer(
             message,
             "❌ <b>Could not generate the sticker.</b>\n\n"
-            "The prompt may have been rejected by moderation, or the image "
-            "service / model is unavailable for your account.",
+            "Generation or background removal failed, timed out, or the sticker "
+            "processor is busy. Please try again later. No question quota is charged.",
         )
         return False
 
@@ -811,7 +812,7 @@ async def generate_and_send_sticker(
     for attempt in range(2):
         try:
             await throttle.wait(message.chat.id)
-            await message.answer_sticker(
+            sticker_message = await message.answer_sticker(
                 BufferedInputFile(sticker, filename="sticker.webp")
             )
             sent = True
@@ -833,10 +834,26 @@ async def generate_and_send_sticker(
         return False
 
     footer = format_timing(result.elapsed, model=config.image_model)
-    if footer:
+    owner_id = user_id or (message.from_user.id if getattr(message, "from_user", None) else None)
+    keyboard = None
+    if owner_id is not None:
+        try:
+            token = await save_sticker(
+                owner_id, message.bot.id,
+                sticker_message.sticker.file_id, sticker_message.sticker.file_unique_id,
+            )
+            keyboard = add_keyboard(token)
+        except Exception as exc:  # noqa: BLE001 - стикер уже доставлен, квоту не возвращаем
+            logger.warning("Could not save sticker set button: %s", exc)
+            await safe_answer(message, "The sticker was sent, but the set button is unavailable. Please try again later.")
+    if footer or keyboard:
+        text = f"🎨 <i>{html.escape(prompt[:300])}</i>"
+        if footer:
+            text += f"\n\n{html.escape(footer)}"
         await safe_answer(
             message,
-            f"🎨 <i>{html.escape(prompt[:300])}</i>\n\n{html.escape(footer)}",
+            text,
+            reply_markup=keyboard,
         )
 
     if service is not None and user_id is not None:
@@ -1512,7 +1529,7 @@ async def _answer_with_ai(
             service=service,
             user_id=user.id,
             model=model,
-        ) and not result.content:
+        ):
             await refund_access(service, user.id, access)
     elif image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text

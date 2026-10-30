@@ -12,6 +12,8 @@ matplotlib>=3.9
 # formulas); matplotlib pulls it in transitively, but the dependency is
 # declared explicitly because our code imports PIL directly.
 pillow>=10.0
+# Локальное удаление фона стикеров (CPU); модель u2net скачивается при первом запуске.
+rembg[cpu]>=2.0.60
 # Document analysis (optional at runtime — imports are guarded):
 # pdfplumber reads PDF text layers, python-docx reads DOCX (paragraphs and
 # tables). Without them such uploads are rejected with an explanation;

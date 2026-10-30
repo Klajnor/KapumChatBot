@@ -172,6 +172,32 @@ class AppSetting(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class GeneratedSticker(Base):
+    """Отправленный стикер: непрозрачный токен кнопки, владелец и Telegram file_id."""
+
+    __tablename__ = "generated_stickers"
+
+    token: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    bot_id: Mapped[int] = mapped_column(BigInteger)
+    file_id: Mapped[str] = mapped_column(Text)
+    file_unique_id: Mapped[str] = mapped_column(String(256))
+
+
+class StickerPack(Base):
+    """Набор, созданный этим ботом для конкретного пользователя."""
+
+    __tablename__ = "sticker_packs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    bot_id: Mapped[int] = mapped_column(BigInteger)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    title: Mapped[str] = mapped_column(String(64))
+    # Резервируем имя до Telegram-запроса: повтор после сетевого сбоя безопасен.
+    created: Mapped[bool] = mapped_column(default=False)
+
+
 class DigestChannel(Base):
     """A channel (or group) that gets a daily summary of its messages."""
 

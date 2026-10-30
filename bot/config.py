@@ -640,6 +640,10 @@ class Config:
     enable_sticker_generation: bool = field(
         default_factory=lambda: _env_bool("ENABLE_STICKER_GENERATION", True)
     )
+    # Таймаут локального удаления фона, включая первую загрузку модели rembg.
+    sticker_processing_timeout: int = field(
+        default_factory=lambda: max(10, min(600, _env_int("STICKER_PROCESSING_TIMEOUT", 120)))
+    )
     # Let the AI answer with text files (json, xml, txt, md, ...) as Telegram
     # documents. Only a fixed allowlist of non-executable text formats.
     enable_file_replies: bool = field(

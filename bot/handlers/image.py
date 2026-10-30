@@ -53,8 +53,8 @@ async def cmd_sticker(message: Message) -> None:
             "🎨 <b>Generate a sticker</b>\n\n"
             "Usage: <code>/sticker &lt;description&gt;</code>\n"
             "Example: <code>/sticker a smiling cat giving a thumbs up</code>\n\n"
-            "The result is a real 512×512 Telegram sticker you can save or "
-            "add to a sticker set."
+            "The result is a transparent 512×512 Telegram sticker. Use the button "
+            "below the result to create a set or add it to one of your sets."
         ),
     )
 
