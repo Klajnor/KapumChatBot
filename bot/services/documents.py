@@ -36,6 +36,7 @@ import aiohttp
 
 from bot.config import config
 from bot.services.operations import stage
+from bot.services.pdf_limits import PdfResourceLimit, pdf_stream_limits
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,7 @@ def _extract_pdf(data: bytes, deadline: float | None = None) -> str | None:
     try:
         parts: list[str] = []
         collected = 0
-        with pdfplumber.open(BytesIO(data)) as pdf:
+        with pdf_stream_limits(), pdfplumber.open(BytesIO(data)) as pdf:
             # Both caps matter: a 20 MB PDF can hold thousands of dense pages,
             # and the text is only clipped *after* extraction, so without a
             # stop condition the whole document is expanded into memory first.
@@ -207,7 +208,7 @@ def _extract_pdf(data: bytes, deadline: float | None = None) -> str | None:
                 if collected >= config.max_extracted_chars:
                     break
         return "\n\n".join(parts) or None
-    except DocumentParseTimeout:
+    except (DocumentParseTimeout, PdfResourceLimit):
         raise
     except Exception as exc:  # noqa: BLE001 - a broken PDF must not kill a reply
         logger.error("PDF text extraction failed: %s", exc)
@@ -411,6 +412,8 @@ async def extract_document_text(file_type: str, data: bytes) -> str | None:
     pdfplumber on a large PDF is CPU-bound and must not block the event loop.
     Raises ``DocumentParseTimeout`` when the parser does not finish in time —
     callers tell the user and refund the quota.
+    Raises ``PdfResourceLimit`` on excessive PDF Flate expansion; callers must
+    reject the document rather than retry it via OCR.
     """
     if file_type == "txt":
         text: str | None = decode_text_bytes(data)

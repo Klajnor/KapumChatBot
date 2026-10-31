@@ -17,6 +17,7 @@ from io import BytesIO
 from bot.config import config
 from bot.services.ai_client import ai_client
 from bot.services.documents import DocumentParseTimeout, _check_deadline, _run_parser
+from bot.services.pdf_limits import PdfResourceLimit, pdf_stream_limits
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def _render_pages(
     images: list[bytes] = []
     try:
         _check_deadline(deadline)
-        with pdfplumber.open(BytesIO(data)) as pdf:
+        with pdf_stream_limits(), pdfplumber.open(BytesIO(data)) as pdf:
             total = len(pdf.pages)
             for page in pdf.pages[:max_pages]:
                 _check_deadline(deadline)
@@ -80,7 +81,7 @@ def _render_pages(
                 picture.save(buffer, format="JPEG", quality=80)
                 images.append(buffer.getvalue())
         return images, total
-    except DocumentParseTimeout:
+    except (DocumentParseTimeout, PdfResourceLimit):
         raise
     except Exception as exc:  # noqa: BLE001 - a broken PDF must not kill a reply
         logger.error("PDF page rendering failed: %s", exc)

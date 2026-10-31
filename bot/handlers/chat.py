@@ -63,6 +63,7 @@ from bot.services.mcp import (
 )
 from bot.services.operations import stage, tracked
 from bot.services.outgoing_files import files_tool, prepare_files
+from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.request_intent import Intent, classify_request
@@ -1856,6 +1857,14 @@ async def _handle_document(message: Message) -> None:
         async with waiting(message):
             try:
                 extracted = await extract_document_text(file_type, data)
+            except PdfResourceLimit:
+                await refund_access(service, user.id, access)
+                await safe_answer(
+                    message,
+                    "⚠️ <b>The PDF exceeds safe decompression limits.</b> "
+                    "Try a smaller file. Your question was not counted.",
+                )
+                return
             except DocumentParseTimeout:
                 await refund_access(service, user.id, access)
                 await safe_answer(
@@ -1874,6 +1883,14 @@ async def _handle_document(message: Message) -> None:
                 )
                 try:
                     ocr = await ocr_pdf(data)
+                except PdfResourceLimit:
+                    await refund_access(service, user.id, access)
+                    await safe_answer(
+                        message,
+                        "⚠️ <b>The PDF exceeds safe decompression limits.</b> "
+                        "Try a smaller file. Your question was not counted.",
+                    )
+                    return
                 except DocumentParseTimeout:
                     await refund_access(service, user.id, access)
                     await safe_answer(

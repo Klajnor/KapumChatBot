@@ -39,6 +39,7 @@ from bot.services.intent import (
 )
 from bot.services.markdown import render, split_chunks
 from bot.services.operations import stage, tracked
+from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.telegram_utils import (
@@ -297,6 +298,13 @@ async def _build_reply(
         if len(data) <= config.max_document_bytes:
             try:
                 extracted = await extract_document_text(file_type, data)
+            except PdfResourceLimit:
+                await refund_access(service, caller_id, access)
+                return GuestReply(
+                    text="⚠️ The PDF exceeds safe decompression limits. "
+                    "Try a smaller file. Your question was not counted.",
+                    mode="plain",
+                )
             except DocumentParseTimeout:
                 await refund_access(service, caller_id, access)
                 return GuestReply(
