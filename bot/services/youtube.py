@@ -13,9 +13,11 @@ YouTube changes often and yt-dlp breaks with it: every failure becomes a
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,10 +32,49 @@ _VIDEO_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _BUCKET_SECONDS = 60  # one [m:ss] timestamp per minute of speech
+_READ_CHUNK = 64 * 1024
+
+# Set by fetch_transcript when the outer timeout fires. The worker thread sees
+# the same Event through the copied context and stops at the next checkpoint;
+# a Python thread cannot be killed outright, so blocked socket calls are still
+# bounded by yt-dlp's own socket_timeout.
+_CANCEL: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "youtube_cancel", default=None
+)
 
 
 class YouTubeError(Exception):
     """A failure whose message is safe to show to the user."""
+
+
+class _Cancelled(Exception):
+    """Internal: the caller has already timed out; stop doing more work."""
+
+
+def _check_cancelled() -> None:
+    event = _CANCEL.get()
+    if event is not None and event.is_set():
+        raise _Cancelled
+
+
+def _read_capped(response: Any, limit: int) -> tuple[bytes, bool]:
+    """Read at most ``limit`` bytes, reporting whether more data was left.
+
+    ``http.client`` honours the requested size, so a huge caption track is
+    never materialised in full just to be truncated later.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        _check_cancelled()
+        chunk = response.read(min(_READ_CHUNK, limit + 1 - total))
+        if not chunk:
+            return b"".join(chunks), False
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            return b"".join(chunks)[:limit], True
+    return b"".join(chunks), False
 
 
 @dataclass(slots=True)
@@ -60,12 +101,21 @@ def _format_clock(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
-def parse_json3(raw: bytes | str) -> str:
-    """Caption text with a ``[m:ss]`` mark at the start of every minute."""
+def parse_json3(raw: bytes | str, max_chars: int | None = None) -> str:
+    """Caption text with a ``[m:ss]`` mark at the start of every minute.
+
+    ``max_chars`` stops the walk early instead of building the whole transcript
+    only to truncate it in the caller. It is a soft bound: the current minute's
+    line may finish slightly above it.
+    """
     data = json.loads(raw)
     lines: list[str] = []
     bucket = -1
+    total = 0
     for event in data.get("events", []):
+        if max_chars is not None and total >= max_chars:
+            break
+        _check_cancelled()
         segments = event.get("segs")
         if not segments:
             continue
@@ -76,9 +126,12 @@ def parse_json3(raw: bytes | str) -> str:
         index = int(start // _BUCKET_SECONDS)
         if index != bucket:
             bucket = index
-            lines.append(f"[{_format_clock(start)}] {text}")
+            line = f"[{_format_clock(start)}] {text}"
+            lines.append(line)
+            total += len(line) + 1
         else:
             lines[-1] += " " + text
+            total += len(text) + 1
     return "\n".join(lines)
 
 
@@ -131,7 +184,7 @@ def _load_transcript(video_id: str) -> Transcript:
         "skip_download": True,
         "noplaylist": True,
         "ignoreconfig": True,
-        "socket_timeout": 15,
+        "socket_timeout": min(15, config.youtube_timeout),
         "retries": 1,
         "extractor_retries": 1,
     }
@@ -139,6 +192,7 @@ def _load_transcript(video_id: str) -> Transcript:
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
+            _check_cancelled()
             if not info:
                 raise YouTubeError("Could not load the video.")
             if info.get("is_live"):
@@ -148,8 +202,15 @@ def _load_transcript(video_id: str) -> Transcript:
             if picked is None:
                 raise YouTubeError("This video has no captions, so there is nothing to read.")
             language, automatic, formats = picked
-            body = ydl.urlopen(formats[0]["url"]).read()
-    except YouTubeError:
+            _check_cancelled()
+            body, truncated = _read_capped(
+                ydl.urlopen(formats[0]["url"]), config.youtube_max_bytes
+            )
+            if truncated:
+                raise YouTubeError(
+                    "The captions of this video are too large to read."
+                )
+    except (YouTubeError, _Cancelled):
         raise
     except Exception as exc:
         logger.warning("YouTube extraction failed for %s: %s", video_id, exc)
@@ -159,7 +220,7 @@ def _load_transcript(video_id: str) -> Transcript:
         ) from exc
 
     try:
-        text = parse_json3(body)
+        text = parse_json3(body, max_chars=config.youtube_max_chars)
     except (ValueError, AttributeError, TypeError) as exc:
         logger.warning("Unreadable caption track for %s: %s", video_id, exc)
         raise YouTubeError("The captions of this video could not be read.") from exc
@@ -184,13 +245,25 @@ def _load_transcript(video_id: str) -> Transcript:
 
 
 async def fetch_transcript(video_id: str) -> Transcript:
-    """Captions of one video; raises ``YouTubeError`` with a user-facing text."""
+    """Captions of one video; raises ``YouTubeError`` with a user-facing text.
+
+    The blocking yt-dlp call runs in a thread, which Python cannot kill. On
+    timeout the shared Event is set: the thread stops at the next read/step
+    checkpoint instead of continuing to download and parse the whole track.
+    """
+    cancel = threading.Event()
+    token = _CANCEL.set(cancel)
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_load_transcript, video_id), config.youtube_timeout
         )
     except TimeoutError:
+        cancel.set()
         raise YouTubeError("YouTube took too long to answer. Try again later.") from None
+    except _Cancelled:
+        raise YouTubeError("YouTube took too long to answer. Try again later.") from None
+    finally:
+        _CANCEL.reset(token)
 
 
 def describe(transcript: Transcript) -> str:

@@ -784,6 +784,10 @@ class Config:
     youtube_max_chars: int = field(
         default_factory=lambda: _env_int("YOUTUBE_MAX_CHARS", 30_000)
     )
+    # Raw caption JSON read limit before parsing, bytes.
+    youtube_max_bytes: int = field(
+        default_factory=lambda: _env_int("YOUTUBE_MAX_BYTES", 2_000_000)
+    )
     # Total timeout for loading one video's captions, seconds.
     youtube_timeout: int = field(
         default_factory=lambda: _env_int("YOUTUBE_TIMEOUT", 40)
@@ -1263,6 +1267,9 @@ class Config:
         # OCR pages and transcript size bound the paid tokens of one request.
         self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))
         self.youtube_max_chars = max(2_000, min(self.youtube_max_chars, 100_000))
+        self.youtube_max_bytes = max(
+            256_000, min(self.youtube_max_bytes, 20_000_000)
+        )
         self.youtube_timeout = max(10, min(self.youtube_timeout, 120))
         # Web search bounds.
         self.search_timeout = max(5, min(self.search_timeout, 60))
