@@ -761,9 +761,12 @@ async def _fetch_body(
     Для изображений используется тот же сетевой шлюз с ``text_only=False``
     и собственным лимитом. Явные заголовки не передаются на другой origin.
     """
-    timeout = aiohttp.ClientTimeout(
-        total=config.link_fetch_timeout if timeout_seconds is None else timeout_seconds
+    total_timeout = (
+        config.link_fetch_timeout if timeout_seconds is None else timeout_seconds
     )
+    # One absolute deadline for the whole redirect chain. A per-hop timeout
+    # alone lets six slow hops take six times LINK_FETCH_TIMEOUT.
+    deadline = time.monotonic() + total_timeout
     limit = _MAX_FETCH_BYTES if max_bytes is None else max_bytes
     try:
         try:
@@ -772,6 +775,10 @@ async def _fetch_body(
             return None, url, None
         origin = (initial.scheme, initial.netloc)
         for _ in range(_MAX_REDIRECTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("URL fetch exceeded its total deadline")
+                return None, url, None
             try:
                 parsed = urlsplit(url)
             except ValueError:
@@ -785,12 +792,24 @@ async def _fetch_body(
             if not _port_allowed(parsed):
                 logger.warning("Refusing a non-web port: %s", parsed.netloc)
                 return None, url, None
-            ips = await asyncio.to_thread(_resolve_public_ips, parsed.hostname)
+            try:
+                ips = await asyncio.wait_for(
+                    asyncio.to_thread(_resolve_public_ips, parsed.hostname),
+                    remaining,
+                )
+            except TimeoutError:
+                logger.warning("URL fetch DNS lookup exceeded its deadline")
+                return None, url, None
             if not ips:
                 logger.warning(
                     "Refusing a host without public addresses: %s", parsed.netloc
                 )
                 return None, url, None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("URL fetch exceeded its total deadline")
+                return None, url, None
+            timeout = aiohttp.ClientTimeout(total=remaining)
             connector = aiohttp.TCPConnector(resolver=_PinnedResolver(ips))
             try:
                 async with aiohttp.ClientSession(
