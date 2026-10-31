@@ -142,6 +142,16 @@ class PhotoIntentUsage(Base):
     call_count: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class ReminderIntentUsage(Base):
+    """Общий UTC-бюджет AI-разбора напоминаний и определения часового пояса."""
+
+    __tablename__ = "reminder_intent_usage"
+
+    date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    scope_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    call_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class Reminder(Base):
     """Scheduled one-time reminders and recurring messages / AI requests.
 

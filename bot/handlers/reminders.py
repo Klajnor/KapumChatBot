@@ -49,6 +49,12 @@ from bot.services.user_service import UserService, user_service
 logger = logging.getLogger(__name__)
 router = Router()
 
+_INTENT_LIMIT_MESSAGE = (
+    "⏳ <b>Daily reminder/timezone interpretation limit reached.</b> "
+    "Use <code>/remind in 30 minutes your text</code> or "
+    "<code>/timezone Europe/Moscow</code>. Enabled budgets reset at midnight UTC."
+)
+
 # Serialises "count then insert" per user. The cap check and the insert are two
 # statements, so without a lock two concurrent /remind commands can both pass
 # the check and overshoot REMINDER_LIMIT.
@@ -262,8 +268,8 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
             first_name=user.first_name,
             last_name=user.last_name,
         )
-        # Reminder creation is free (nothing is consumed), but it is an
-        # authorized-only feature; guests get the normal chat answer instead.
+        # Квота вопросов не расходуется; helper имеет отдельный persistent-бюджет.
+        # Гости продолжают обычный чат без AI-разбора напоминания.
         access = await check_access(
             service, user.id, consume=False, require_quota=False
         )
@@ -271,6 +277,9 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
             return False
         settings = await service.get_user_settings(user.id)
         tz = get_timezone(await service.get_reminder_timezone(user.id))
+        if not await service.consume_reminder_intent_budget(user.id):
+            await safe_answer(message, _INTENT_LIMIT_MESSAGE)
+            return True
 
     # Layer 2: one small AI call converts the request into a /remind slot;
     # layer 3 inside the service re-validates it with the plain regexes.
@@ -284,6 +293,10 @@ async def maybe_freeform_reminder(message: Message, text: str) -> bool:
         return True
 
     async with user_service() as service:
+        access = await check_access(service, user.id, consume=False, require_quota=False)
+        if not access.allowed or access.role == "guest":
+            await safe_answer(message, access.message or _TZ_AUTH_MESSAGE)
+            return True
         reminder_id, error = await create_reminder_record(
             service, user.id, message.chat.id, outcome
         )
@@ -673,6 +686,11 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
     if is_forwarded(message):
         return False  # a forwarded text is not the user's answer
 
+    if not config.enable_reminders:
+        _tz_dialogs.pop(user.id, None)
+        await safe_answer(message, "⚠️ Reminders are disabled on this bot.")
+        return True
+
     lowered = text.strip().lower().rstrip("!.")
     if lowered in ("cancel", "отмена", "не надо", "стоп"):
         _tz_dialogs.pop(user.id, None)
@@ -687,7 +705,15 @@ async def maybe_timezone_dialog(message: Message, text: str) -> bool:
             _tz_dialogs.pop(key, None)
 
     async with user_service() as service:
+        access = await check_access(service, user.id, consume=False, require_quota=False)
+        if not access.allowed or access.role == "guest":
+            _tz_dialogs.pop(user.id, None)
+            await safe_answer(message, access.message or _TZ_AUTH_MESSAGE)
+            return True
         settings = await service.get_user_settings(user.id)
+        if not await service.consume_reminder_intent_budget(user.id):
+            await safe_answer(message, _INTENT_LIMIT_MESSAGE)
+            return True
 
     detected = await detect_timezone(text, settings["model"])
     if detected is None:
@@ -730,6 +756,13 @@ async def cb_timezone(callback: CallbackQuery) -> None:
             callback, "The dialog is over — send /timezone to start again.",
             show_alert=True,
         )
+        return
+
+    async with user_service() as service:
+        access = await check_access(service, user.id, consume=False, require_quota=False)
+    if not config.enable_reminders or not access.allowed or access.role == "guest":
+        _tz_dialogs.pop(user.id, None)
+        await safe_answer_callback(callback, "Access restricted or reminders disabled.", show_alert=True)
         return
 
     if action == "ok":

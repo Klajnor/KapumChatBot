@@ -390,6 +390,17 @@ class UserService:
         await self.session.commit()
         return reserved
 
+    async def consume_reminder_intent_budget(self, telegram_id: int) -> bool:
+        """Списать общую AI-попытку напоминания/timezone, без квоты вопросов."""
+        reserved = await self.user_repo.try_consume_reminder_intent(
+            telegram_id,
+            datetime.datetime.now(datetime.UTC).date(),
+            config.reminder_intent_daily_limit,
+            config.reminder_intent_global_daily_limit,
+        )
+        await self.session.commit()
+        return reserved
+
     async def release_daily_usage(self, telegram_id: int) -> None:
         """Return a query after a failed request."""
         await self.user_repo.release_daily_usage(telegram_id, datetime.date.today())

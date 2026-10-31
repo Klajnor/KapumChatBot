@@ -1592,17 +1592,17 @@ async def handle_text(message: Message) -> None:
     if not text:
         return
 
-    # An in-progress /timezone dialog («where are you?») consumes the user's
-    # next message before the chat ever sees it.
-    if await maybe_timezone_dialog(message, text):
-        return
-
-    # Free-form reminder requests («напомни завтра позвонить маме») are
-    # intercepted before the message becomes a chat question: reminder
-    # creation is free (see /remind) and must not spend a daily question.
-    # Returns True only when the message was clearly a reminder request.
-    if await maybe_freeform_reminder(message, text):
-        return
+    # Бесплатные для квоты вопросов помощники тоже вызывают платный AI.
+    # Берём слот ДО них. Перед обычным запросом он освобождается: voice уже
+    # вызывает helper под своим _guarded, двойной слот ему не нужен.
+    with limits.slot(user.id) as granted:
+        if not granted:
+            await safe_answer(message, limits.BUSY_MESSAGE)
+            return
+        if await maybe_timezone_dialog(message, text):
+            return
+        if await maybe_freeform_reminder(message, text):
+            return
 
     # A question sent as a reply to a photo analyzes (or regenerates from)
     # the quoted image instead of chatting about text alone.

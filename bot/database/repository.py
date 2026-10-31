@@ -18,6 +18,7 @@ from bot.database.models import (
     Message,
     PhotoIntentUsage,
     Reminder,
+    ReminderIntentUsage,
     User,
     UserSettings,
 )
@@ -451,6 +452,22 @@ class UserRepository:
         self, telegram_id: int, date: datetime.date, user_limit: int, global_limit: int
     ) -> bool:
         """Атомарно резервировать оба бюджета фото; отказ не меняет счётчики."""
+        return await self._try_consume_intent_budget(
+            PhotoIntentUsage, telegram_id, date, user_limit, global_limit
+        )
+
+    async def try_consume_reminder_intent(
+        self, telegram_id: int, date: datetime.date, user_limit: int, global_limit: int
+    ) -> bool:
+        """Общий бюджет free-form напоминаний и timezone, отдельно от фото."""
+        return await self._try_consume_intent_budget(
+            ReminderIntentUsage, telegram_id, date, user_limit, global_limit
+        )
+
+    async def _try_consume_intent_budget(
+        self, model: type[PhotoIntentUsage | ReminderIntentUsage],
+        telegram_id: int, date: datetime.date, user_limit: int, global_limit: int,
+    ) -> bool:
         if telegram_id <= 0 or user_limit <= 0 or global_limit <= 0:
             return False
         insert_fn = (
@@ -460,14 +477,14 @@ class UserRepository:
             # Общая строка всегда первая: единый порядок блокировок для PostgreSQL.
             for scope_id, limit in ((0, global_limit), (telegram_id, user_limit)):
                 statement = (
-                    insert_fn(PhotoIntentUsage)
+                    insert_fn(model)
                     .values(date=date, scope_id=scope_id, call_count=1)
                     .on_conflict_do_update(
                         index_elements=["date", "scope_id"],
-                        set_={"call_count": PhotoIntentUsage.call_count + 1},
-                        where=PhotoIntentUsage.call_count < limit,
+                        set_={"call_count": model.call_count + 1},
+                        where=model.call_count < limit,
                     )
-                    .returning(PhotoIntentUsage.call_count)
+                    .returning(model.call_count)
                 )
                 result = await self.session.execute(statement)
                 if result.scalar_one_or_none() is None:

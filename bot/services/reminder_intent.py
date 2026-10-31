@@ -17,11 +17,11 @@ requests right in the chat. This module turns them into the same
 Any fallback path — AI failure, broken JSON, a message that is not a request —
 returns ``None`` and the caller continues the normal chat flow.
 
-Intended behaviour (not a gap): the detection call is a small, bounded
-service call and does NOT consume the daily question quota, exactly like
-creating a reminder (see ``/remind``). Its cost is bounded by the pre-filter,
-the per-user concurrency cap, ``max_tokens`` and the reminder limits. Forwarded
-messages never reach it. The *scheduled* AI run, by contrast, is charged.
+Разбор не расходует квоту вопросов, но production-обработчик до AI-вызова
+резервирует persistent-бюджет UserService.consume_reminder_intent_budget,
+общий с timezone. Текстовый и голосовой входы удерживают per-user slot.
+Pre-filter и max_tokens сами по себе НЕ ограничивают число вызовов.
+Форварды игнорируются; запуск AI-напоминания по расписанию расходует вопрос.
 """
 
 from __future__ import annotations

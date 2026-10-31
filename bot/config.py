@@ -712,6 +712,13 @@ class Config:
     photo_intent_global_daily_limit: int = field(
         default_factory=lambda: _env_int("PHOTO_INTENT_GLOBAL_DAILY_LIMIT", 200)
     )
+    # Общий бюджет двух бесплатных для квоты вопросов AI-помощников.
+    reminder_intent_daily_limit: int = field(
+        default_factory=lambda: _env_int("REMINDER_INTENT_DAILY_LIMIT", 20)
+    )
+    reminder_intent_global_daily_limit: int = field(
+        default_factory=lambda: _env_int("REMINDER_INTENT_GLOBAL_DAILY_LIMIT", 200)
+    )
 
     # --- Document & link analysis ---
     # Analyze uploaded files (PDF / DOCX / plain text & code) by extracting
@@ -1234,6 +1241,10 @@ class Config:
         self.photo_intent_daily_limit = max(0, min(self.photo_intent_daily_limit, 10_000))
         self.photo_intent_global_daily_limit = max(
             0, min(self.photo_intent_global_daily_limit, 100_000)
+        )
+        self.reminder_intent_daily_limit = max(0, min(self.reminder_intent_daily_limit, 10_000))
+        self.reminder_intent_global_daily_limit = max(
+            0, min(self.reminder_intent_global_daily_limit, 100_000)
         )
         # OCR pages and transcript size bound the paid tokens of one request.
         self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))

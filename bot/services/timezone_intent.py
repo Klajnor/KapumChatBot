@@ -6,9 +6,10 @@ current time in that zone for confirmation before anything is saved. The
 returned name is re-validated against :mod:`zoneinfo`, so a hallucinated
 zone can never reach the database.
 
-Intended behaviour (not a gap): this lookup is a tiny one-off helper of the
-``/timezone`` dialog and does NOT consume the daily question quota. The dialog
-is only open on request, expires after 10 minutes and ignores forwarded text.
+Определение зоны не расходует квоту вопросов, но обработчик перед AI-вызовом
+перепроверяет доступ и резервирует persistent-бюджет, общий с free-form
+напоминаниями. Текстовый вход удерживает per-user slot. TTL диалога и max_tokens
+не заменяют бюджет попыток. Диалог игнорирует форварды и истекает через 10 минут.
 """
 
 from __future__ import annotations
