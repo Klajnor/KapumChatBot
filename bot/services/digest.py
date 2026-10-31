@@ -471,8 +471,8 @@ async def _deliver(chat_id: int, markdown: str) -> bool:
 async def show_prompt(chat_id: int, title: str, prompt: str) -> bool:
     """Show a prompt in full, through the same rich → HTML → plain chain.
 
-    The prompt can be longer than one HTML message (up to 4096 characters
-    plus escaping), so it is not squeezed into the admin panel's screens.
+    The prompt can be far longer than one HTML message, so it is not squeezed
+    into the admin panel's screens.
     """
     return await _deliver(chat_id, f"**{title}**\n\n{prompt}")
 

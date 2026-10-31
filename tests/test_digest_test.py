@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -35,6 +36,25 @@ def _callback(chat_type: str = "private") -> SimpleNamespace:
     return SimpleNamespace(from_user=SimpleNamespace(id=ADMIN), message=status)
 
 
+def _prompt_document(data: bytes, name: str = "prompt.txt") -> SimpleNamespace:
+    return SimpleNamespace(
+        from_user=SimpleNamespace(id=ADMIN),
+        chat=SimpleNamespace(id=ADMIN, type="private"),
+        document=SimpleNamespace(
+            file_id="f",
+            file_unique_id="u",
+            file_name=name,
+            mime_type="text/plain",
+            file_size=len(data),
+        ),
+        answer=AsyncMock(),
+        bot=SimpleNamespace(
+            get_file=AsyncMock(return_value=SimpleNamespace(file_path="prompt.txt")),
+            download_file=AsyncMock(return_value=io.BytesIO(data)),
+        ),
+    )
+
+
 class TestDigestTestButton(DBTest):
     def _run(self, coro_fn):
         patches = [
@@ -51,6 +71,7 @@ class TestDigestTestButton(DBTest):
             return self._loop.run_until_complete(coro_fn())
         finally:
             panel._test_state.clear()
+            panel._awaiting.pop(ADMIN, None)
             for p in reversed(patches):
                 p.stop()
 
@@ -128,5 +149,33 @@ class TestDigestTestButton(DBTest):
             self.assertEqual(chat_id, ADMIN)
             self.assertTrue(markdown.endswith(prompt))  # not clipped
             self.assertEqual(panel._awaiting.pop(ADMIN), ("dgprompt", None))
+
+        self._run(go)
+
+    def test_prompt_can_be_uploaded_as_a_text_file(self):
+        async def go() -> None:
+            prompt = "П" * panel.MAX_PROMPT_CHARS
+            message = _prompt_document(prompt.encode())
+            self.assertFalse(panel._awaiting_prompt_file(message))  # not asked yet
+            panel._awaiting[ADMIN] = ("dgprompt", None)
+            self.assertTrue(panel._awaiting_prompt_file(message))
+            await panel.on_prompt_file(message)
+            self.assertEqual(await digest.get_prompt(), prompt)
+            self.assertNotIn(ADMIN, panel._awaiting)
+            message.answer.assert_awaited()
+
+        self._run(go)
+
+    def test_prompt_file_is_rejected_when_not_text_or_too_long(self):
+        async def go() -> None:
+            panel._awaiting[ADMIN] = ("dgprompt", None)
+            await panel.on_prompt_file(_prompt_document(b"x", "prompt.pdf"))
+            self.assertIn(ADMIN, panel._awaiting)  # still waiting for a prompt
+
+            too_long = _prompt_document(b"x" * (panel.MAX_PROMPT_CHARS + 1))
+            await panel.on_prompt_file(too_long)
+            self.assertIn(ADMIN, panel._awaiting)
+            self.assertEqual(await digest.get_prompt(), digest.DEFAULT_DIGEST_PROMPT)
+            too_long.bot.download_file.assert_awaited()  # bytes fit, chars did not
 
         self._run(go)

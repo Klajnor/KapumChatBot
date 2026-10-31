@@ -32,6 +32,7 @@ from bot.config import config
 from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
 from bot.handlers.tasks import cb_tasks
 from bot.services import digest
+from bot.services.documents import decode_text_bytes, detect_file_type
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
 
@@ -625,9 +626,14 @@ async def _confirm_reset(
 # A prompt of up to MAX_PROMPT_CHARS does not fit an HTML screen together with
 # the other lines (4096 characters, escaping included): the digest screen shows
 # a clipped preview, and the edit screens send the whole prompt separately
-# through the rich → HTML → plain chain (digest.show_prompt).
+# through the rich → HTML → plain chain (digest.show_prompt). Telegram caps one
+# text message at 4096 characters, so a longer prompt may be attached as a
+# plain-text file (on_prompt_file).
 _TEMPERATURES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
-MAX_PROMPT_CHARS = 4096
+MAX_PROMPT_CHARS = 32768
+# UTF-8 spends at most 4 bytes per character (plus a possible BOM): a larger
+# file is over the limit whatever it decodes to, so it is never downloaded.
+_MAX_PROMPT_FILE_BYTES = MAX_PROMPT_CHARS * 4 + 8
 _SHOWN_PROMPT_CHARS = 1500
 _CHANNEL_TYPES = ("channel", "supergroup", "group")
 _DIGEST_RESETS = {  # action -> (setting, what is reset, cancel callback, notice)
@@ -869,7 +875,8 @@ async def _digest_action(
         await _show(
             callback,
             "✏️ <b>Digest prompt</b>\n\nThe current prompt is in the next message.\n"
-            f"Send the new system prompt (up to {MAX_PROMPT_CHARS} characters).",
+            f"Send the new system prompt (up to {MAX_PROMPT_CHARS} characters), "
+            "or attach a .txt/.md file.",
             _digest_cancel(),
         )
         await _send_prompt(callback, "Current digest prompt", await digest.get_prompt())
@@ -890,7 +897,8 @@ async def _digest_action(
             "Before every run the digest prompt is sent to the model together with "
             "this instruction, and the reworded prompt is used for the summary.\n\n"
             "The current modifier is in the next message.\n"
-            f"Send the new modifier prompt (up to {MAX_PROMPT_CHARS} characters).",
+            f"Send the new modifier prompt (up to {MAX_PROMPT_CHARS} characters), "
+            "or attach a .txt/.md file.",
             _digest_cancel(),
         )
         await _send_prompt(callback, "Current modifier prompt", await digest.get_modifier())
@@ -998,14 +1006,12 @@ async def _digest_input(message: Message, actor: int, kind: str, text: str) -> N
         if not text or len(text) > MAX_PROMPT_CHARS:
             _awaiting[actor] = (kind, None)
             await message.answer(
-                f"❌ Send a prompt of 1–{MAX_PROMPT_CHARS} characters.",
+                f"❌ Send a prompt of 1–{MAX_PROMPT_CHARS} characters, "
+                "or attach a .txt/.md file.",
                 reply_markup=_digest_cancel(),
             )
             return
-        key = digest.SETTING_PROMPT if kind == "dgprompt" else digest.SETTING_MODIFIER
-        await digest.set_setting(key, text)
-        screen, markup = await _digest_screen("✅ Prompt saved.")
-        await message.answer(screen, reply_markup=markup)
+        await _save_prompt(message, actor, kind, text)
         return
 
     if kind == "dgtemp":
@@ -1036,6 +1042,67 @@ async def _digest_input(message: Message, actor: int, kind: str, text: str) -> N
         notice += "\n⚠️ The bot is not an admin there yet — it will not see posts."
     screen, markup = await _digest_screen(notice)
     await message.answer(screen, reply_markup=markup)
+
+
+async def _save_prompt(message: Message, actor: int, kind: str, text: str) -> None:
+    """Store the prompt typed by the admin or read from a file, then show the panel."""
+    _awaiting.pop(actor, None)
+    key = digest.SETTING_PROMPT if kind == "dgprompt" else digest.SETTING_MODIFIER
+    await digest.set_setting(key, text)
+    screen, markup = await _digest_screen("✅ Prompt saved.")
+    await message.answer(screen, reply_markup=markup)
+
+
+def _awaiting_prompt_file(message: Message) -> bool:
+    """A document sent while the panel waits for the digest prompt or modifier."""
+    user = message.from_user
+    return (
+        user is not None
+        and message.document is not None
+        and message.chat.type == "private"
+        and config.is_admin(user.id)
+        and _awaiting.get(user.id, ("", None))[0] in ("dgprompt", "dgmod")
+    )
+
+
+@router.message(_awaiting_prompt_file)
+async def on_prompt_file(message: Message) -> None:
+    """The prompt as a plain-text file: 32768 characters do not fit a message."""
+    user, doc = message.from_user, message.document
+    kind = _awaiting[user.id][0]
+    if detect_file_type(doc.file_name, doc.mime_type) != "txt":
+        await message.answer(
+            "❌ Attach the prompt as a plain-text file (.txt/.md), or send it "
+            f"as a message of up to {MAX_PROMPT_CHARS} characters.",
+            reply_markup=_digest_cancel(),
+        )
+        return
+    if doc.file_size and doc.file_size > _MAX_PROMPT_FILE_BYTES:
+        await message.answer(
+            "❌ The file is too large: the prompt is limited to "
+            f"{MAX_PROMPT_CHARS} characters.",
+            reply_markup=_digest_cancel(),
+        )
+        return
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        buffer = await message.bot.download_file(file.file_path)
+        data = buffer.read()
+    except Exception:  # noqa: BLE001 - any download failure is final
+        logger.warning("Could not download a digest prompt file from %s", user.id)
+        await message.answer(
+            "❌ Could not download the file. Please try again.",
+            reply_markup=_digest_cancel(),
+        )
+        return
+    text = decode_text_bytes(data).strip()
+    if not text or len(text) > MAX_PROMPT_CHARS:
+        await message.answer(
+            f"❌ Send a prompt of 1–{MAX_PROMPT_CHARS} characters.",
+            reply_markup=_digest_cancel(),
+        )
+        return
+    await _save_prompt(message, user.id, kind, text)
 
 
 # --- Digest test: summarise messages sent to the bot ---------------------------------
