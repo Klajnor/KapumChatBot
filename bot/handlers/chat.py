@@ -355,6 +355,47 @@ def _with_quoted_context(message: Message, text: str) -> str:
     return text
 
 
+def _photo_provenance(
+    message: Message, photo_from: Message | None, *, user_id: int
+) -> str | None:
+    """Label a photo that was authored by somebody else, otherwise ``None``.
+
+    The image counts as third-party when the message carrying it is forwarded
+    or when it is a replied-to photo written by another participant. The
+    requester's own earlier photo stays trusted, exactly like their own text.
+    """
+    source = message if photo_from is None else photo_from
+    if is_forwarded(source):
+        name = _forward_source_name(source)
+        return f"[Forwarded image from {name}]" if name else "[Forwarded image]"
+    author = getattr(source, "from_user", None)
+    if photo_from is not None and author is not None and author.id != user_id:
+        return f"[Image from {_sender_name(source)}]"
+    return None
+
+
+def _with_photo_provenance(
+    label: str | None, body: str, *, body_is_untrusted: bool = True
+) -> str:
+    """History record for an image request, keeping its taint for later turns.
+
+    A forwarded or quoted image is wrapped in ``<untrusted_content>`` exactly
+    like forwarded text. The marker survives in the stored history, so the next
+    question still trips the taint gate (MCP withheld, untrusted system hint
+    added) instead of trusting instructions recognised from somebody else's
+    picture.
+
+    When only the image is foreign and the text is the requester's own question
+    (a reply to somebody else's photo), the question stays outside the frame and
+    the image gets an explicit untrusted placeholder.
+    """
+    if label is None:
+        return body
+    if body_is_untrusted:
+        return f"{label}\n{wrap_untrusted('photo', body)}"
+    return f"{label}\n{body}\n{wrap_untrusted('photo', '[image contents]')}"
+
+
 # --- Document & link analysis -------------------------------------------------
 
 # URLs inside a text message; trailing punctuation is stripped by _clean_url.
@@ -627,13 +668,21 @@ _PENDING_ENHANCE_TTL_SECONDS = 600
 
 
 def _remember_pending_enhance(
-    user_id: int, file_ids: list[str], caption: str, operations: list[str]
+    user_id: int,
+    file_ids: list[str],
+    caption: str,
+    operations: list[str],
+    *,
+    origin: str | None = None,
+    caption_tainted: bool = False,
 ) -> None:
     now = time.monotonic()
     _pending_enhance[user_id] = {
         "file_ids": file_ids,
         "caption": caption,
         "operations": operations,
+        "origin": origin,
+        "caption_tainted": caption_tainted,
         "expires": now + _PENDING_ENHANCE_TTL_SECONDS,
     }
     # Opportunistic cleanup of everything that has gone stale.
@@ -1994,7 +2043,10 @@ async def _route_single_photo(
         settings = await service.get_user_settings(message.from_user.id)  # type: ignore[union-attr]
         intent = "analyze"
         enhance_ops: list[str] = []
-        if caption:
+        # Подпись пересланного фото — чужой текст, как и пересланное сообщение:
+        # по ней не выбираем генерацию/улучшение и не тратим helper-бюджет.
+        intent_caption = None if is_forwarded(message) else caption
+        if intent_caption:
             # Нужны и доступ, и отдельный бюджет: при text-only/clarify обычная
             # квота может не списаться или вернуться, но API-попытка уже платная.
             gate = await check_access(service, message.from_user.id, consume=False)  # type: ignore[union-attr]
@@ -2004,7 +2056,9 @@ async def _route_single_photo(
                 )
                 return
             if await service.consume_photo_intent_budget(message.from_user.id):  # type: ignore[union-attr]
-                intent, enhance_ops = await detect_intent(caption, settings["model"])
+                intent, enhance_ops = await detect_intent(
+                    intent_caption, settings["model"]
+                )
             # The caption is user content: log the decision only, not the text.
             logger.info("Photo intent: %s %s", intent, " ".join(enhance_ops))
     finally:
@@ -2041,6 +2095,7 @@ async def _handle_photo(
         return
 
     photo_msg = message if photo_from is None else photo_from
+    origin = _photo_provenance(message, photo_from, user_id=user.id)
     if question is not None:
         caption = question
     else:
@@ -2049,6 +2104,15 @@ async def _handle_photo(
         quoted = _describe_quoted(message.reply_to_message)
         if quoted:
             caption = f"{quoted}\n\n---\n\n{caption}"
+
+    # Forwarded text around a photo is somebody else's words: frame it for the
+    # model, exactly like a forwarded text message.
+    caption_tainted = origin is not None and is_forwarded(message)
+    vision_caption = (
+        f"{origin}\n{wrap_untrusted('photo', caption)}"
+        if caption_tainted
+        else caption
+    )
 
     service = await _open_registered(message)
     if service is None:
@@ -2089,12 +2153,18 @@ async def _handle_photo(
             {"role": "system", "content": settings["system_prompt"]},
             *history,
         ]
+        if caption_tainted:
+            apply_untrusted_hint(messages)
 
         await service.add_message(
             chat_id=message.chat.id,
             user_id=user.id,
             role="user",
-            content=f"[Image] {caption}",
+            content=_with_photo_provenance(
+                origin,
+                f"[Image] {caption}",
+                body_is_untrusted=is_forwarded(message),
+            ),
             image_url=photo.file_id,
             model=settings["model"],
         )
@@ -2106,7 +2176,7 @@ async def _handle_photo(
                 try:
                     vision_result: ChatResult = await ai_client.stream_chat_completion(
                         AIClient.vision_messages(
-                            messages, caption, image_bytes
+                            messages, vision_caption, image_bytes
                         ),
                         model=settings["model"],
                         temperature=settings["temperature"],
@@ -2120,7 +2190,7 @@ async def _handle_photo(
                     )
                     await printer.discard()
                     vision_result = await ai_client.chat_with_image_result(
-                        text=caption,
+                        text=vision_caption,
                         image_bytes=image_bytes,
                         messages=messages,
                         model=settings["model"],
@@ -2129,7 +2199,7 @@ async def _handle_photo(
                     )
             else:
                 vision_result = await ai_client.chat_with_image_result(
-                    text=caption,
+                    text=vision_caption,
                     image_bytes=image_bytes,
                     messages=messages,
                     model=settings["model"],
@@ -2216,6 +2286,7 @@ async def _handle_vision_and_generate(
     else:
         caption = strip_bot_mention(message.caption or "").strip()
     photo_msg = message if photo_from is None else photo_from
+    origin = _photo_provenance(message, photo_from, user_id=user.id)
     service = await _open_registered(message)
     if service is None:
         return
@@ -2284,7 +2355,11 @@ async def _handle_vision_and_generate(
             chat_id=message.chat.id,
             user_id=user.id,
             role="user",
-            content=f"[Image->Generate] {caption}",
+            content=_with_photo_provenance(
+                origin,
+                f"[Image->Generate] {caption}",
+                body_is_untrusted=is_forwarded(message),
+            ),
             image_url=photo.file_id,
             model=settings["model"],
         )
@@ -2379,6 +2454,7 @@ async def _handle_enhance_photo(
     else:
         caption = strip_bot_mention(message.caption or "").strip()
     photo_msg = message if photo_from is None else photo_from
+    origin = _photo_provenance(message, photo_from, user_id=user.id)
 
     photo = photo_msg.photo[-1]
     if photo.file_size and photo.file_size > config.max_photo_bytes:
@@ -2392,7 +2468,12 @@ async def _handle_enhance_photo(
     if _is_private(message) and config.enable_image_generation:
         # The neural option means the generation API: no question without it.
         _remember_pending_enhance(
-            user.id, [photo.file_id], caption, operations or []
+            user.id,
+            [photo.file_id],
+            caption,
+            operations or [],
+            origin=origin,
+            caption_tainted=is_forwarded(message),
         )
         await safe_answer(
             message, MSG_ENHANCE_CHOICE, reply_markup=get_enhance_choice_keyboard()
@@ -2418,6 +2499,8 @@ async def _handle_enhance_photo(
         caption,
         operations or [],
         via="server",
+        origin=origin,
+        caption_tainted=is_forwarded(message),
     )
 
 
@@ -2430,6 +2513,8 @@ async def _run_enhancement(
     operations: list[str],
     *,
     via: str,
+    origin: str | None = None,
+    caption_tainted: bool = False,
 ) -> None:
     """Enhance one or more photos and deliver the results.
 
@@ -2452,7 +2537,11 @@ async def _run_enhancement(
             chat_id=target.chat.id,
             user_id=user.id,
             role="user",
-            content=f"[Image→Enhance:{via} {len(items)}] {caption}",
+            content=_with_photo_provenance(
+                origin,
+                f"[Image→Enhance:{via} {len(items)}] {caption}",
+                body_is_untrusted=caption_tainted,
+            ),
             image_url=items[0][0],
             model=settings["model"],
         )
@@ -2687,10 +2776,17 @@ async def _process_album(
         if access is None:
             return
         settings = await service.get_user_settings(user.id)
+        image_origin = _photo_provenance(message, None, user_id=user.id)
+        caption_tainted = is_forwarded(message)
 
         # Detect intent via AI before processing (safe: defaults to 'analyze').
+        # Подпись пересланного альбома — чужой текст, классификатор не зовём.
         intent, enhance_ops = "analyze", []
-        if caption and await service.consume_photo_intent_budget(user.id):
+        if (
+            caption
+            and not caption_tainted
+            and await service.consume_photo_intent_budget(user.id)
+        ):
             intent, enhance_ops = await detect_intent(caption, settings["model"])
             # Log the decision only: the caption is user content.
             logger.info("Album intent: %s %s", intent, " ".join(enhance_ops))
@@ -2761,7 +2857,11 @@ async def _process_album(
                 chat_id=message.chat.id,
                 user_id=user.id,
                 role="user",
-                content=f"[Album->Generate {len(valid_images)} images] {caption}",
+                content=_with_photo_provenance(
+                    image_origin,
+                    f"[Album->Generate {len(valid_images)} images] {caption}",
+                    body_is_untrusted=caption_tainted,
+                ),
                 model=settings["model"],
             )
 
@@ -2811,6 +2911,8 @@ async def _process_album(
                     [fid for fid, _ in valid],
                     caption,
                     enhance_ops,
+                    origin=image_origin,
+                    caption_tainted=caption_tainted,
                 )
                 await refund_access(service, user.id, access)
                 await safe_answer(
@@ -2828,7 +2930,11 @@ async def _process_album(
                 chat_id=message.chat.id,
                 user_id=user.id,
                 role="user",
-                content=f"[Album→Enhance {len(valid_images)} images] {caption}",
+                content=_with_photo_provenance(
+                    image_origin,
+                    f"[Album→Enhance {len(valid_images)} images] {caption}",
+                    body_is_untrusted=caption_tainted,
+                ),
                 model=settings["model"],
             )
 
@@ -2877,9 +2983,18 @@ async def _process_album(
                 *history,
             ]
 
+            album_text = caption or f"Describe these {len(valid_images)} images."
+            if caption_tainted and caption:
+                album_text = (
+                    f"{image_origin}\n{wrap_untrusted('photo', caption)}"
+                    if image_origin
+                    else wrap_untrusted("photo", caption)
+                )
+                apply_untrusted_hint(base_messages)
+
             full_messages = [dict(entry) for entry in base_messages]
             content_parts: list[dict[str, Any]] = [
-                {"type": "text", "text": caption or f"Describe these {len(valid_images)} images."}
+                {"type": "text", "text": album_text}
             ]
             for img in valid_images:
                 content_parts.append({
@@ -2892,7 +3007,11 @@ async def _process_album(
                 chat_id=message.chat.id,
                 user_id=user.id,
                 role="user",
-                content=f"[Album {len(valid_images)} images] {caption}",
+                content=_with_photo_provenance(
+                    image_origin,
+                    f"[Album {len(valid_images)} images] {caption}",
+                    body_is_untrusted=caption_tainted,
+                ),
                 model=settings["model"],
             )
 
@@ -3008,6 +3127,8 @@ async def cb_enhance_choice(callback: CallbackQuery) -> None:
             str(entry["caption"]),
             list(entry["operations"]),
             via=via,
+            origin=entry.get("origin"),
+            caption_tainted=bool(entry.get("caption_tainted")),
         )
 
 
