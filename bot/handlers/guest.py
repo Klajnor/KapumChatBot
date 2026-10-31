@@ -45,12 +45,14 @@ from bot.services.science import normalize_formulas
 from bot.services.telegram_utils import (
     PARSE_MODES,
     format_timing,
+    is_forwarded,
     safe_answer_guest,
     strip_bot_mention,
     with_timing,
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
+from bot.services.untrusted import apply_untrusted_hint, wrap_untrusted
 from bot.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -200,6 +202,25 @@ def _document_of(message: Message):
     return reply.document if reply is not None else None
 
 
+def _attachment_foreign(
+    message: Message, source: Message | None, caller_id: int
+) -> bool:
+    """True when an attachment was written/forwarded by somebody else.
+
+    Guest replies may reference a photo or voice note from the replied-to
+    message. That content is third-party even though the summon itself was
+    written by the caller. Unknown authors are treated as foreign (fail closed).
+    """
+    if source is None:
+        return False
+    if is_forwarded(source):
+        return True
+    if source is message:
+        return False
+    author = getattr(source, "from_user", None)
+    return author is None or getattr(author, "id", None) != caller_id
+
+
 def _extract_text(message: Message) -> str:
     """Summoning text with the ``@bot`` mention removed."""
     return strip_bot_mention(message.text or message.caption or "").strip()
@@ -225,6 +246,10 @@ async def _build_reply(
     )
 
     text = _extract_text(message)
+    # Forwarded summon text is somebody else's words: it is data, not a request.
+    text_tainted = is_forwarded(message)
+    text_external = text_tainted
+    external = text_tainted
 
     # Enforce maximum summon-text length to prevent abuse.
     if len(text) > config.max_guest_text_length:
@@ -281,9 +306,15 @@ async def _build_reply(
             text=access.message or get_random_themed_response(), mode="html"
         )
 
+    if text_tainted and text:
+        text = f"[Forwarded message]\n{wrap_untrusted('forward', text)}"
+
     # Document: extract its text (after the quota has been taken) and fold it,
     # together with the pages linked in the text, into the request.
     if document is not None:
+        # Uploaded/replied documents and their OCR/link text are third-party data.
+        external = True
+        text_external = True
         data = await _download(message, document.file_id)
         if not data:
             await refund_access(service, caller_id, access)
@@ -326,6 +357,7 @@ async def _build_reply(
                 text, require_short=False, notes=crawl_notes
             )
             if link_blocks:
+                external = True
                 text = remainder
         text = _compose_document_context(
             document.file_name or "document", extracted, text, link_blocks
@@ -334,12 +366,21 @@ async def _build_reply(
         # A summons that is essentially bare links reads those pages.
         link_blocks, remainder, videos = await read_links(text, notes=crawl_notes)
         if link_blocks:
+            external = True
+            text_external = True
             request = remainder or (
                 DEFAULT_VIDEO_PROMPT if videos == len(link_blocks) else DEFAULT_LINK_PROMPT
             )
             text = "\n\n".join(link_blocks) + f"\n\n---\n\nUser request: {request}"
 
     # Voice message: recognize it now (after the quota has been taken).
+    voice_foreign = voice_ok and _attachment_foreign(
+        message,
+        message
+        if getattr(message, "voice", None) is not None
+        else getattr(message, "reply_to_message", None),
+        caller_id,
+    )
     if voice_ok:
         audio = await _download(message, voice.file_id)
         transcript = None
@@ -351,6 +392,14 @@ async def _build_reply(
             await refund_access(service, caller_id, access)
             return GuestReply(
                 text="❌ Could not recognize the voice message.", mode="plain"
+            )
+        if voice_foreign:
+            # A replied-to/forwarded voice note is data, exactly like a forward.
+            external = True
+            text_external = True
+            transcript = (
+                "[Voice message from another participant]\n"
+                f"{wrap_untrusted('voice', transcript)}"
             )
         text = f"{text}\n{transcript}".strip() if text else transcript.strip()
 
@@ -372,11 +421,29 @@ async def _build_reply(
         *history,
     ]
 
+    # A replied-to/forwarded photo is third-party too. Its content cannot be
+    # wrapped (it is an image), so the history record gets a marker instead and
+    # the next question keeps the taint gate active.
+    photo_source = message if getattr(message, "photo", None) else None
+    replied = getattr(message, "reply_to_message", None)
+    if photo_source is None and getattr(replied, "photo", None):
+        photo_source = replied
+    photo_foreign = _attachment_foreign(message, photo_source, caller_id)
+    external = external or photo_foreign
+    if external:
+        apply_untrusted_hint(base_messages)
+
+    history_text = text
+    if photo_foreign:
+        history_text = (
+            f"{history_text}\n{wrap_untrusted('photo', '[image contents]')}".strip()
+        )
+
     await service.add_message(
         chat_id=chat_id,
         user_id=caller_id,
         role="user",
-        content=text,
+        content=history_text,
         model=settings["model"],
     )
 
@@ -397,7 +464,9 @@ async def _build_reply(
     if photo_bytes is not None:
         intent, enhance_ops = "analyze", []
         if (
-            text and config.enable_image_generation
+            text
+            and not text_external
+            and config.enable_image_generation
             and await service.consume_photo_intent_budget(caller_id)
         ):
             intent, enhance_ops = await detect_intent(text, settings["model"])
@@ -494,9 +563,11 @@ async def _build_reply(
             return telegraph_reply
         return GuestReply(text=with_timing(response + _guest_hint(access), footer))
 
-    # Text request -> the model may answer with a generated image.
+    # Text request -> the model may answer with a generated image. With external
+    # content in the request the image tool is withheld: third-party text must
+    # not steer a paid generation call.
     messages = [*base_messages, {"role": "user", "content": text}]
-    if config.enable_image_generation:
+    if config.enable_image_generation and not external:
         result: ChatResult = await ai_client.chat_with_tools(
             messages=messages,
             model=settings["model"],
