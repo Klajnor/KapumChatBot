@@ -1861,7 +1861,7 @@ async def _handle_document(message: Message) -> None:
                 await refund_access(service, user.id, access)
                 await safe_answer(
                     message,
-                    "⚠️ <b>The PDF exceeds safe decompression limits.</b> "
+                    "⚠️ <b>The PDF exceeds safe processing limits.</b> "
                     "Try a smaller file. Your question was not counted.",
                 )
                 return
@@ -1887,7 +1887,7 @@ async def _handle_document(message: Message) -> None:
                     await refund_access(service, user.id, access)
                     await safe_answer(
                         message,
-                        "⚠️ <b>The PDF exceeds safe decompression limits.</b> "
+                        "⚠️ <b>The PDF exceeds safe processing limits.</b> "
                         "Try a smaller file. Your question was not counted.",
                     )
                     return
@@ -1901,17 +1901,20 @@ async def _handle_document(message: Message) -> None:
                     return
                 if ocr is not None:
                     extracted = clip_extracted(ocr.text)
+                    total_label = (
+                        str(ocr.total_pages) if ocr.total_pages is not None else "unknown total"
+                    )
                     ocr_note = (
                         f"[Scanned PDF read by OCR: pages 1-{ocr.pages_read} of "
-                        f"{ocr.total_pages}"
+                        f"{total_label}"
                         + ("; the remaining pages were NOT read" if ocr.partial else "")
                         + ". OCR may contain recognition errors.]\n\n"
                     )
                     if ocr.partial:
                         await safe_answer(
                             message,
-                            f"ℹ️ Read the first {ocr.pages_read} of {ocr.total_pages} "
-                            "pages (OCR page limit).",
+                            f"ℹ️ Read the first {ocr.pages_read} pages (OCR page limit). "
+                            "The remaining pages were not read.",
                         )
         if not extracted:
             await refund_access(service, user.id, access)

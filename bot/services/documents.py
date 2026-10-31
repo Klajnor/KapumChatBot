@@ -37,6 +37,7 @@ import aiohttp
 from bot.config import config
 from bot.services.operations import stage
 from bot.services.pdf_limits import PdfResourceLimit, pdf_stream_limits
+from bot.services.pdf_pages import open_pdf_pages
 
 logger = logging.getLogger(__name__)
 
@@ -188,18 +189,17 @@ async def _run_parser(func: Any, *args: Any) -> Any:
 def _extract_pdf(data: bytes, deadline: float | None = None) -> str | None:
     """Extract text from PDF bytes with pdfplumber (optional dependency)."""
     try:
-        import pdfplumber
+        import pdfplumber  # noqa: F401 - проверка опциональной зависимости
     except ImportError:
         logger.warning("pdfplumber is not installed; PDF analysis is unavailable")
         return None
     try:
         parts: list[str] = []
         collected = 0
-        with pdf_stream_limits(), pdfplumber.open(BytesIO(data)) as pdf:
-            # Both caps matter: a 20 MB PDF can hold thousands of dense pages,
-            # and the text is only clipped *after* extraction, so without a
-            # stop condition the whole document is expanded into memory first.
-            for page in pdf.pages[:_MAX_PDF_PAGES]:
+        with pdf_stream_limits(), open_pdf_pages(
+            data, _MAX_PDF_PAGES, lambda: _check_deadline(deadline)
+        ) as pdf:
+            for page in pdf.pages:
                 _check_deadline(deadline)
                 text = page.extract_text() or ""
                 if text.strip():

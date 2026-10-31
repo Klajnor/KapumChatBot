@@ -197,7 +197,7 @@ class PdfIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await chat._handle_document(message)
         refund.assert_awaited_once_with(service, 5, access)
         ocr.assert_not_awaited()
-        self.assertIn("safe decompression limits", answer.call_args.args[1])
+        self.assertIn("safe processing limits", answer.call_args.args[1])
 
     async def test_guest_returns_quota_on_resource_limit(self):
         caller = SimpleNamespace(id=5, username=None, first_name=None, last_name=None)
@@ -218,4 +218,4 @@ class PdfIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             reply = await guest._build_reply(SimpleNamespace(), service, caller, 5)
         refund.assert_awaited_once_with(service, 5, access)
-        self.assertIn("safe decompression limits", reply.text)
+        self.assertIn("safe processing limits", reply.text)

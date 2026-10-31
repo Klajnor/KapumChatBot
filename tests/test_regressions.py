@@ -895,7 +895,7 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "hello")
         self.assertIsNone(await documents.extract_document_text("zip", b"binary"))
 
-    async def test_pdf_extraction_uses_pdfplumber_when_available(self):
+    async def test_pdf_extraction_uses_bounded_reader_when_available(self):
         import sys
 
         pdf = SimpleNamespace(
@@ -903,9 +903,13 @@ class DocumentAnalysisTests(unittest.IsolatedAsyncioTestCase):
         )
         context = MagicMock()
         context.__enter__.return_value = pdf
-        fake_module = SimpleNamespace(open=lambda *a, **k: context)
-        with patch.dict(sys.modules, {"pdfplumber": fake_module}):
+        fake_module = SimpleNamespace()
+        with (
+            patch.dict(sys.modules, {"pdfplumber": fake_module}),
+            patch.object(documents, "open_pdf_pages", return_value=context) as reader,
+        ):
             self.assertEqual(documents._extract_pdf(b"%PDF-fake"), "Page text")
+        self.assertEqual(reader.call_args.args[:2], (b"%PDF-fake", documents._MAX_PDF_PAGES))
 
     async def test_pdf_extraction_is_graceful_without_pdfplumber(self):
         import sys

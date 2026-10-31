@@ -15,7 +15,7 @@ MAX_FLATE_DOCUMENT_BYTES = 64 * 1024 * 1024
 
 
 class PdfResourceLimit(ValueError):
-    """PDF превысил безопасный бюджет распаковки; повторный OCR запрещён."""
+    """PDF превысил безопасный бюджет обработки; повторный OCR запрещён."""
 
 
 @dataclass

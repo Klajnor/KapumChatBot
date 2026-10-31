@@ -301,7 +301,7 @@ async def _build_reply(
             except PdfResourceLimit:
                 await refund_access(service, caller_id, access)
                 return GuestReply(
-                    text="⚠️ The PDF exceeds safe decompression limits. "
+                    text="⚠️ The PDF exceeds safe processing limits. "
                     "Try a smaller file. Your question was not counted.",
                     mode="plain",
                 )

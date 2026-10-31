@@ -127,7 +127,7 @@ class PdfOcrTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await pdf_ocr.ocr_pdf(_blank_pdf(7))
         self.assertEqual(fake_client.chat_with_image_result.await_count, 3)
-        self.assertEqual((result.pages_read, result.total_pages), (3, 7))
+        self.assertEqual((result.pages_read, result.total_pages), (3, None))
         self.assertTrue(result.partial)
         self.assertIn("## Page 1\nFirst page text", result.text)
         self.assertNotIn("EMPTY", result.text)

@@ -18,6 +18,7 @@ from bot.config import config
 from bot.services.ai_client import ai_client
 from bot.services.documents import DocumentParseTimeout, _check_deadline, _run_parser
 from bot.services.pdf_limits import PdfResourceLimit, pdf_stream_limits
+from bot.services.pdf_pages import open_pdf_pages
 
 logger = logging.getLogger(__name__)
 
@@ -39,28 +40,29 @@ _OCR_PROMPT = (
 class OcrResult:
     text: str
     pages_read: int
-    total_pages: int
+    total_pages: int | None
 
     @property
     def partial(self) -> bool:
-        return self.pages_read < self.total_pages
+        return self.total_pages is None or self.pages_read < self.total_pages
 
 
 def _render_pages(
     data: bytes, max_pages: int, deadline: float | None = None
-) -> tuple[list[bytes], int]:
-    """JPEG bytes of the first pages and the document's total page count."""
+) -> tuple[list[bytes], int | None]:
+    """JPEG первых страниц; total неизвестно при обрезке по лимиту."""
     try:
-        import pdfplumber
+        import pdfplumber  # noqa: F401 - проверка опциональной зависимости
     except ImportError:
         logger.warning("pdfplumber is not installed; PDF OCR is unavailable")
         return [], 0
     images: list[bytes] = []
     try:
         _check_deadline(deadline)
-        with pdf_stream_limits(), pdfplumber.open(BytesIO(data)) as pdf:
-            total = len(pdf.pages)
-            for page in pdf.pages[:max_pages]:
+        with pdf_stream_limits(), open_pdf_pages(
+            data, max_pages, lambda: _check_deadline(deadline)
+        ) as pdf:
+            for page in pdf.pages:
                 _check_deadline(deadline)
                 # PDFium растеризует MediaBox до обрезки. thumbnail() после
                 # to_image не защищает от гигантской исходной аллокации.
@@ -80,6 +82,7 @@ def _render_pages(
                 buffer = BytesIO()
                 picture.save(buffer, format="JPEG", quality=80)
                 images.append(buffer.getvalue())
+            total = pdf.total_pages
         return images, total
     except (DocumentParseTimeout, PdfResourceLimit):
         raise
