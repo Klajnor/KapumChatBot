@@ -396,7 +396,10 @@ async def _build_reply(
     photo_bytes = await _download_photo(message)
     if photo_bytes is not None:
         intent, enhance_ops = "analyze", []
-        if text and config.enable_image_generation:
+        if (
+            text and config.enable_image_generation
+            and await service.consume_photo_intent_budget(caller_id)
+        ):
             intent, enhance_ops = await detect_intent(text, settings["model"])
 
         if intent == "enhance":

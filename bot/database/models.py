@@ -132,6 +132,16 @@ class DailyUsage(Base):
     )
 
 
+class PhotoIntentUsage(Base):
+    """Суточные попытки классификации фото; scope_id=0 — общий бюджет бота."""
+
+    __tablename__ = "photo_intent_usage"
+
+    date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    scope_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    call_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class Reminder(Base):
     """Scheduled one-time reminders and recurring messages / AI requests.
 

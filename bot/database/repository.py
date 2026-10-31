@@ -16,6 +16,7 @@ from bot.database.models import (
     DailyUsage,
     DigestChannel,
     Message,
+    PhotoIntentUsage,
     Reminder,
     User,
     UserSettings,
@@ -445,6 +446,34 @@ class UserRepository:
             return None
         usage = await self.get_daily_usage(telegram_id, date)
         return int(usage.query_count) if usage else 1
+
+    async def try_consume_photo_intent(
+        self, telegram_id: int, date: datetime.date, user_limit: int, global_limit: int
+    ) -> bool:
+        """Атомарно резервировать оба бюджета фото; отказ не меняет счётчики."""
+        if telegram_id <= 0 or user_limit <= 0 or global_limit <= 0:
+            return False
+        insert_fn = (
+            sqlite_insert if self.session.get_bind().dialect.name == "sqlite" else pg_insert
+        )
+        async with self.session.begin_nested() as reservation:
+            # Общая строка всегда первая: единый порядок блокировок для PostgreSQL.
+            for scope_id, limit in ((0, global_limit), (telegram_id, user_limit)):
+                statement = (
+                    insert_fn(PhotoIntentUsage)
+                    .values(date=date, scope_id=scope_id, call_count=1)
+                    .on_conflict_do_update(
+                        index_elements=["date", "scope_id"],
+                        set_={"call_count": PhotoIntentUsage.call_count + 1},
+                        where=PhotoIntentUsage.call_count < limit,
+                    )
+                    .returning(PhotoIntentUsage.call_count)
+                )
+                result = await self.session.execute(statement)
+                if result.scalar_one_or_none() is None:
+                    await reservation.rollback()
+                    return False
+        return True
 
     async def release_daily_usage(self, telegram_id: int, date: datetime.date) -> None:
         """Give back a query taken for a request that failed."""

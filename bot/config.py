@@ -705,6 +705,14 @@ class Config:
         default_factory=lambda: _env_int("MAX_ALBUM_BYTES", 50 * 1024 * 1024)
     )
 
+    # Отдельные persistent-бюджеты платного классификатора фото (попытки/UTC-сутки).
+    photo_intent_daily_limit: int = field(
+        default_factory=lambda: _env_int("PHOTO_INTENT_DAILY_LIMIT", 20)
+    )
+    photo_intent_global_daily_limit: int = field(
+        default_factory=lambda: _env_int("PHOTO_INTENT_GLOBAL_DAILY_LIMIT", 200)
+    )
+
     # --- Document & link analysis ---
     # Analyze uploaded files (PDF / DOCX / plain text & code) by extracting
     # their text and adding it to the AI request. PDF and DOCX parsers are
@@ -1222,6 +1230,10 @@ class Config:
         )
         self.request_intent_max_chars = max(
             32, min(self.request_intent_max_chars, 1024)
+        )
+        self.photo_intent_daily_limit = max(0, min(self.photo_intent_daily_limit, 10_000))
+        self.photo_intent_global_daily_limit = max(
+            0, min(self.photo_intent_global_daily_limit, 100_000)
         )
         # OCR pages and transcript size bound the paid tokens of one request.
         self.pdf_ocr_max_pages = max(1, min(self.pdf_ocr_max_pages, 20))

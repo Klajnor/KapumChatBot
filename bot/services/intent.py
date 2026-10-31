@@ -5,6 +5,9 @@ from keywords — what to do with an attached photo: analyze it, generate a
 new image from it, or enhance the photo itself. One cheap single-word call
 (``temperature=0``) decides; any failure falls back to ``"analyze"``, the
 behaviour that existed before intent routing.
+
+Все production-вызовы должны предварительно резервировать отдельный суточный
+бюджет через UserService.consume_photo_intent_budget (включая guest и альбомы).
 """
 from __future__ import annotations
 

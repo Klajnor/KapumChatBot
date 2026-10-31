@@ -295,6 +295,7 @@ class IntentAccessGateTests(unittest.IsolatedAsyncioTestCase):
             session=SimpleNamespace(close=AsyncMock()),
         )
         allowed = AccessResult(allowed=True, role="admin")
+        service.consume_photo_intent_budget = AsyncMock(return_value=True)
         with (
             patch.object(config, "enable_image_generation", False),
             patch.object(chat, "_is_addressed", return_value=True),

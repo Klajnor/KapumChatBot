@@ -1986,7 +1986,7 @@ async def _route_single_photo(
     else:
         caption = strip_bot_mention(message.caption or "").strip()
 
-    # Detect intent via AI before consuming quota.
+    # Классификатор имеет отдельный persistent-бюджет; квота вопроса — ниже.
     service = await _open_registered(message)
     if service is None:
         return
@@ -1995,18 +1995,16 @@ async def _route_single_photo(
         intent = "analyze"
         enhance_ops: list[str] = []
         if caption:
-            # Intent classification is itself a PAID model call, so gate it
-            # behind a non-consuming access check: otherwise anyone — even a
-            # user with no access at all — could farm the API by sending
-            # captioned photos in a loop. The real quota unit is still consumed
-            # later, by the handler that produces the answer.
+            # Нужны и доступ, и отдельный бюджет: при text-only/clarify обычная
+            # квота может не списаться или вернуться, но API-попытка уже платная.
             gate = await check_access(service, message.from_user.id, consume=False)  # type: ignore[union-attr]
             if not gate.allowed:
                 await safe_answer(
                     message, gate.message or get_random_themed_response()
                 )
                 return
-            intent, enhance_ops = await detect_intent(caption, settings["model"])
+            if await service.consume_photo_intent_budget(message.from_user.id):  # type: ignore[union-attr]
+                intent, enhance_ops = await detect_intent(caption, settings["model"])
             # The caption is user content: log the decision only, not the text.
             logger.info("Photo intent: %s %s", intent, " ".join(enhance_ops))
     finally:
@@ -2692,7 +2690,7 @@ async def _process_album(
 
         # Detect intent via AI before processing (safe: defaults to 'analyze').
         intent, enhance_ops = "analyze", []
-        if caption:
+        if caption and await service.consume_photo_intent_budget(user.id):
             intent, enhance_ops = await detect_intent(caption, settings["model"])
             # Log the decision only: the caption is user content.
             logger.info("Album intent: %s %s", intent, " ".join(enhance_ops))
