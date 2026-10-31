@@ -103,6 +103,7 @@ from bot.services.telegram_utils import (
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
+from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import (
     apply_untrusted_hint,
     messages_have_untrusted_content,
@@ -1266,6 +1267,7 @@ async def _resolve_tool_round(
     search_ready: bool,
     search_allowed: bool,
     mcp_allowed: bool,
+    budget: ToolBudget | None = None,
 ) -> None:
     """Run the model's search/MCP calls and append the tool exchange.
 
@@ -1279,6 +1281,7 @@ async def _resolve_tool_round(
     final answer, never tool calls or tool output.
     """
     messages.append(build_assistant_tool_message(result.content, calls))
+    budget = budget or ToolBudget()
 
     search_calls = [
         call for call in calls
@@ -1302,14 +1305,8 @@ async def _resolve_tool_round(
 
     for call in calls:
         if call.name == "search_web" and search_ready:
-            if not search_allowed:
-                messages.append(
-                    build_tool_response(
-                        call.id,
-                        "Лимит веб-поиска на этот вопрос исчерпан. Ответь из "
-                        "уже собранной информации.",
-                    )
-                )
+            if not search_allowed or not budget.take_search():
+                messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
                 continue
             query = str(call.arguments.get("query") or "").strip()
             max_results = call.arguments.get("max_results")
@@ -1317,21 +1314,19 @@ async def _resolve_tool_round(
                 max_results = None
             results = await search_web(query, max_results) if query else []
             messages.append(
-                build_tool_response(call.id, format_search_results(query, results))
-            )
-            continue
-
-        if not mcp_allowed:
-            messages.append(
                 build_tool_response(
-                    call.id,
-                    "Лимит обращений к MCP на этот вопрос исчерпан. Ответь из "
-                    "уже собранной информации.",
+                    call.id, budget.clip(format_search_results(query, results))
                 )
             )
             continue
-        output = await mcp_manager.call_tool(call.name, call.arguments)
-        messages.append(build_tool_response(call.id, output))
+
+        if not mcp_allowed or not budget.take_mcp():
+            messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
+            continue
+        output = await mcp_manager.call_tool(
+            call.name, call.arguments, max_chars=budget.context_chars
+        )
+        messages.append(build_tool_response(call.id, budget.clip(output)))
 
 
 def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1426,6 +1421,9 @@ async def _answer_with_ai(
     total_elapsed = 0.0
     search_rounds = 0
     mcp_rounds = 0
+    # Total calls/context for this question, not per round: one model turn may
+    # ask for many searches or MCP reads.
+    budget = ToolBudget()
     result: ChatResult
 
     async with waiting(message) as notifier:
@@ -1509,8 +1507,13 @@ async def _answer_with_ai(
             can_search = (
                 bool(search_calls)
                 and search_rounds < config.max_search_rounds
+                and budget.search_left
             )
-            can_mcp = bool(mcp_calls) and mcp_rounds < config.mcp_max_rounds
+            can_mcp = (
+                bool(mcp_calls)
+                and mcp_rounds < config.mcp_max_rounds
+                and budget.mcp_left
+            )
             # Search and MCP are multi-round tool loops: run the calls and ask
             # again — unless the same turn also asked for an image/sticker
             # (those win) or every requested tool type spent its budget.
@@ -1536,6 +1539,7 @@ async def _answer_with_ai(
                     search_ready=search_ready,
                     search_allowed=can_search,
                     mcp_allowed=can_mcp,
+                    budget=budget,
                 )
                 continue
             if handled_calls and not result.content:

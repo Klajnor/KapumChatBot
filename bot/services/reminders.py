@@ -60,6 +60,7 @@ from bot.services.search import (
     search_web,
 )
 from bot.services.telegram_utils import format_timing, throttle, with_timing
+from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import apply_untrusted_hint, messages_have_untrusted_content
 from bot.services.user_service import UserService
 
@@ -540,6 +541,7 @@ async def _run_ai_prompt(
 
     elapsed = 0.0
     rounds = 0
+    budget = ToolBudget()
     while True:
         if messages_have_untrusted_content(messages):
             apply_untrusted_hint(messages)
@@ -569,25 +571,29 @@ async def _run_ai_prompt(
                 return result, elapsed
             messages.append(build_assistant_tool_message(result.content, calls))
             for call in calls:
-                messages.append(
-                    build_tool_response(
-                        call.id,
-                        "Лимит веб-поиска на этот вопрос исчерпан. Ответь из "
-                        "уже собранной информации.",
-                    )
-                )
+                messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
             continue
         rounds += 1
         messages.append(build_assistant_tool_message(result.content, calls))
+        served = False
         for call in calls:
+            if not budget.take_search():
+                messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
+                continue
+            served = True
             query = str(call.arguments.get("query") or "").strip()
             max_results = call.arguments.get("max_results")
             if not isinstance(max_results, int) or isinstance(max_results, bool):
                 max_results = None
             found = await search_web(query, max_results) if query else []
             messages.append(
-                build_tool_response(call.id, format_search_results(query, found))
+                build_tool_response(
+                    call.id, budget.clip(format_search_results(query, found))
+                )
             )
+        if not served:
+            # The per-request budget is spent: ask once more without tools.
+            tools = None
 
 
 async def _refund_ai_run(user_id: int, access: Any) -> None:

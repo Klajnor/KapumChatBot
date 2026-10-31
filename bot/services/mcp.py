@@ -726,9 +726,17 @@ class MCPManager:
         return entry[0] if entry else None
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        max_chars: int | None = None,
     ) -> str:
-        """Execute a tool call; always returns framed text, never raises."""
+        """Execute a tool call; always returns framed text, never raises.
+
+        ``max_chars`` lets the caller cap the total tool context for a request;
+        it can only lower ``MCP_MAX_RESULT_CHARS``, never raise it.
+        """
         if not self._loaded:
             await self._load()
         entry = self._tools.get(name)
@@ -748,6 +756,8 @@ class MCPManager:
                 "mcp", f"Ошибка MCP-инструмента {tool.name}: {exc}"
             )
         limit = config.mcp_max_result_chars
+        if max_chars is not None:
+            limit = max(1, min(limit, max_chars))
         if len(text) > limit:
             text = text[:limit] + f"\n…[обрезано {len(text) - limit} символов]"
         # Заметки и ошибки MCP — внешние данные. Тег не даёт injection закрыть

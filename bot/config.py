@@ -824,6 +824,16 @@ class Config:
     max_search_rounds: int = field(
         default_factory=lambda: _env_int("MAX_SEARCH_ROUNDS", 2)
     )
+    # Total search calls per question across all rounds (a single model turn
+    # may ask for several). Each call can read SEARCH_MAX_RESULTS pages.
+    search_max_calls: int = field(
+        default_factory=lambda: _env_int("SEARCH_MAX_CALLS", 3)
+    )
+    # Total characters of search/MCP output added to the model context for one
+    # question. Trimming keeps the untrusted frame intact.
+    tool_max_context_chars: int = field(
+        default_factory=lambda: _env_int("TOOL_MAX_CONTEXT_CHARS", 60_000)
+    )
 
     # --- MCP (Model Context Protocol) providers ---
     # The chat model gets tools exposed by one or more MCP servers. The main
@@ -872,6 +882,10 @@ class Config:
     # Tool rounds allowed per question (MCP calls are multi-round).
     mcp_max_rounds: int = field(
         default_factory=lambda: _env_int("MCP_MAX_ROUNDS", 2)
+    )
+    # Total MCP calls per question across all rounds.
+    mcp_max_calls: int = field(
+        default_factory=lambda: _env_int("MCP_MAX_CALLS", 4)
     )
     # Which MCP tools the model may see and call (names as the server reports
     # them, comma-separated; "*" = everything the server offers). Servers whose
@@ -1254,10 +1268,15 @@ class Config:
         self.search_timeout = max(5, min(self.search_timeout, 60))
         self.search_max_results = max(1, min(self.search_max_results, 10))
         self.max_search_rounds = max(1, min(self.max_search_rounds, 5))
+        self.search_max_calls = max(1, min(self.search_max_calls, 20))
+        self.tool_max_context_chars = max(
+            1_000, min(self.tool_max_context_chars, 200_000)
+        )
         # MCP bounds: a hung server must not block an answer forever, and one
         # long note must not flood the model context.
         self.mcp_timeout = max(5, min(self.mcp_timeout, 300))
         self.mcp_max_rounds = max(1, min(self.mcp_max_rounds, 5))
+        self.mcp_max_calls = max(1, min(self.mcp_max_calls, 20))
         self.mcp_max_result_chars = max(
             1_000, min(self.mcp_max_result_chars, 50_000)
         )
