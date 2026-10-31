@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bot.config import config
+from bot.services.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -727,12 +728,14 @@ class MCPManager:
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> str:
-        """Execute a tool call; always returns text, never raises."""
+        """Execute a tool call; always returns framed text, never raises."""
         if not self._loaded:
             await self._load()
         entry = self._tools.get(name)
         if entry is None:
-            return f"Ошибка: неизвестный MCP-инструмент {name!r}."
+            return wrap_untrusted(
+                "mcp", f"Ошибка: неизвестный MCP-инструмент {name!r}."
+            )
         tool, client = entry
         logger.info("MCP call: %s.%s", tool.server, tool.name)
         try:
@@ -741,11 +744,15 @@ class MCPManager:
             logger.warning(
                 "MCP call %s.%s failed: %s", tool.server, tool.name, exc
             )
-            return f"Ошибка MCP-инструмента {tool.name}: {exc}"
+            return wrap_untrusted(
+                "mcp", f"Ошибка MCP-инструмента {tool.name}: {exc}"
+            )
         limit = config.mcp_max_result_chars
         if len(text) > limit:
             text = text[:limit] + f"\n…[обрезано {len(text) - limit} символов]"
-        return text
+        # Заметки и ошибки MCP — внешние данные. Тег не даёт injection закрыть
+        # рамку, а следующий раунд снимет MCP-инструменты по общему taint-gate.
+        return wrap_untrusted("mcp", text)
 
     async def status(self) -> list[dict[str, Any]]:
         """Per-server diagnostic for the admin ``/mcp`` command."""
