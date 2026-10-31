@@ -5,6 +5,7 @@ import html
 import logging
 import re
 import time
+from io import BytesIO
 from typing import Any
 
 from aiogram import F, Router
@@ -178,19 +179,21 @@ _DISPLAY_MATH_RE = re.compile(r"\$\$|\\\[")
 
 # --- Media group (album) support -------------------------------------------
 
-# Collect photos that arrive in a single album; each group_id maps to a dict
-# with ``images`` (list of bytes) and an ``event`` that processing awaits.
+# Запись альбома живёт до конца обработки; pending не даёт обработать его,
+# пока остальные фото ещё скачиваются. Байты резервируются под общим lock.
 _album_images: dict[str, dict[str, Any]] = {}
 _album_lock: asyncio.Lock = asyncio.Lock()
-_album_total_bytes: dict[str, int] = {}  # per-key running total for size checks
+_album_total_bytes: dict[str, int] = {}  # буферы + зарезервированные payload-байты
+_album_download_bytes: dict[str, int] = {}  # дополнительная копия при скачивании
 _ALBUM_COLLECT_SECONDS = 1.5  # how long to wait for the next photo
 _ALBUM_CLEANUP_SECONDS = 300  # discard stale album entries after 5 minutes
 # Album buffers hold raw photo bytes in RAM for up to _ALBUM_CLEANUP_SECONDS
 # and are collected before any per-user slot is taken, so a flood of media
 # groups must not be able to exhaust memory. New albums are refused once the
-# global budget is spent; every appended photo re-checks the real byte count.
+# global budget is spent; reservations include downloads and active processing.
 _ALBUM_MAX_CONCURRENT = 8
 _ALBUM_MAX_PER_USER = 2
+_ALBUM_MAX_PHOTOS = 10
 _ALBUM_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 _ALBUM_BUDGET_NOTICE = (
     "⏳ <b>Too many albums are being processed.</b>\n\n"
@@ -199,8 +202,23 @@ _ALBUM_BUDGET_NOTICE = (
 
 
 def _album_bytes_in_flight() -> int:
-    """Total bytes currently buffered across all in-flight albums."""
-    return sum(_album_total_bytes.values())
+    """Байты сбора, скачивания (с возможной копией) и обработки альбомов."""
+    return sum(_album_total_bytes.values()) + sum(_album_download_bytes.values())
+
+
+class _AlbumSizeExceeded(ValueError):
+    """Загрузка превысила предварительно зарезервированный размер."""
+
+
+class _AlbumBuffer(BytesIO):
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def write(self, data: bytes) -> int:
+        if self.tell() + len(data) > self.limit:
+            raise _AlbumSizeExceeded
+        return super().write(data)
 
 
 async def _album_cleanup() -> None:
@@ -209,22 +227,14 @@ async def _album_cleanup() -> None:
         await asyncio.sleep(_ALBUM_CLEANUP_SECONDS)
         cutoff = time.monotonic() - _ALBUM_CLEANUP_SECONDS
         async with _album_lock:
-            stale = [k for k, v in _album_images.items() if v["last"] < cutoff]
+            stale = [
+                k for k, v in _album_images.items()
+                if v["last"] < cutoff and not v.get("pending") and not v.get("processing")
+            ]
             for key in stale:
                 _album_images.pop(key, None)
                 _album_total_bytes.pop(key, None)
-
-
-async def _touch_album(key: str, stamp: float) -> None:
-    """Mark an album as recently touched so this handler may finalize it.
-
-    Called for rejected photos too: without it an album whose *last* photo was
-    oversized would never be processed and the valid photos would be lost.
-    """
-    async with _album_lock:
-        entry = _album_images.get(key)
-        if entry is not None:
-            entry["last"] = stamp
+                _album_download_bytes.pop(key, None)
 
 
 def _album_key(chat_id: int, group_id: str) -> str:
@@ -2539,16 +2549,14 @@ async def _handle_album_photo(message: Message) -> None:
     sender = getattr(message, "from_user", None)
     sender_id = sender.id if sender is not None else 0
 
-    # Reserve room BEFORE downloading: Telegram reports the size up front, so
-    # an oversized photo — or an album whose budget is already spent — costs
-    # neither bandwidth nor memory. On top of the per-album cap, the global
-    # in-flight budget (albums, bytes, per-user albums) stops a flood of media
-    # groups from exhausting RAM: buffers live for up to _ALBUM_CLEANUP_SECONDS
-    # and are collected before any per-user request slot is taken.
-    declared = photo.file_size or 0
-    over_budget = False
+    declared = max(0, photo.file_size or 0)
+    # Неизвестный размер требует максимального резерва. При заниженном размере
+    # bounded sink отклоняет файл, а не выделяет память сверх резерва.
+    reserve = declared or config.max_photo_bytes
+    notice = None
     async with _album_lock:
-        if key not in _album_images:
+        entry = _album_images.get(key)
+        if entry is None:
             same_user = sum(
                 1
                 for entry in _album_images.values()
@@ -2557,122 +2565,104 @@ async def _handle_album_photo(message: Message) -> None:
             if (
                 len(_album_images) >= _ALBUM_MAX_CONCURRENT
                 or same_user >= _ALBUM_MAX_PER_USER
-                or _album_bytes_in_flight() + declared > _ALBUM_MAX_TOTAL_BYTES
+                or _album_bytes_in_flight() + 2 * reserve > _ALBUM_MAX_TOTAL_BYTES
             ):
-                over_budget = True
+                notice = _ALBUM_BUDGET_NOTICE
             else:
-                _album_images[key] = {
+                entry = _album_images[key] = {
                     "images": [],
                     "message": message,
-                    "last": 0.0,
+                    "last": now,
                     "user_id": sender_id,
+                    "pending": 0,
                 }
                 _album_total_bytes[key] = 0
-        if not over_budget:
-            entry = _album_images.get(key)
-            if entry is not None and not entry["message"].caption and message.caption:
+        if notice is None and entry is not None:
+            if entry.get("processing"):
+                notice = _ALBUM_BUDGET_NOTICE
+            elif reserve > config.max_photo_bytes:
+                notice = (
+                    "⚠️ <b>Image too large.</b> Maximum size per image is "
+                    f"{config.max_photo_bytes // (1024 * 1024)} MB."
+                )
+            elif _album_total_bytes.get(key, 0) + reserve > config.max_album_bytes:
+                notice = (
+                    "⚠️ <b>Album size limit reached.</b> The maximum total is "
+                    f"{config.max_album_bytes // (1024 * 1024)} MB."
+                )
+            elif (
+                _album_bytes_in_flight() + 2 * reserve > _ALBUM_MAX_TOTAL_BYTES
+                or len(entry["images"]) + entry.get("pending", 0) >= _ALBUM_MAX_PHOTOS
+            ):
+                notice = _ALBUM_BUDGET_NOTICE
+            if not entry.get("processing"):
+                entry["last"] = now
+            if not entry["message"].caption and message.caption:
                 entry["message"] = message
-            total_before = _album_total_bytes.get(key, 0)
+            if notice is None:
+                entry["pending"] = entry.get("pending", 0) + 1
+                _album_total_bytes[key] = _album_total_bytes.get(key, 0) + reserve
+                _album_download_bytes[key] = _album_download_bytes.get(key, 0) + reserve
 
-    if over_budget:
-        await safe_answer(message, _ALBUM_BUDGET_NOTICE)
-        return
-
-    over_single = bool(declared) and declared > config.max_photo_bytes
-    over_album = total_before + declared > config.max_album_bytes
-
-    if over_single:
-        await safe_answer(
-            message,
-            f"⚠️ <b>Image too large.</b> Maximum size per image is "
-            f"{config.max_photo_bytes // (1024 * 1024)} MB. "
-            f"This image is {declared / (1024 * 1024):.1f} MB — skipped.",
-        )
-        await _touch_album(key, now)
-    elif over_album:
-        await safe_answer(
-            message,
-            f"⚠️ <b>Album size limit reached.</b> The maximum total is "
-            f"{config.max_album_bytes // (1024 * 1024)} MB — this image was skipped.",
-        )
-        await _touch_album(key, now)
+    if notice is not None:
+        await safe_answer(message, notice)
+        if entry is None or entry.get("processing"):
+            return
     else:
+        image_bytes = None
         try:
-            file = await message.bot.get_file(photo.file_id)
-            buffer = await message.bot.download_file(file.file_path)
-            image_bytes = buffer.read()
+            with _AlbumBuffer(reserve) as buffer:
+                file = await message.bot.get_file(photo.file_id)
+                await message.bot.download_file(file.file_path, destination=buffer)
+                image_bytes = buffer.getvalue()
+        except _AlbumSizeExceeded:
+            await safe_answer(
+                message,
+                "⚠️ <b>Image size exceeds the reserved limit.</b> Please send the photo again.",
+            )
         except Exception:
             logger.warning("Could not download album photo %s", photo.file_id, exc_info=True)
-            await _touch_album(key, now)
-            image_bytes = None
-
-        if image_bytes is not None:
-            img_size = len(image_bytes)
-            if img_size > config.max_photo_bytes:
-                await safe_answer(
-                    message,
-                    f"⚠️ <b>Image too large.</b> Maximum size per image is "
-                    f"{config.max_photo_bytes // (1024 * 1024)} MB. "
-                    f"This image is {img_size / (1024 * 1024):.1f} MB — skipped.",
-                )
-                await _touch_album(key, now)
-            else:
-                # The declared size can be missing or understated, so the real
-                # byte count is checked again before the buffer is kept.
-                appended = False
-                gone = False
-                async with _album_lock:
-                    entry = _album_images.get(key)
-                    if entry is None:
-                        gone = True
-                    else:
-                        others = sum(
-                            value
-                            for other, value in _album_total_bytes.items()
-                            if other != key
-                        )
-                        if (
-                            others + _album_total_bytes.get(key, 0) + img_size
-                            <= _ALBUM_MAX_TOTAL_BYTES
-                        ):
-                            entry["images"].append((photo.file_id, image_bytes))
-                            entry["last"] = now
-                            _album_total_bytes[key] = (
-                                _album_total_bytes.get(key, 0) + img_size
-                            )
-                            appended = True
-                if gone:
-                    return
-                if not appended:
-                    await safe_answer(message, _ALBUM_BUDGET_NOTICE)
-                    await _touch_album(key, now)
+        finally:
+            # Буфер уже закрыт. Отмена тоже возвращает резерв, но только после
+            # освобождения памяти загрузки; cleanup не удаляет pending-записи.
+            async with _album_lock:
+                _album_total_bytes[key] -= reserve
+                _album_download_bytes[key] -= reserve
+                if not _album_download_bytes[key]:
+                    _album_download_bytes.pop(key)
+                entry["pending"] -= 1
+                if image_bytes:
+                    entry["images"].append((photo.file_id, image_bytes))
+                    _album_total_bytes[key] += len(image_bytes)
+                image_bytes = None  # Только entry владеет буфером во время ожидания.
+                entry["last"] = time.monotonic()
+                if not entry["pending"] and not entry["images"]:
+                    _album_images.pop(key, None)
+                    _album_total_bytes.pop(key, None)
 
     await asyncio.sleep(_ALBUM_COLLECT_SECONDS)
     await asyncio.sleep(0)  # yield to let other album handlers update the entry
 
     async with _album_lock:
         entry = _album_images.get(key)
-        if entry is None or entry["last"] > now:
+        if (
+            entry is None or entry.get("pending") or entry.get("processing")
+            or time.monotonic() - entry["last"] < _ALBUM_COLLECT_SECONDS
+        ):
             return
+        entry["processing"] = True
         images: list[tuple[str, bytes]] = entry.pop("images", [])
-        first_message: Message = entry.pop("message", message)
-        total_size = _album_total_bytes.pop(key, 0)
-        _album_images.pop(key, None)
+        first_message: Message = entry["message"]
 
-    if not images:
-        return
-
-    if total_size > config.max_album_bytes:
-        await safe_answer(
-            first_message,
-            f"⚠️ <b>Album too large.</b> The total album size is "
-            f"{total_size / (1024 * 1024):.1f} MB; the maximum is "
-            f"{config.max_album_bytes // (1024 * 1024)} MB. "
-            f"Please send fewer or smaller images.",
-        )
-        return
-
-    await _guarded(first_message, lambda m: _process_album(m, images))
+    try:
+        if images:
+            await _guarded(first_message, lambda m: _process_album(m, images))
+    finally:
+        images.clear()
+        image_bytes = None
+        async with _album_lock:
+            _album_images.pop(key, None)
+            _album_total_bytes.pop(key, None)
 
 
 @tracked("Photo album")
