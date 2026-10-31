@@ -18,6 +18,10 @@ scheduled AI run costs one question from the daily quota, like a typed one
 reminder kept, and a failed run is refunded. The reminder limits
 (``REMINDER_LIMIT`` / ``REMINDER_RECURRING_LIMIT`` / minimum interval) bound
 the rate on top of that.
+
+Обычные напоминания тоже требуют актуальной авторизации (не guest), но не
+квоты вопросов. Revoke/block перед очередной доставкой отключает запись без
+сообщения в чат. Уже отправленный/находящийся в сети запрос не отзывается.
 """
 
 from __future__ import annotations
@@ -465,6 +469,19 @@ async def fire_reminder(due: DueReminder) -> None:
         if due.ai_mode:
             await _fire_ai(due)
         else:
+            # Обычная доставка бесплатна, но отзыв доступа должен останавливать
+            # и её. Исчерпанная квота вопросов не является отзывом авторизации.
+            async with async_session_factory() as session:
+                gate = await check_access(
+                    UserService(session), due.user_id, consume=False, require_quota=False
+                )
+            if not gate.allowed or gate.role == "guest":
+                logger.info(
+                    "Reminder %s: user %s is no longer authorized (role=%s); disabling it",
+                    due.id, due.user_id, gate.role,
+                )
+                await _disable_reminder(due.id)
+                return
             await _send_html(
                 due.chat_id,
                 f"⏰ <b>Reminder</b>\n\n{html.escape(due.text)}",

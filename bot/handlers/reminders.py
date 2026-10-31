@@ -407,7 +407,7 @@ async def _render_list(
 
 @router.message(Command("reminders"))
 async def cmd_reminders(message: Message) -> None:
-    """List the user's reminders with Pause / Resume / Delete buttons."""
+    """Показать свои записи, включая после revoke для удаления; toggle проверяет доступ."""
     user = message.from_user
     if user is None:
         return
@@ -457,6 +457,20 @@ async def cb_reminders(callback: CallbackQuery) -> None:
             reminder_id, page = int(parts[3]), int(parts[4])
             async with user_service() as service:
                 if action == "tg":
+                    # Владение старой кнопкой не даёт права возобновлять
+                    # автоматические доставки после revoke/block. Просмотр
+                    # и удаление своих записей по-прежнему доступны для очистки.
+                    access = await check_access(
+                        service, owner, consume=False, require_quota=False
+                    )
+                    if not access.allowed or access.role == "guest":
+                        await safe_answer_callback(
+                            callback,
+                            "Current authorization is required to pause or resume reminders. "
+                            "You can still delete your reminders.",
+                            show_alert=True,
+                        )
+                        return
                     reminder = await service.toggle_reminder(reminder_id, owner)
                     if reminder is None:
                         toast = "Reminder not found."

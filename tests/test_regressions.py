@@ -1226,8 +1226,22 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
             ai_mode=False, schedule=None,
         )
         fake_bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(reminder_service, "bot", fake_bot):
+
+        @asynccontextmanager
+        async def fake_session():
+            yield SimpleNamespace()
+
+        from bot.services.access import AccessResult
+
+        with (
+            patch.object(reminder_service, "bot", fake_bot),
+            patch.object(reminder_service, "async_session_factory", fake_session),
+            patch.object(reminder_service, "check_access", AsyncMock(
+                return_value=AccessResult(True, "allowed"),
+            )) as access,
+        ):
             await reminder_service.fire_reminder(due)
+        self.assertEqual(access.call_args.kwargs, {"consume": False, "require_quota": False})
         fake_bot.send_message.assert_awaited_once()
         args = fake_bot.send_message.call_args.args
         self.assertEqual(args[0], 42)
