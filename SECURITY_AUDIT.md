@@ -2,6 +2,21 @@
 
 ## Исправления по результатам 31.10.2026
 
+### Эксплуатация — исправлено: `restart.sh` не отдаёт код сервису
+
+- Скрипт возвращает `/opt/KapumChatBot` и `.venv` в `root:root`, снимает
+  групповую запись. `.env`/`.mcp.json` — `root:brain 640`, БД/WAL/SHM и токен
+  Telegraph — `brain:brain 600`, `StateDirectory` — `brain:brain 700`.
+- Удалён прежний `chown -R brain:brain /opt/KapumChatBot`, из-за которого RCE
+  в боте/MCP мог менять код и закрепляться до перезапуска.
+- README синхронизирован с фактическим `ExecStartPre=-…clean_pycache.sh`.
+- `tests/test_deploy_hardening.py`: статическая проверка владельцев/прав и
+  соответствия README юниту.
+- После исправления: **639 passed, 13 subtests passed**; Ruff и
+  `git diff --check` без ошибок.
+- Ограничение: bash/systemd на сервере не запускались; тест не заменяет
+  проверку живых ACL.
+
 ### Редиректы — исправлено: единый absolute deadline
 
 - `_fetch_body` считает один `deadline = now + LINK_FETCH_TIMEOUT` и проверяет
@@ -449,13 +464,13 @@ Mock с семью `search_web` выполнил все семь уже в пе�
 
 ### Эксплуатация, конфигурация и функциональные ошибки
 
-1. **`restart.sh` отменяет root-owned hardening.** `restart.sh:31-34` делает
+1. **`restart.sh` отменяет root-owned hardening.** ✅ **исправлено
+   31.10.2026, см. раздел «Эксплуатация» в начале документа.** Скрипт делал
    `chown -R brain:brain /opt/KapumChatBot`, хотя README и unit описывают код
-   как `root:root`, недоступный сервису для записи. После применения скрипта
-   RCE в боте/MCP сможет изменять код и закрепиться до перезапуска. Код и
-   `.env` должны оставаться root-owned; `brain` нужны только изменяемые данные.
-   Дополнительно README говорит об отсутствии `ExecStartPre`, хотя оно есть в
-   `chat_bot.service:30`, — описание нужно синхронизировать.
+   как `root:root`, недоступный сервису для записи; RCE в боте/MCP мог
+   изменять код и закрепиться до перезапуска. Теперь код/venv остаются
+   `root:root`, конфиги — `root:brain 640`, данные — `brain:brain`.
+   README синхронизирован с фактическим `ExecStartPre`.
 2. **Миграция PostgreSQL → SQLite неполна.** `scripts/migrate_to_sqlite.py:24-35`
    заявляет перенос всех таблиц, но не переносит `reminders`, `app_settings`,
    `channel_messages`, `digest_channels`, `generated_stickers`, `sticker_packs`.

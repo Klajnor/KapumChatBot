@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Исправляет владельца файлов бота (brain:brain), ставит права 600 на
-# критичные файлы (секреты, БД), перезапускает сервис и показывает лог.
+# Возвращает hardening к состоянию из README/юнита: код и venv — root:root
+# (сервис только читает), конфиги — root:brain 640, изменяемые данные —
+# brain:brain. Перезапускает сервис и показывает лог.
 #
 # Использование (на сервере):
 #   sudo ./restart.sh
@@ -11,12 +12,17 @@ set -euo pipefail
 APP_DIR="/opt/KapumChatBot"
 SERVICE="chat_bot.service"
 OWNER="brain:brain"
+CONFIG_OWNER="root:brain"
 STATE_DIR="/var/lib/kapum-chatbot"   # StateDirectory сервиса: БД и токен Telegraph
 
-# Критичные файлы: секреты и данные (шаблоны, отсутствующие файлы пропускаются)
-SECRET_GLOBS=(
+# Конфиги читает сервис, но менять их вправе только root.
+CONFIG_FILES=(
     "$APP_DIR/.env"
     "$APP_DIR/.mcp.json"
+)
+
+# Изменяемые данные: БД и токен Telegraph (отсутствующие файлы пропускаются).
+DATA_GLOBS=(
     "$APP_DIR"/*.db "$APP_DIR"/*.db-wal "$APP_DIR"/*.db-shm
     "$APP_DIR/telegraph_account.json"
     "$STATE_DIR"/*.db "$STATE_DIR"/*.db-wal "$STATE_DIR"/*.db-shm
@@ -28,15 +34,29 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "Владелец $OWNER для $APP_DIR..."
-chown -R "$OWNER" "$APP_DIR"
+echo "Код $APP_DIR: root:root, без права записи для группы и остальных..."
+chown -R root:root "$APP_DIR"
+chmod -R go-w "$APP_DIR"
+
+echo "Конфиги: $CONFIG_OWNER 640..."
+for f in "${CONFIG_FILES[@]}"; do
+    if [ -f "$f" ]; then
+        chown "$CONFIG_OWNER" -- "$f"
+        chmod 640 -- "$f"
+        echo "  640 $f"
+    fi
+done
+
 if [ -d "$STATE_DIR" ]; then
+    echo "Данные $STATE_DIR: $OWNER 700..."
     chown -R "$OWNER" "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
 fi
 
-echo "Права 600 на критичные файлы..."
-for f in "${SECRET_GLOBS[@]}"; do
+echo "Данные в $APP_DIR: $OWNER 600..."
+for f in "${DATA_GLOBS[@]}"; do
     if [ -f "$f" ]; then
+        chown "$OWNER" -- "$f"
         chmod 600 -- "$f"
         echo "  600 $f"
     fi

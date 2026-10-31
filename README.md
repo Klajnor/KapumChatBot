@@ -1630,9 +1630,10 @@ chmod +x scripts/clean_pycache.sh      # один раз после клонир
 ```
 
 На сервере чистить кэш вручную не нужно: юнит `chat_bot.service` запускает
-Python с `PYTHONDONTWRITEBYTECODE=1`, поэтому `.pyc` вообще не создаются.
-Отдельного `ExecStartPre` с `clean_pycache.sh` в юните нет — скрипт остаётся
-ручной утилитой для обслуживания (например, после смены версии Python).
+Python с `PYTHONDONTWRITEBYTECODE=1`, поэтому новые `.pyc` не создаются.
+Дополнительно `ExecStartPre=-/bin/bash …/clean_pycache.sh` удаляет старый кэш;
+префикс `-` означает, что сбой очистки не блокирует запуск сервиса. Скрипт
+остаётся и ручной утилитой для обслуживания (например, после смены версии Python).
 
 ## 🐧 Запуск под systemd (Linux)
 
@@ -1668,6 +1669,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now chat_bot
 sudo journalctl -u chat_bot -f
 ```
+
+`sudo ./restart.sh` перезапускает сервис и **возвращает** эту схему прав, если
+она была нарушена: код и `.venv` — `root:root` без записи для группы,
+`.env`/`.mcp.json` — `root:brain 640`, БД и токен Telegraph — `brain:brain 600`,
+`StateDirectory` — `brain:brain 700`. Скрипт не делает сервис владельцем кода:
+иначе RCE в боте или MCP мог бы закрепиться в `/opt/KapumChatBot` до
+перезапуска.
 
 На Debian/Ubuntu для шага 3 нужен пакет `python3-venv`; для голосовых
 сообщений — `ffmpeg` (см. раздел про установку ffmpeg выше).
