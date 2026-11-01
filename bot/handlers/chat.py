@@ -1273,12 +1273,14 @@ async def _single_shot(
             temperature=settings["temperature"],
             max_tokens=settings["max_tokens"],
             tools=tools,
+            public=True,
         )
     return await ai_client.chat_completion_result(
         messages=messages,
         model=model,
         temperature=settings["temperature"],
         max_tokens=settings["max_tokens"],
+        public=True,
     )
 
 
@@ -1519,6 +1521,7 @@ async def _answer_with_ai(
                         max_tokens=settings["max_tokens"],
                         tools=tools_arg,
                         on_delta=printer.on_delta,
+                        public=True,
                     )
                 except AIStreamError as exc:
                     logger.warning(
@@ -2261,6 +2264,7 @@ async def _handle_photo(
                         max_tokens=settings["max_tokens"],
                         on_delta=printer.on_delta,
                         require_vision=True,
+                        public=True,
                     )
                 except AIStreamError as exc:
                     logger.warning(
@@ -2275,6 +2279,7 @@ async def _handle_photo(
                         model=settings["model"],
                         temperature=settings["temperature"],
                         max_tokens=settings["max_tokens"],
+                        public=True,
                     )
             else:
                 vision_result = await ai_client.chat_with_image_result(
@@ -2284,6 +2289,7 @@ async def _handle_photo(
                     model=settings["model"],
                     temperature=settings["temperature"],
                     max_tokens=settings["max_tokens"],
+                    public=True,
                 )
         response = vision_result.content
 
@@ -3129,6 +3135,7 @@ async def _process_album(
                     temperature=settings["temperature"],
                     max_tokens=settings["max_tokens"],
                     require_vision=True,
+                    public=True,
                 )
             response = album_result.content or ""
 

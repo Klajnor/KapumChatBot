@@ -123,6 +123,16 @@ def _model_set(prefix: str, *, default_vision: bool = False) -> dict[str, Any] |
     }
 
 
+# Thinking (reasoning) of user-visible answers. The level is sent as the
+# provider's ``reasoning_effort``; a positive budget overrides it with an exact
+# ``thinking_budget`` cap. Qwen 3.8 rejects both fields at once, so only one of
+# them is ever sent. "off" disables thinking entirely.
+THINKING_LEVELS = ("off", "low", "medium", "high", "max")
+DEFAULT_THINKING_LEVEL = "medium"
+# Qwen 3.8 accepts up to 262 144 thinking tokens; other models clamp their own.
+MAX_THINKING_BUDGET = 262_144
+
+
 # Notice shown while a slow AI request is still running (see PROGRESS_TEXT).
 # Placeholders: {spinner} — animated frame, {seconds} — elapsed whole seconds.
 DEFAULT_PROGRESS_TEXT = "{spinner} Waiting for the AI response… {seconds} s"
@@ -615,6 +625,20 @@ class Config:
     )
     default_max_tokens: int = field(
         default_factory=lambda: _env_int("DEFAULT_MAX_TOKENS", 2048)
+    )
+    # Thinking of user-visible answers (chat, photos, guest, AI reminders,
+    # digest): off | low | medium | high | max. The admin menu (owner only)
+    # overrides these values at runtime via app_settings.
+    thinking_level: str = field(
+        default_factory=lambda: _env(
+            "THINKING_LEVEL", default=DEFAULT_THINKING_LEVEL
+        ).lower()
+    )
+    # Exact thinking-token cap; 0 = use thinking_level. A positive value is sent
+    # as thinking_budget (without reasoning_effort, which Qwen 3.8 rejects
+    # together with it).
+    thinking_budget: int = field(
+        default_factory=lambda: _env_int("THINKING_BUDGET", 0)
     )
     request_timeout: int = field(
         default_factory=lambda: _env_int("REQUEST_TIMEOUT", 300)
@@ -1226,6 +1250,15 @@ class Config:
 
         if self.parse_mode not in {"markdown", "html", "plain"}:
             self.parse_mode = "markdown"
+
+        if self.thinking_level not in THINKING_LEVELS:
+            logging.getLogger(__name__).warning(
+                "Invalid THINKING_LEVEL %r; using %s",
+                self.thinking_level,
+                DEFAULT_THINKING_LEVEL,
+            )
+            self.thinking_level = DEFAULT_THINKING_LEVEL
+        self.thinking_budget = max(0, min(self.thinking_budget, MAX_THINKING_BUDGET))
 
         if self.progress_delay < 0:
             self.progress_delay = 0.0

@@ -36,7 +36,7 @@ from bot.handlers import (
     digest as digest_handler,
 )
 from bot.handlers.chat import _album_cleanup
-from bot.services import telegraph
+from bot.services import telegraph, thinking
 from bot.services.ai_client import ai_client, ffmpeg_available
 from bot.services.digest import digest_scheduler_loop
 from bot.services.health import start_health_server, stop_health_server
@@ -149,6 +149,10 @@ async def main() -> None:
     try:
         await init_db()
         logger.info("Database initialized")
+
+        # Admin overrides for thinking of user-visible answers (.env defaults
+        # apply when no value is stored).
+        await thinking.load()
 
         async with user_service() as service:
             await service.load_granted_admins()

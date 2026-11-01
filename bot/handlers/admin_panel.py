@@ -31,7 +31,7 @@ from bot.bot import bot, get_bot_id
 from bot.config import config
 from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
 from bot.handlers.tasks import cb_tasks
-from bot.services import digest
+from bot.services import digest, thinking
 from bot.services.documents import decode_text_bytes, detect_file_type
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
@@ -119,15 +119,21 @@ async def _find(service: Any, telegram_id: int) -> dict[str, Any]:
 # --- Screens ---------------------------------------------------------------
 
 
-def _home_markup() -> InlineKeyboardMarkup:
+def _home_markup(actor_id: int | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👥 Users", callback_data="adm:list:a:0")
     b.button(text="📊 Statistics", callback_data="adm:stats")
     b.button(text="➕ Add user", callback_data="adm:add")
     b.button(text="📰 Digest", callback_data="adm:dg")
+    owner = actor_id is not None and config.is_owner(actor_id)
+    if owner:
+        b.button(text="🧠 Thinking", callback_data="adm:th")
     b.button(text="🔄 Tasks", callback_data="adm:tasks")
     b.button(text="✖ Close", callback_data="adm:close")
-    b.adjust(2, 2, 1, 1)
+    if owner:
+        b.adjust(2, 2, 1, 1, 1)
+    else:
+        b.adjust(2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -284,7 +290,7 @@ async def cmd_admin(message: Message) -> None:
         await message.answer("ℹ️ Open the admin menu in a private chat with the bot.")
         return
     _awaiting.pop(user.id, None)
-    await message.answer(await _home_text(), reply_markup=_home_markup())
+    await message.answer(await _home_text(), reply_markup=_home_markup(user.id))
 
 
 @router.callback_query(F.data == "adm:noop")
@@ -308,13 +314,17 @@ async def cb_admin(callback: CallbackQuery) -> None:
         _test_state.pop(actor, None)
 
     try:
-        target = int(parts[2]) if len(parts) > 2 and action not in ("list",) else None
+        target = (
+            int(parts[2])
+            if len(parts) > 2 and action not in ("list", "ths")
+            else None
+        )
     except ValueError:
         await safe_answer_callback(callback)
         return
 
     if action == "home":
-        await _show(callback, await _home_text(), _home_markup())
+        await _show(callback, await _home_text(), _home_markup(actor))
     elif action == "close":
         if callback.message is not None and hasattr(callback.message, "delete"):
             try:
@@ -342,6 +352,9 @@ async def cb_admin(callback: CallbackQuery) -> None:
             "(the user must have written to the bot once).",
             _cancel_markup(),
         )
+    elif action.startswith("th"):
+        await _thinking_action(callback, actor, action, parts)
+        return
     elif action.startswith("dg"):
         await _digest_action(callback, actor, action, parts)
         return
@@ -540,6 +553,10 @@ async def on_admin_input(message: Message) -> None:
         await _confirm_reset(message, actor, kind.removeprefix("reset:"), target, text)
         return
 
+    if kind == "thbudget":
+        await _thinking_input(message, actor, text)
+        return
+
     if kind in ("dgadd", "dgprompt", "dgtime", "dgmod", "dgtemp"):
         await _digest_input(message, actor, kind, text)
         return
@@ -594,6 +611,23 @@ async def _confirm_reset(
     confirmed = text == CONFIRM_WORD
     cancelled = "✖ Not confirmed — nothing changed."
 
+    if key == "thr":
+        if confirmed:
+            try:
+                await thinking.reset()
+            except Exception:
+                logger.exception("Could not reset thinking settings")
+                screen, markup = await _thinking_screen("❌ Could not reset the setting.")
+                await message.answer(screen, reply_markup=markup)
+                return
+        screen, markup = await _thinking_screen(
+            "♻️ Thinking settings reset to the .env defaults."
+            if confirmed
+            else cancelled
+        )
+        await message.answer(screen, reply_markup=markup)
+        return
+
     if key in _DIGEST_RESETS:
         setting, _what, _back, done = _DIGEST_RESETS[key]
         if confirmed:
@@ -619,6 +653,160 @@ async def _confirm_reset(
                 notice = "🧹 System prompt reset to the default."
     card, markup = await _render_card(actor, target, notice)
     await message.answer(card, reply_markup=markup)
+
+
+# --- Thinking (owner only) ---------------------------------------------------------
+
+_THINKING_LABELS = {
+    "off": "Off",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "max": "Max",
+}
+_THINKING_HINTS = {
+    "off": "no thinking",
+    "low": "light reasoning",
+    "medium": "balanced",
+    "high": "deep reasoning",
+    "max": "maximum effort",
+}
+
+
+async def _thinking_screen(notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    settings = thinking.current()
+    level_source = "custom" if settings.level_custom else ".env"
+    budget_source = "custom" if settings.budget_custom else ".env"
+    if settings.budget:
+        budget = f"{settings.budget:,}".replace(",", " ")
+        budget_text = f"{budget} tokens"
+    else:
+        budget_text = "0 (use the level)"
+    lines = [
+        "🧠 <b>Thinking — user-visible answers</b>",
+        "",
+        (
+            f"Level: <b>{_THINKING_LABELS[settings.level]}</b> "
+            f"({_THINKING_HINTS[settings.level]}; {level_source})"
+        ),
+        f"Budget: <b>{budget_text}</b> ({budget_source})",
+        "",
+        (
+            "<i>Applies to chat, photos, guest answers, AI reminders and the "
+            "digest. Internal intent/OCR calls keep the provider defaults.</i>"
+        ),
+    ]
+    if settings.level == "off" and settings.budget:
+        lines.append("⚠️ The budget is ignored while the level is Off.")
+    if notice:
+        lines.append(f"\n{notice}")
+
+    b = InlineKeyboardBuilder()
+    b.row(
+        _button(f"🧠 Level: {_THINKING_LABELS[settings.level]}", "adm:thl"),
+        _button(f"🔢 Budget: {settings.budget or 'level'}", "adm:thb"),
+    )
+    if settings.level_custom or settings.budget_custom:
+        b.row(_button("♻️ Reset to .env defaults", "adm:thr"))
+    b.row(_button("🏠 Menu", "adm:home"))
+    return "\n".join(lines), b.as_markup()
+
+
+async def _thinking_show(callback: CallbackQuery, notice: str = "") -> None:
+    text, markup = await _thinking_screen(notice)
+    await _show(callback, text, markup)
+
+
+async def _thinking_action(
+    callback: CallbackQuery, actor: int, action: str, parts: list[str]
+) -> None:
+    if not config.is_owner(actor):
+        await safe_answer_callback(callback, "Owners only", show_alert=True)
+        return
+
+    if action == "th":
+        await _thinking_show(callback)
+    elif action == "thl":
+        current = thinking.current().level
+        b = InlineKeyboardBuilder()
+        for level in thinking.THINKING_LEVELS:
+            mark = "✅ " if level == current else ""
+            b.button(
+                text=f"{mark}{_THINKING_LABELS[level]} — {_THINKING_HINTS[level]}",
+                callback_data=f"adm:ths:{level}",
+            )
+        b.adjust(1)
+        b.row(_button("◀ Back", "adm:th"))
+        await _show(
+            callback,
+            "🧠 <b>Thinking level</b>\n\n"
+            "The provider maps the level to its own effort scale; a custom "
+            "budget overrides it.",
+            b.as_markup(),
+        )
+    elif action == "ths":
+        level = parts[2] if len(parts) > 2 else ""
+        try:
+            await thinking.set_level(level)
+        except ValueError:
+            await _thinking_show(callback, "❌ Unknown thinking level.")
+            return
+        except Exception:
+            logger.exception("Could not save thinking level")
+            await _thinking_show(callback, "❌ Could not save the setting.")
+            return
+        await _thinking_show(callback, f"✅ Level set to {_THINKING_LABELS[level]}.")
+    elif action == "thb":
+        settings = thinking.current()
+        _awaiting[actor] = ("thbudget", None)
+        await _show(
+            callback,
+            "🔢 <b>Thinking budget</b>\n\n"
+            f"Current: <b>{settings.budget}</b> tokens.\n"
+            f"Send a whole number from 0 to {thinking.MAX_THINKING_BUDGET}: "
+            "0 = use the level, a positive value caps the thinking tokens. "
+            "Qwen 3.8 does not accept the budget together with the level, "
+            "so the budget overrides it.",
+            _cancel_markup("adm:th"),
+        )
+    elif action == "thr":
+        await _ask_reset(
+            callback,
+            actor,
+            "thr",
+            None,
+            "the thinking settings",
+            "adm:th",
+        )
+    else:
+        await _thinking_show(callback)
+
+
+async def _thinking_input(message: Message, actor: int, text: str) -> None:
+    if not config.is_owner(actor):
+        return
+    value = thinking.parse_budget(text)
+    if value is None:
+        _awaiting[actor] = ("thbudget", None)
+        await message.answer(
+            f"❌ Send a whole number from 0 to {thinking.MAX_THINKING_BUDGET}.",
+            reply_markup=_cancel_markup("adm:th"),
+        )
+        return
+    try:
+        await thinking.set_budget(value)
+    except Exception:
+        logger.exception("Could not save thinking budget")
+        screen, markup = await _thinking_screen("❌ Could not save the setting.")
+        await message.answer(screen, reply_markup=markup)
+        return
+    notice = (
+        "✅ Budget set: use the level."
+        if value == 0
+        else f"✅ Budget set to {value} tokens."
+    )
+    screen, markup = await _thinking_screen(notice)
+    await message.answer(screen, reply_markup=markup)
 
 
 # --- Channel digest ----------------------------------------------------------------

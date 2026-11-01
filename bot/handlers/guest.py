@@ -555,6 +555,7 @@ async def _build_reply(
             model=settings["model"],
             temperature=settings["temperature"],
             max_tokens=settings["max_tokens"],
+            public=True,
         )
         response = vision.content if vision else None
         if not response:
@@ -588,6 +589,7 @@ async def _build_reply(
             model=settings["model"],
             temperature=settings["temperature"],
             max_tokens=settings["max_tokens"],
+            public=True,
         ) or ChatResult()
     else:
         result = await ai_client.chat_completion_result(
@@ -595,6 +597,7 @@ async def _build_reply(
             model=settings["model"],
             temperature=settings["temperature"],
             max_tokens=settings["max_tokens"],
+            public=True,
         )
         result = result or ChatResult()
 

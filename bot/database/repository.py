@@ -740,13 +740,11 @@ class ReminderRepository:
         await self.session.flush()
 
 
-class DigestRepository:
-    """Settings, digest channels and the observed channel messages."""
+class AppSettingRepository:
+    """Key → text runtime settings in the shared ``app_settings`` table."""
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
-
-    # --- Runtime settings ----------------------------------------------------
 
     async def get_setting(self, key: str) -> str | None:
         row = await self.session.get(AppSetting, key)
@@ -763,6 +761,10 @@ class DigestRepository:
         else:
             row.value = value
         await self.session.flush()
+
+
+class DigestRepository(AppSettingRepository):
+    """Settings, digest channels and the observed channel messages."""
 
     # --- Channels ------------------------------------------------------------
 

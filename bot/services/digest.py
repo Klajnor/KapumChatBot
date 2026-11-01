@@ -327,6 +327,7 @@ async def _vary_prompt(
             model=model,
             temperature=temperature,
             max_tokens=config.digest_max_tokens,
+            public=True,
         )
     except Exception:
         logger.exception("Prompt modifier request failed; using the prompt as is")
@@ -365,6 +366,7 @@ async def _ask(text: str, model: str, prompt: str) -> Answer:
         model=model,
         temperature=temperature,
         max_tokens=config.digest_max_tokens,
+        public=True,
     )
     return Answer(
         content=result.content,

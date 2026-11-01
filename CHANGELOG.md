@@ -4,6 +4,9 @@
 
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
+### 2026-11-02
+- **Общая настройка thinking для публичных ответов.** `THINKING_LEVEL` (`off`, `low`, `medium`, `high`, `max`, по умолчанию `medium`) и `THINKING_BUDGET` (`0…262144`, по умолчанию `0`) в `.env`; владелец меняет их в `/admin → 🧠 Thinking`. Значения хранятся в `app_settings`, применяются без перезапуска и сбрасываются к `.env` через `CONFIRM`. Настройка уходит в `enable_thinking` / `reasoning_effort` / `thinking_budget` только для ответов, которые видит пользователь: чат и стриминг, фото/альбом, guest, AI-напоминания, дайджест и его модификатор. Intent, OCR и описания референсных картинок не затронуты. При `400/422` на thinking-поля — один retry без них и запоминание модели.
+
 ### 2026-11-01
 - **`restart.sh` больше не ломает консоль при Ctrl+C.** Удалён `trap ... exit 0`, который при запуске через `source`/`.` переопределял обработчик SIGINT и закрывал SSH-сессию; добавлен запрет source-запуска. Ctrl+C теперь останавливает только `journalctl` и возвращает в консоль.
 
@@ -201,6 +204,18 @@
 ---
 
 ## Подробные заметки
+
+### Thinking для публичных ответов: 02.11.2026
+
+- Добавлены `THINKING_LEVEL` (по умолчанию `medium`) и `THINKING_BUDGET` (по умолчанию `0`) в `bot/config.py` с валидацией: неизвестный уровень откатывается на `medium`, бюджет ограничивается `0…262144`.
+- `bot/services/thinking.py` держит эффективные настройки в памяти: `load()` читает `app_settings` при старте, `set_level()`/`set_budget()` пишут в БД и обновляют кэш, `reset()` удаляет override'ы. `payload_fields()` отдаёт `enable_thinking: false` для `off`, иначе `enable_thinking: true` + `reasoning_effort`, а при бюджете `> 0` — `thinking_budget` без `reasoning_effort` (Qwen 3.8 не принимает оба поля).
+- `AIClient` получил флаг `public`: только он добавляет thinking-поля в `_chat_payload`. Публичные вызовы помечены в `handlers/chat.py` (чат, стриминг, фото, альбом), `handlers/guest.py`, `services/reminders.py` и `services/digest.py` (саммари и модификатор). Intent-классификаторы, OCR и vision-описания референсных картинок оставлены без изменений.
+- При `400/422` на thinking-поля `chat_completion_result`, `chat_with_tools` и `chat_with_image_result` повторяют запрос без них и запоминают модель в `_thinking_unsupported`; стриминг делает так же, если не переданы tools. Это защищает чужие OpenAI-совместимые endpoint'ы.
+- Админка: кнопка `🧠 Thinking` на главном экране видна только владельцу; экран показывает уровень/бюджет и источник (`custom`/`.env`), уровень выбирается кнопками, бюджет вводится числом, сброс — через `CONFIRM`. Данные в `app_settings` (`thinking_level`, `thinking_budget`) переживают перезапуск.
+- `bot/database/repository.py`: общие `get_setting`/`set_setting` вынесены в `AppSettingRepository`, `DigestRepository` наследует его.
+- Тесты: `tests/test_thinking.py` (11 тестов) — парсинг, payload, public/private, retry без thinking-полей, сохранение/перезагрузка/сброс, ввод бюджета и сброс из админки, owner-only кнопка и экран, диспетчеризация кнопки уровня.
+- Проверки: **688 passed, 1 skipped, 20 subtests passed**; Ruff без ошибок.
+- Ограничение: жёсткого wall-clock таймаута нет — бюджет ограничивает thinking-токены, но не сетевые зависания. `medium` на Qwen 3.8 соответствует примерно 16k thinking-токенов; при `REQUEST_TIMEOUT=300` на больших запросах лучше `low` или явный бюджет.
 
 ### Ctrl+C в restart.sh: 01.11.2026
 

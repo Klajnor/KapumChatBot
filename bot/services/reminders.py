@@ -552,6 +552,7 @@ async def _run_ai_prompt(
                 temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"],
                 tools=tools,
+                public=True,
             )
         else:
             result = await ai_client.chat_completion_result(
@@ -559,6 +560,7 @@ async def _run_ai_prompt(
                 model=model,
                 temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"],
+                public=True,
             )
         elapsed += result.elapsed
         calls = [call for call in result.tool_calls if call.name == "search_web"]

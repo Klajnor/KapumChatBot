@@ -22,6 +22,7 @@ from bot.config import (
     FORMULA_STYLE_HINT,
     config,
 )
+from bot.services import thinking
 from bot.services.image_tools import canonical_operations
 from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
@@ -566,6 +567,20 @@ def _chain_fatal(status: int | None) -> bool:
     return status in _CHAIN_FATAL_STATUSES
 
 
+# Fields added to user-visible requests by bot.services.thinking. A provider
+# that does not understand them answers 400/422; the request is retried once
+# without them and the model is remembered for the rest of the process.
+_THINKING_FIELDS = frozenset({"enable_thinking", "thinking_budget", "reasoning_effort"})
+
+
+def _has_thinking(payload: dict[str, Any]) -> bool:
+    return any(field in payload for field in _THINKING_FIELDS)
+
+
+def _without_thinking(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key not in _THINKING_FIELDS}
+
+
 class AIClient:
     """Async client for Qwen (OpenAI-compatible chat + DashScope native APIs)."""
 
@@ -580,6 +595,9 @@ class AIClient:
         # Provider model IDs reported as available, per provider base URL
         # (a missing / ``None`` entry = unknown).
         self._available_ids: dict[str, set[str] | None] = {}
+        # Models whose endpoint rejected thinking parameters; the rest of the
+        # process sends them without thinking instead of repeating the 400.
+        self._thinking_unsupported: set[str] = set()
 
     # --- Session management ------------------------------------------------
 
@@ -722,10 +740,12 @@ class AIClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        public: bool = False,
     ) -> str | None:
         """Send a chat completion request and return the assistant text."""
         result = await self.chat_completion_result(
-            messages, model, temperature, max_tokens
+            messages, model, temperature, max_tokens, public=public
         )
         return result.content
 
@@ -737,22 +757,39 @@ class AIClient:
         max_tokens: int | None = None,
         *,
         require_vision: bool = False,
+        public: bool = False,
     ) -> ChatResult:
         """Chat completion returning the text plus timing and token usage.
 
         When a model does not answer (API error, quota exhausted, empty
         reply), the next model in :meth:`model_chain` is tried automatically.
         ``require_vision`` is for multimodal messages: it keeps the request
-        away from models whose ``VISION`` flag is off.
+        away from models whose ``VISION`` flag is off. ``public`` marks a
+        request whose answer is shown to a user: it receives the global
+        thinking settings (see :mod:`bot.services.thinking`).
         """
         started = time.monotonic()
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
-                messages, attempt_model, temperature, max_tokens
+                messages,
+                attempt_model,
+                temperature,
+                max_tokens,
+                public=public and attempt_model not in self._thinking_unsupported,
             )
             status, data, _elapsed = await self._post_chat(
                 payload, retries=2, model_id=attempt_model
             )
+            if status in {400, 422} and _has_thinking(payload):
+                self._thinking_unsupported.add(attempt_model)
+                logger.warning(
+                    "Model %s rejected thinking parameters; retrying without them",
+                    attempt_model,
+                )
+                payload = _without_thinking(payload)
+                status, data, _elapsed = await self._post_chat(
+                    payload, retries=2, model_id=attempt_model
+                )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
                 if content:
@@ -783,45 +820,54 @@ class AIClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        public: bool = False,
     ) -> ChatResult:
         """Chat completion with function calling enabled.
 
         Falls back to a plain completion if the model/region rejects tools,
-        then moves on to the next model in the chain.
+        then moves on to the next model in the chain. ``public`` applies the
+        global thinking settings (user-visible answers only).
         """
         started = time.monotonic()
         for attempt_model in self.model_chain(model):
             payload = self._chat_payload(
-                messages, attempt_model, temperature, max_tokens
+                messages,
+                attempt_model,
+                temperature,
+                max_tokens,
+                public=public and attempt_model not in self._thinking_unsupported,
             )
             payload["tools"] = tools if tools is not None else [IMAGE_TOOL]
 
             status, data, _elapsed = await self._post_chat(
                 payload, retries=2, model_id=attempt_model
             )
+            # Some models do not support the tools parameter -> retry the
+            # same model without it, but only for a tool-shaped rejection.
+            # Tools go first so a tools-only rejection does not needlessly
+            # disable thinking for this model.
+            if status in {400, 404, 422}:
+                payload.pop("tools", None)
+                status, data, _elapsed = await self._post_chat(
+                    payload, retries=2, model_id=attempt_model
+                )
+            if status in {400, 422} and _has_thinking(payload):
+                self._thinking_unsupported.add(attempt_model)
+                logger.warning(
+                    "Model %s rejected thinking parameters; retrying without them",
+                    attempt_model,
+                )
+                payload = _without_thinking(payload)
+                status, data, _elapsed = await self._post_chat(
+                    payload, retries=2, model_id=attempt_model
+                )
+
             if status == 200 and data is not None:
                 result = self._parse_result(data)
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
                     return result
-
-            # Some models do not support the tools parameter -> retry the
-            # same model without it, but only for a tool-shaped rejection.
-            if status in {400, 404, 422}:
-                payload.pop("tools", None)
-                status, data, _elapsed = await self._post_chat(
-                payload, retries=2, model_id=attempt_model
-            )
-                if status == 200 and data is not None:
-                    content = self._finalize(self._extract_content(data))
-                    if content:
-                        return ChatResult(
-                            content=content,
-                            elapsed=time.monotonic() - started,
-                            usage=_extract_usage(data),
-                            model=attempt_model,
-                        )
 
             logger.warning(
                 "Model %s did not answer with tools (status %s); "
@@ -845,10 +891,12 @@ class AIClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        public: bool = False,
     ) -> str | None:
         """Send a chat completion that includes a single image."""
         result = await self.chat_with_image_result(
-            text, image_bytes, messages, model, temperature, max_tokens
+            text, image_bytes, messages, model, temperature, max_tokens, public=public
         )
         return result.content
 
@@ -860,11 +908,14 @@ class AIClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        public: bool = False,
     ) -> ChatResult:
         """Vision completion returning the text plus timing and token usage.
 
         Only vision-capable models are tried, so a text-only fallback never
-        receives an image request.
+        receives an image request. ``public`` applies the global thinking
+        settings when the analysis itself is shown to the user.
         """
         started = time.monotonic()
         for attempt_model in self.model_chain(model, require_vision=True):
@@ -873,10 +924,22 @@ class AIClient:
                 attempt_model,
                 temperature,
                 max_tokens,
+                public=public and attempt_model not in self._thinking_unsupported,
             )
             status, data, _elapsed = await self._post_chat(
                 payload, retries=2, model_id=attempt_model
             )
+            if status in {400, 422} and _has_thinking(payload):
+                self._thinking_unsupported.add(attempt_model)
+                logger.warning(
+                    "Vision model %s rejected thinking parameters; "
+                    "retrying without them",
+                    attempt_model,
+                )
+                payload = _without_thinking(payload)
+                status, data, _elapsed = await self._post_chat(
+                    payload, retries=2, model_id=attempt_model
+                )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
                 if content:
@@ -932,6 +995,7 @@ class AIClient:
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any = None,
         require_vision: bool = False,
+        public: bool = False,
     ) -> ChatResult:
         """Streaming chat completion over SSE.
 
@@ -941,20 +1005,30 @@ class AIClient:
         when every model failed, :class:`AIStreamError` is raised and the
         caller should fall back to a regular single-shot request.
         ``require_vision`` keeps multimodal messages away from text-only
-        models; it is passed straight to :meth:`model_chain`.
+        models; it is passed straight to :meth:`model_chain`. ``public``
+        applies the global thinking settings to user-visible answers.
         """
         started = time.monotonic()
         last_error: AIStreamError | None = None
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
-                messages, attempt_model, temperature, max_tokens
+                messages,
+                attempt_model,
+                temperature,
+                max_tokens,
+                public=public and attempt_model not in self._thinking_unsupported,
             )
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
             if tools:
                 payload["tools"] = list(tools)
             try:
-                result = await self._stream_attempt(payload, on_delta, attempt_model)
+                result = await self._stream_attempt_with_thinking_fallback(
+                    payload,
+                    on_delta,
+                    attempt_model,
+                    allow_retry=not tools,
+                )
             except AIStreamError as exc:
                 last_error = exc
                 logger.warning(
@@ -982,6 +1056,39 @@ class AIClient:
             return result
 
         raise last_error or AIStreamError("no model produced an answer")
+
+    async def _stream_attempt_with_thinking_fallback(
+        self,
+        payload: dict[str, Any],
+        on_delta: Any,
+        model_id: str,
+        *,
+        allow_retry: bool,
+    ) -> ChatResult:
+        """One streaming request, retried without thinking fields on 400/422.
+
+        ``allow_retry`` is False when tools are attached: a tool-shaped
+        rejection must not be mistaken for an unsupported thinking parameter
+        (the caller's single-shot fallback handles that case).
+        """
+        try:
+            return await self._stream_attempt(payload, on_delta, model_id)
+        except AIStreamError as exc:
+            if (
+                not allow_retry
+                or exc.status not in {400, 422}
+                or not _has_thinking(payload)
+            ):
+                raise
+            self._thinking_unsupported.add(model_id)
+            logger.warning(
+                "Model %s rejected thinking parameters in a stream; "
+                "retrying without them",
+                model_id,
+            )
+            return await self._stream_attempt(
+                _without_thinking(payload), on_delta, model_id
+            )
 
     async def _stream_attempt(
         self,
@@ -1617,8 +1724,10 @@ class AIClient:
         model: str | None,
         temperature: float | None,
         max_tokens: int | None,
+        *,
+        public: bool = False,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "model": (spec := config.resolve_model(model)).get("model", spec["id"]),
             "messages": AIClient._with_style_hint(messages),
             "temperature": (
@@ -1628,6 +1737,9 @@ class AIClient:
                 config.default_max_tokens if max_tokens is None else max_tokens
             ),
         }
+        if public:
+            payload.update(thinking.payload_fields())
+        return payload
 
     @staticmethod
     def _with_style_hint(
