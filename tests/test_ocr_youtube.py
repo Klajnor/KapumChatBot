@@ -141,6 +141,21 @@ class PdfOcrTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await pdf_ocr.ocr_pdf(_blank_pdf(1)))
         self.assertIsNone(await pdf_ocr.ocr_pdf(b"not a pdf"))
 
+    async def test_selected_model_is_forwarded_to_ocr(self):
+        models = []
+
+        async def fake(prompt, image, messages, **kwargs):
+            models.append(kwargs.get("model"))
+            return ChatResult(content="page")
+
+        fake_client = SimpleNamespace(chat_with_image_result=AsyncMock(side_effect=fake))
+        with (
+            patch.object(pdf_ocr, "ai_client", fake_client),
+            patch.object(config, "pdf_ocr_max_pages", 1),
+        ):
+            await pdf_ocr.ocr_pdf(_blank_pdf(1), model="user-vision")
+        self.assertEqual(models, ["user-vision"])
+
 
 if __name__ == "__main__":
     unittest.main()

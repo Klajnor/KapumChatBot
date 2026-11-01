@@ -2017,8 +2017,9 @@ async def _handle_document(message: Message) -> None:
                     "🔍 <b>No text layer — this looks like a scan.</b> Reading up "
                     f"to {config.pdf_ocr_max_pages} page(s) with a vision model…",
                 )
+                settings = await service.get_user_settings(user.id)
                 try:
-                    ocr = await ocr_pdf(data)
+                    ocr = await ocr_pdf(data, model=settings["model"])
                 except PdfResourceLimit:
                     await refund_access(service, user.id, access)
                     await safe_answer(

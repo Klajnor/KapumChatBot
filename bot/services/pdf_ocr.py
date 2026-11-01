@@ -91,8 +91,12 @@ def _render_pages(
         return [], 0
 
 
-async def ocr_pdf(data: bytes) -> OcrResult | None:
-    """Transcribe the first pages of a scanned PDF; None when nothing was read."""
+async def ocr_pdf(data: bytes, *, model: str | None = None) -> OcrResult | None:
+    """Transcribe the first pages of a scanned PDF; None when nothing was read.
+
+    ``model`` is the user's selected model; ``chat_with_image_result`` still
+    filters it through ``VISION`` and falls back to a vision-capable model.
+    """
     images, total = await _run_parser(_render_pages, data, config.pdf_ocr_max_pages)
     if not images:
         return None
@@ -103,7 +107,12 @@ async def ocr_pdf(data: bytes) -> OcrResult | None:
         async with gate:
             try:
                 result = await ai_client.chat_with_image_result(
-                    _OCR_PROMPT, image, [], temperature=0, max_tokens=_OCR_MAX_TOKENS
+                    _OCR_PROMPT,
+                    image,
+                    [],
+                    temperature=0,
+                    max_tokens=_OCR_MAX_TOKENS,
+                    model=model,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad page must not sink the rest
                 logger.warning("OCR page failed: %s", exc)
