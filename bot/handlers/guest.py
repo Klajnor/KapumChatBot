@@ -52,7 +52,11 @@ from bot.services.telegram_utils import (
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
-from bot.services.untrusted import apply_untrusted_hint, wrap_untrusted
+from bot.services.untrusted import (
+    apply_untrusted_hint,
+    messages_have_untrusted_content,
+    wrap_untrusted,
+)
 from bot.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -430,6 +434,11 @@ async def _build_reply(
         photo_source = replied
     photo_foreign = _attachment_foreign(message, photo_source, caller_id)
     external = external or photo_foreign
+    # The stored history may already contain an untrusted document/page from
+    # an earlier summon. Re-check it every time: a clean current message must
+    # not re-enable the paid image tool for text that is still in context.
+    if messages_have_untrusted_content(base_messages):
+        external = True
     if external:
         apply_untrusted_hint(base_messages)
 

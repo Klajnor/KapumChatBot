@@ -117,6 +117,29 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
         model.intent.assert_not_awaited()
         svc.consume_photo_intent_budget.assert_not_awaited()
 
+    async def test_tainted_history_withholds_image_tool(self):
+        svc = service()
+        svc.get_history = AsyncMock(
+            return_value=[
+                {
+                    "role": "user",
+                    "content": wrap_untrusted("web", "earlier page text"),
+                }
+            ]
+        )
+        msg = message(text="@bot hello")
+        with (
+            common() as model,
+            patch.object(config, "enable_image_generation", True),
+            patch.object(config, "enable_link_analysis", False),
+        ):
+            await guest._build_reply(msg, svc, msg.from_user, 42)
+
+        model.tools.assert_not_awaited()
+        model.complete.assert_awaited_once()
+        messages = model.complete.await_args.kwargs["messages"]
+        self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+
     async def test_document_adds_hint_and_withholds_image_tool(self):
         svc = service()
         document = SimpleNamespace(
