@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -440,6 +441,31 @@ def _account_file() -> Path | None:
     return Path(name) if name else None
 
 
+def _write_account_file(path: Path, short_name: str, token: str) -> None:
+    """Atomically persist the Telegraph account with 0600 permissions.
+
+    A plain ``write_text`` exposes a partially written file and only chmods
+    it afterwards; the token must never be world-readable, even briefly.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"short_name": short_name, "access_token": token}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 async def ensure_account(*, force_new: bool = False) -> tuple[str, str] | None:
     """Return ``(short_name, access_token)`` for createPage, or ``None``.
 
@@ -498,14 +524,7 @@ async def ensure_account(*, force_new: bool = False) -> tuple[str, str] | None:
         _account_fail_until = 0.0
         if path is not None:
             try:
-                path.write_text(
-                    json.dumps({"short_name": short, "access_token": token}),
-                    encoding="utf-8",
-                )
-                try:
-                    path.chmod(0o600)  # the file holds a secret
-                except OSError:
-                    pass
+                _write_account_file(path, short, token)
             except OSError as exc:
                 logger.warning("Could not persist the Telegraph account: %s", exc)
         logger.info("Telegraph account ready (short_name=%s)", short)
