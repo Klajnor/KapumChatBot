@@ -10,7 +10,26 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+
+# Platform-specific secrets/config first, then the legacy ``.env`` fallback.
+# Linux servers keep ``.env.linux`` (absolute state paths); Windows tests use
+# ``.env.win`` when present and otherwise reuse the local ``.env``. Neither
+# platform file is tracked: both hold secrets.
+def _platform_env_files() -> tuple[str, ...]:
+    if os.name == "nt":
+        return (".env.win", ".env")
+    return (".env.linux", ".env")
+
+
+def _load_env_file() -> str | None:
+    for name in _platform_env_files():
+        if os.path.isfile(name):
+            load_dotenv(name, override=False)
+            return name
+    return None
+
+
+ENV_FILE = _load_env_file()
 
 
 def _env(*names: str, default: str = "") -> str:

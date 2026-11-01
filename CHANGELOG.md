@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-01
+- **Конфигурация по платформам: `.env.linux` и `.env.win`.** `bot/config.py` загружает `.env.linux` на Linux и `.env.win` на Windows, с fallback на `.env`. Оба файла git-ignored; `restart.sh` закрепляет `.env.linux` как `root:brain 640`. README, `.env.example`, AGENTS/CLAUDE и тесты обновлены.
+
+### 2026-11-01
 - **Статистика проекта обновляется автоматически.** `scripts/project_stats.py` считает файлы/строки/слова/символы по Git-отслеживаемым текстовым файлам; `PROJECT_STATS.md` пересчитывается хуком `.githooks/pre-commit` перед каждым коммитом. `.venv`, кэши, БД и локальные секреты не учитываются. После клонирования: `git config core.hooksPath .githooks`.
 
 ### 2026-11-01
@@ -195,6 +198,15 @@
 ---
 
 ## Подробные заметки
+
+### Платформенные env-файлы: 01.11.2026
+
+- `bot/config.py` выбирает `(env.win, .env)` на Windows и `(env.linux, .env)` на POSIX. Первый существующий файл загружается через `load_dotenv(..., override=False)`; переменные, уже заданные окружением (например, systemd `Environment=`), сохраняют приоритет.
+- `.env.linux` остаётся серверным (абсолютные `/var/lib/kapum-chatbot/...`), `.env.win` — локальным/тестовым; `.env` — общий fallback. Все три исключены из Git, `.env.win` добавлен в `.gitignore`.
+- `restart.sh` включает `.env.linux` в `CONFIG_FILES` и выставляет `root:brain 640`; `.env` также обрабатывается для старых установок.
+- `tests/test_config_paths.py`: порядок файлов, выбор платформенного файла вместо `.env`, fallback на `.env`.
+- Проверки: **676 passed, 1 skipped, 20 subtests passed**; Ruff и `git diff --check` без ошибок.
+- Ограничение: `.env.win` в репозитории отсутствует (создаётся локально по `.env.example`); на Windows без него используется `.env`.
 
 ### Статистика проекта: 01.11.2026
 

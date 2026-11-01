@@ -19,6 +19,7 @@ class RestartHardeningTests(unittest.TestCase):
     def test_configs_are_root_owned_but_group_readable(self):
         script = (ROOT / "restart.sh").read_text(encoding="utf-8")
         self.assertIn('CONFIG_OWNER="root:brain"', script)
+        self.assertIn('"$APP_DIR/.env.linux"', script)
         self.assertIn('chown "$CONFIG_OWNER" -- "$f"', script)
         self.assertIn('chmod 640 -- "$f"', script)
 

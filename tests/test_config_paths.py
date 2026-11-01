@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bot.config import Config
+import bot.config as bot_config
+from bot.config import (
+    Config,
+    _load_env_file,
+    _platform_env_files,
+)
 
 
 def _sqlite_url(path: Path) -> str:
@@ -41,6 +46,40 @@ class ConfigAbsolutePathTests(unittest.TestCase):
 
     def test_absolute_paths_are_accepted(self):
         self._validate()
+
+    def test_platform_env_file_order(self):
+        expected = (
+            (".env.win", ".env") if os.name == "nt" else (".env.linux", ".env")
+        )
+        self.assertEqual(_platform_env_files(), expected)
+
+    def test_platform_specific_env_file_wins(self):
+        specific = ".env.win" if os.name == "nt" else ".env.linux"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / specific).write_text("SPECIFIC=1", encoding="utf-8")
+            (root / ".env").write_text("BASE=1", encoding="utf-8")
+            previous = os.getcwd()
+            os.chdir(root)
+            try:
+                with patch.object(bot_config, "load_dotenv") as load:
+                    self.assertEqual(_load_env_file(), specific)
+            finally:
+                os.chdir(previous)
+        load.assert_called_once_with(specific, override=False)
+
+    def test_env_fallback_when_platform_file_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".env").write_text("BASE=1", encoding="utf-8")
+            previous = os.getcwd()
+            os.chdir(root)
+            try:
+                with patch.object(bot_config, "load_dotenv") as load:
+                    self.assertEqual(_load_env_file(), ".env")
+            finally:
+                os.chdir(previous)
+        load.assert_called_once_with(".env", override=False)
 
     def test_in_memory_sqlite_is_accepted(self):
         self._validate(DATABASE_URL="sqlite+aiosqlite://")

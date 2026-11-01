@@ -17,6 +17,7 @@ STATE_DIR="/var/lib/kapum-chatbot"   # StateDirectory сервиса: БД и т
 
 # Конфиги читает сервис, но менять их вправе только root.
 CONFIG_FILES=(
+    "$APP_DIR/.env.linux"
     "$APP_DIR/.env"
     "$APP_DIR/.mcp.json"
 )
