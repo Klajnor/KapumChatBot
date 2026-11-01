@@ -5,6 +5,13 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-01
+- **`/clear` очищает память.** Сбрасываются `_last_questions` и `_pending_enhance`, поэтому кнопка «Ask another model» не переотправляет удалённый вопрос, а отложенный выбор улучшения не хранит file_id/подпись.
+- **OCR использует выбранную модель.** `ocr_pdf` принимает `model` из настроек пользователя; text-only модель отфильтровывается через `model_chain`.
+- **ffmpeg без секретов.** Дочерний процесс получает только системный allowlist окружения; команда резолвится через `shutil.which`.
+- **Ограничено чтение ответов провайдера.** JSON — 8 МиБ, ошибки — 512 КиБ, строка SSE — 1 МиБ, поисковый ответ — 2 МиБ.
+- **Файл аккаунта Telegraph пишется атомарно** с правами 0600 через временный файл и `os.replace`.
+
+### 2026-11-01
 - **Безопасность: Telegraph не публикует приватный контекст.** `deliver_answer(..., allow_telegraph=False)` вызывается для ответов с документами/ссылками/форвардами/MCP (по маркеру `<untrusted_content>`), а также для анализа фото и альбома. Guest-mode передаёт `allow=not external`. Обычные ответы по-прежнему могут публиковаться при явном `TELEGRAPH_ENABLED=true`.
 
 ### 2026-11-01
@@ -182,6 +189,16 @@
 ---
 
 ## Подробные заметки
+
+### Пять низких находок: 01.11.2026
+
+- `/clear` теперь вызывает `chat.forget_chat_state`; `_last_questions` и `_pending_enhance` очищаются вместе с историей в БД. `tests/test_clear_state.py`.
+- `pdf_ocr.ocr_pdf(data, model=...)` передаёт выбранную пользователем модель в `chat_with_image_result`; `_handle_document` берёт её из настроек. `model_chain` не отправляет изображение text-only модели. Регрессия в `tests/test_ocr_youtube.py`.
+- `_transcode_audio` запускает `ffmpeg` с allowlist-окружением (`_ffmpeg_environment`), без `BOT_TOKEN`/`AI_API_KEY`/`DATABASE_URL`; команда резолвится через `shutil.which`. `tests/test_ffmpeg_env.py`.
+- `_read_response_text` ограничивает JSON 8 МиБ, ошибки 512 КиБ; `_sse_lines` — 1 МиБ на строку; search API — 2 МиБ. `tests/test_provider_limits.py`.
+- `_write_account_file` пишет токен Telegraph в `O_EXCL 0600` временный файл, делает fsync и `os.replace`; symlink заменяется, а не используется. `tests/test_telegraph_account_file.py`.
+- Проверки: **671 passed, 1 skipped, 20 subtests passed**; Ruff и `git diff --check` без ошибок. Пропущен symlink-тест на Windows (нет привилегий).
+- Ограничение: изменение поведения ffmpeg/PATH и атомарной записи на живом Linux/Telegram не проверялось.
 
 ### Telegraph и приватный контекст: 01.11.2026
 
