@@ -26,8 +26,9 @@ CacheDirectoryMode=0700
 Environment=MPLCONFIGDIR=/var/cache/kapum-chatbot/matplotlib
 # Запасной путь rembg для службы без домашнего каталога. STICKER_MODEL_DIR в .env имеет приоритет.
 Environment=U2NET_HOME=/var/lib/kapum-chatbot/rembg
-# При некоторых случаях разработчик может случайно скопировать кеш со своей машины, на всякий случай сотру его
-ExecStartPre=-/bin/bash /opt/KapumChatBot/scripts/clean_pycache.sh -p /opt/KapumChatBot/bot
+# Кэш байткода сервис не создаёт (PYTHONDONTWRITEBYTECODE=1). Старые
+# root-owned __pycache__ удаляет restart.sh от root; запускать чистку от brain
+# нельзя — код и кэш принадлежат root:root.
 ExecStart=/opt/KapumChatBot/.venv/bin/python -m bot.main
 Restart=always
 RestartSec=5s

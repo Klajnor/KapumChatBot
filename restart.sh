@@ -37,6 +37,9 @@ fi
 echo "Код $APP_DIR: root:root, без права записи для группы и остальных..."
 chown -R root:root "$APP_DIR"
 chmod -R go-w "$APP_DIR"
+# Старые __pycache__ могли остаться от предыдущих версий и принадлежат root.
+# Сервис работает с PYTHONDONTWRITEBYTECODE=1 и не должен пытаться их удалять.
+find "$APP_DIR" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
 
 echo "Конфиги: $CONFIG_OWNER 640..."
 for f in "${CONFIG_FILES[@]}"; do

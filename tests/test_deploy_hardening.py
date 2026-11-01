@@ -30,10 +30,17 @@ class RestartHardeningTests(unittest.TestCase):
         self.assertIn('chown "$OWNER" -- "$f"', script)
         self.assertIn('chmod 600 -- "$f"', script)
 
-    def test_readme_describes_the_actual_execstartpre(self):
+    def test_restart_removes_stale_root_owned_pycache(self):
+        script = (ROOT / "restart.sh").read_text(encoding="utf-8")
+        self.assertIn("__pycache__", script)
+        self.assertIn("rm -rf", script)
+
+    def test_no_pycache_cleanup_runs_as_the_service_user(self):
         unit = (ROOT / "chat_bot.service").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("ExecStartPre", unit)
-        self.assertIn("ExecStartPre", readme)
+        # root-owned code cannot be cleaned by brain; the unit must not try.
+        self.assertNotIn("ExecStartPre", unit)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", unit)
+        self.assertIn("clean_pycache", readme)
         self.assertIn("root:root", readme)
         self.assertIn("root:brain", readme)
