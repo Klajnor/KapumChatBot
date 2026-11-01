@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -73,9 +74,45 @@ async def _sse_lines(chunks: Any) -> AsyncIterator[str]:
         yield tail
 
 
+# Bounds for provider responses: a misbehaving endpoint must not be able to
+# materialise an arbitrarily large JSON/error body in the bot's memory.
+_MAX_PROVIDER_BODY = 8 * 1024 * 1024
+_MAX_PROVIDER_ERROR_BODY = 512 * 1024
+_MAX_SSE_BUFFER = 1 * 1024 * 1024
+
+
+async def _read_response_text(response: Any, limit: int) -> str:
+    """Read at most ``limit`` bytes of a provider response and decode them."""
+    data = await response.content.read(limit + 1)
+    if len(data) > limit:
+        data = data[:limit]
+    encoding = getattr(response, "charset", None) or "utf-8"
+    return data.decode(encoding, "replace")
+
+
 _TRANSCODE_TIMEOUT = 60
 _MAX_TRANSCODE_BYTES = 300 * 16_000 * 2 + 65_536  # пять минут PCM16 + WAV-заголовок
 _MAX_TRANSCODE_ERRORS = 65_536
+
+# ffmpeg is a native decoder for untrusted media: do not hand it the bot's
+# secrets (BOT_TOKEN, AI_API_KEY, DATABASE_URL, …) through the environment.
+_FFMPEG_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+})
+
+
+def _ffmpeg_environment() -> dict[str, str]:
+    """Environment for the ffmpeg child: system basics, never bot secrets."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _FFMPEG_ENV_ALLOWLIST
+    }
 
 
 async def _transcode_audio(audio: bytes, output_format: str) -> bytes | None:
@@ -94,8 +131,9 @@ async def _transcode_audio(audio: bytes, output_format: str) -> bytes | None:
         return bytes(result)
 
     try:
+        command = shutil.which("ffmpeg") or "ffmpeg"
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-nostdin", "-v", "error",
+            command, "-nostdin", "-v", "error",
             "-protocol_whitelist", "pipe",
             "-format_whitelist", "ogg,mp3,wav,mov,matroska,webm,aac,flac",
             "-i", "pipe:0", "-map", "0:a:0", "-vn", "-sn", "-dn",
@@ -105,6 +143,7 @@ async def _transcode_audio(audio: bytes, output_format: str) -> bytes | None:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_ffmpeg_environment(),
         )
 
         async def feed() -> None:
