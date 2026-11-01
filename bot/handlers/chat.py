@@ -1185,6 +1185,7 @@ async def deliver_answer(
     *,
     title_source: str | None = None,
     reply_markup: Any = None,
+    allow_telegraph: bool = True,
 ) -> bool:
     """Deliver an AI answer.
 
@@ -1193,7 +1194,8 @@ async def deliver_answer(
     rich messages are off or Telegram rejects the content, the old chain
     takes over: Telegraph link for what Telegram used to be unable to show,
     formula PNGs, and the MarkdownV2/HTML formatting fallback — so the
-    answer is never lost.
+    answer is never lost. ``allow_telegraph=False`` keeps answers that used
+    private documents/notes/images inside Telegram.
     """
     if config.rich_messages:
         if printer is not None and printer.message is not None:
@@ -1207,8 +1209,10 @@ async def deliver_answer(
 
     if config.render_formula_images:
         text = promote_complex_inline(text)
-    if config.enable_telegraph and needs_telegraph(
-        text, tables_as_images=config.render_formula_images
+    if (
+        allow_telegraph
+        and config.enable_telegraph
+        and needs_telegraph(text, tables_as_images=config.render_formula_images)
     ):
         url = await publish_answer(title_source or text, text)
         if url:
@@ -1626,6 +1630,9 @@ async def _answer_with_ai(
             footer,
             title_source=text,
             reply_markup=_retry_markup(message, saved.id if saved else None),
+            # Documents, fetched pages, quotes/forwards and MCP output are
+            # framed as untrusted; such answers must stay inside Telegram.
+            allow_telegraph=not messages_have_untrusted_content(messages),
         )
     elif (
         image_call is None
@@ -2307,6 +2314,8 @@ async def _handle_photo(
             footer,
             title_source=caption,
             reply_markup=export_markup,
+            # A photo analysis describes a private image.
+            allow_telegraph=False,
         )
 
         hint = guest_hint(access)
@@ -3131,7 +3140,15 @@ async def _process_album(
                 input_tokens=album_result.input_tokens,
                 output_tokens=album_result.output_tokens,
             )
-            await deliver_answer(message, None, response, footer, title_source=caption)
+            await deliver_answer(
+                message,
+                None,
+                response,
+                footer,
+                title_source=caption,
+                # Album analysis is private image content.
+                allow_telegraph=False,
+            )
 
         hint = guest_hint(access)
         if hint:

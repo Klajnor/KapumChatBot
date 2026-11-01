@@ -146,13 +146,17 @@ def _guest_hint(access: AccessResult) -> str:
 
 
 async def _maybe_telegraph_reply(
-    question: str, answer: str, footer: str
+    question: str, answer: str, footer: str, *, allow: bool = True
 ) -> GuestReply | None:
     """A guest query allows one short reply: links beat broken tables/formulas.
 
     Returns ``None`` when Telegraph is not needed or unavailable, so the
     caller sends the answer as a normal (truncated) text reply.
+    ``allow=False`` keeps answers based on documents/pages/forwards inside
+    Telegram instead of publishing them publicly.
     """
+    if not allow:
+        return None
     if config.rich_messages:
         # Rich guest answers render tables/formulas natively: no link needed.
         return None
@@ -567,7 +571,9 @@ async def _build_reply(
             input_tokens=vision.input_tokens,
             output_tokens=vision.output_tokens,
         )
-        telegraph_reply = await _maybe_telegraph_reply(text, response, footer)
+        telegraph_reply = await _maybe_telegraph_reply(
+            text, response, footer, allow=not external
+        )
         if telegraph_reply is not None:
             return telegraph_reply
         return GuestReply(text=with_timing(response + _guest_hint(access), footer))
@@ -630,7 +636,9 @@ async def _build_reply(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
-    telegraph_reply = await _maybe_telegraph_reply(text, result.content, footer)
+    telegraph_reply = await _maybe_telegraph_reply(
+        text, result.content, footer, allow=not external
+    )
     if telegraph_reply is not None:
         return telegraph_reply
     tail = "".join(f"\n\n{note}" for note in crawl_notes)

@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-01
+- **Безопасность: Telegraph не публикует приватный контекст.** `deliver_answer(..., allow_telegraph=False)` вызывается для ответов с документами/ссылками/форвардами/MCP (по маркеру `<untrusted_content>`), а также для анализа фото и альбома. Guest-mode передаёт `allow=not external`. Обычные ответы по-прежнему могут публиковаться при явном `TELEGRAPH_ENABLED=true`.
+
+### 2026-11-01
 - **Безопасность: админ-команды только в личке.** `/add_user`, `/remove_user`, `/list_users`, `/admin_stats`, `/reset_daily_usage`, `/broadcast` и `/mcp` проверяют `require_private_chat` до работы с БД. В группе они больше не печатают Telegram ID, имена, статистику и черновик рассылки.
 
 ### 2026-11-01
@@ -179,6 +182,14 @@
 ---
 
 ## Подробные заметки
+
+### Telegraph и приватный контекст: 01.11.2026
+
+- `deliver_answer` получил `allow_telegraph`; `_answer_with_ai` передаёт `not messages_have_untrusted_content(messages)`, поэтому документы, прочитанные страницы, цитаты/форварды, результаты поиска и MCP-заметки не публикуются. Анализ одиночного фото и альбома передаёт `allow_telegraph=False` явно.
+- `guest._maybe_telegraph_reply` принимает `allow`; оба вызова передают `not external`, включая taint из истории.
+- `tests/test_telegraph_privacy.py`: `deliver_answer` не вызывает `publish_answer` при запрете; guest-ответ с `allow=False` возвращает `None`. Расширены `test_untrusted_side_effects.py` проверкой флага для недоверенного и чистого запроса.
+- Проверки: **665 passed, 20 subtests passed**; Ruff и `git diff --check` без ошибок.
+- Ограничение: при явном `TELEGRAPH_ENABLED=true` обычный ответ без приватного контекста всё ещё публикуется — это осознанная opt-in функция.
 
 ### Админ-команды только в личке: 01.11.2026
 
