@@ -15,3 +15,4 @@ telegraph_account.json
 # Локальные веса rembg; в Git хранится только пустой каталог.
 /models/rembg/*
 !/models/rembg/.gitkeep
+/.env.linux
