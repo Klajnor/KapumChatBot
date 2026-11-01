@@ -99,7 +99,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         client = AIClient(api_key="secret-key")
         response = MagicMock()
         response.status = 200
-        response.text = AsyncMock(return_value='{"choices": []}')
+        response.charset = "utf-8"
+        response.content.read = AsyncMock(return_value=b'{"choices": []}')
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=response)
         session = MagicMock()
@@ -124,7 +125,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         client = AIClient(api_key="secret-key")
         response = MagicMock()
         response.status = 200
-        response.text = AsyncMock(return_value='{"choices": []}')
+        response.charset = "utf-8"
+        response.content.read = AsyncMock(return_value=b'{"choices": []}')
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=response)
         session = MagicMock()

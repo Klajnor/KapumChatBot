@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 PROVIDERS = ("tavily", "brave")
 
 # Snippets are trimmed so one search cannot flood the model's context.
+# A search provider response is JSON with short snippets; anything larger is
+# a broken endpoint (or a proxy page), not a result set.
+_MAX_SEARCH_BODY = 2 * 1024 * 1024
+
 _SNIPPET_CHARS = 700
 
 # Ограничиваем время, параллелизм и объём контекста глубокого чтения.
@@ -138,7 +142,11 @@ async def _request_json(
                 method, url, json=json_payload, params=params, headers=headers
             ) as resp,
         ):
-            body = await resp.text()
+            body_bytes = await resp.content.read(_MAX_SEARCH_BODY + 1)
+            if len(body_bytes) > _MAX_SEARCH_BODY:
+                logger.warning("Search API %s returned an oversized body", host)
+                return None
+            body = body_bytes.decode("utf-8", "replace")
             if resp.status != 200:
                 logger.warning(
                     "Search API %s returned HTTP %s: %s",

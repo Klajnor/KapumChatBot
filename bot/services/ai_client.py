@@ -64,6 +64,8 @@ async def _sse_lines(chunks: Any) -> AsyncIterator[str]:
     buffer = ""
     async for raw in chunks:
         buffer += raw.decode("utf-8", "replace")
+        if len(buffer) > _MAX_SSE_BUFFER:
+            raise AIStreamError("SSE line is too long")
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
@@ -618,7 +620,7 @@ class AIClient:
         try:
             session = await self._get_session()
             async with session.get(url, headers=self._auth_headers(api_key)) as resp:
-                body = await resp.text()
+                body = await _read_response_text(resp, _MAX_PROVIDER_BODY)
                 if resp.status != 200:
                     logger.warning(
                         "Model list unavailable (status %s): %s",
@@ -1093,7 +1095,9 @@ class AIClient:
                 target, json=payload, timeout=timeout, headers=headers
             ) as resp:
                 if resp.status != 200:
-                    body = await resp.text()
+                    body = await _read_response_text(
+                        resp, _MAX_PROVIDER_ERROR_BODY
+                    )
                     logger.error(
                         "AI stream error (status %s): %s", resp.status, body[:500]
                     )
@@ -1714,7 +1718,12 @@ class AIClient:
                 async with session.post(
                     target, json=payload, timeout=request_timeout, headers=headers
                 ) as resp:
-                    body = await resp.text()
+                    body = await _read_response_text(
+                        resp,
+                        _MAX_PROVIDER_BODY
+                        if resp.status == 200
+                        else _MAX_PROVIDER_ERROR_BODY,
+                    )
                     logger.info(
                         "AI API response id=%s attempt=%s status=%s elapsed=%.2fs",
                         request_id, attempt, resp.status, _elapsed(),
