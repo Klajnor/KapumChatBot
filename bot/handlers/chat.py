@@ -723,6 +723,17 @@ def _pop_pending_enhance(user_id: int) -> dict[str, Any] | None:
     return entry
 
 
+def forget_chat_state(chat_id: int, user_id: int) -> None:
+    """Drop in-memory conversation state for `/clear`.
+
+    History lives in the database, but the "ask another model" question and
+    the pending photo-enhance choice live in process memory; clearing only the
+    database would leave them reusable after the user asked for a fresh start.
+    """
+    _last_questions.pop(chat_id, None)
+    _pending_enhance.pop(user_id, None)
+
+
 def _retry_markup(message: Message, export_id: int | None = None) -> Any:
     """Inline keyboard under an answer: 📄/📝 export + re-ask (private only).
 

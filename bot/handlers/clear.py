@@ -36,6 +36,12 @@ async def cb_clear_confirm(callback: CallbackQuery) -> None:
     async with user_service() as service:
         await service.clear_history(chat.id, user_id=own_only)
 
+    # The database is not the only place with conversation state: the
+    # "ask another model" question and a pending enhance choice live in RAM.
+    from bot.handlers import chat as chat_handler
+
+    chat_handler.forget_chat_state(chat.id, callback.from_user.id)
+
     await safe_edit_text(
         callback.message,  # type: ignore[arg-type]
         "✅ <b>Conversation history cleared!</b>\n\n"
