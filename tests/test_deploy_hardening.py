@@ -34,6 +34,7 @@ class RestartHardeningTests(unittest.TestCase):
         script = (ROOT / "restart.sh").read_text(encoding="utf-8")
         self.assertIn("__pycache__", script)
         self.assertIn("rm -rf", script)
+        self.assertIn("systemctl daemon-reload", script)
 
     def test_no_pycache_cleanup_runs_as_the_service_user(self):
         unit = (ROOT / "chat_bot.service").read_text(encoding="utf-8")

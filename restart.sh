@@ -66,6 +66,7 @@ for f in "${DATA_GLOBS[@]}"; do
 done
 
 echo "Перезапуск $SERVICE..."
+systemctl daemon-reload
 systemctl restart "$SERVICE"
 systemctl --no-pager --lines=0 status "$SERVICE" || true
 

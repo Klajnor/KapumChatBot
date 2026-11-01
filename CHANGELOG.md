@@ -196,7 +196,7 @@
 ### Чистка __pycache__ при перезапуске: 01.11.2026
 
 - `chat_bot.service` больше не запускает `clean_pycache.sh` как `ExecStartPre`: юнит работает от `brain`, а `/opt/KapumChatBot` принадлежит `root:root`, поэтому `rm` возвращал `Permission denied` на каждом старте.
-- `PYTHONDONTWRITEBYTECODE=1` остаётся, новые `.pyc` не появляются. `restart.sh` после `chown -R root:root` удаляет старые `__pycache__` от root; это единственное место, где очистка имеет права.
+- `PYTHONDONTWRITEBYTECODE=1` остаётся, новые `.pyc` не появляются. `restart.sh` после `chown -R root:root` удаляет старые `__pycache__` от root; это единственное место, где очистка имеет права. Перед `systemctl restart` добавлен `daemon-reload`, чтобы новый юнит применился.
 - README объясняет, почему скрипт нельзя запускать из юнита и что вручную его запускают от root (или на своей копии проекта). `tests/test_deploy_hardening.py` проверяет отсутствие `ExecStartPre` и наличие очистки в `restart.sh`.
 - Проверки: **672 passed, 1 skipped, 20 subtests passed**; Ruff и `git diff --check` без ошибок.
 - Ограничение: живой systemd не запускался; на сервере нужно один раз выполнить `sudo ./restart.sh` (или `sudo rm -rf /opt/KapumChatBot/bot/handlers/__pycache__`).
