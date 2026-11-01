@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-01
+- **Статистика проекта обновляется автоматически.** `scripts/project_stats.py` считает файлы/строки/слова/символы по Git-отслеживаемым текстовым файлам; `PROJECT_STATS.md` пересчитывается хуком `.githooks/pre-commit` перед каждым коммитом. `.venv`, кэши, БД и локальные секреты не учитываются. После клонирования: `git config core.hooksPath .githooks`.
+
+### 2026-11-01
 - **Эксплуатация: убран `ExecStartPre` с чисткой `__pycache__`.** Сервис работает от `brain`, а код и старый кэш принадлежат `root:root`, поэтому `rm` падал с `Permission denied` при каждом перезапуске. `PYTHONDONTWRITEBYTECODE=1` уже запрещает новые `.pyc`; старые root-owned каталоги теперь удаляет `restart.sh` от root.
 
 ### 2026-11-01
@@ -192,6 +195,14 @@
 ---
 
 ## Подробные заметки
+
+### Статистика проекта: 01.11.2026
+
+- `scripts/project_stats.py` берёт `git ls-files`, оставляет текстовые расширения (`.py`, `.md`, `.txt`, `.toml`, `.sh`, `.service`, `.example`, …), декодирует UTF-8 и считает файлы, строки (`splitlines`), слова (`split`) и символы (Unicode code points). Группы: `bot/`, `tests/`, `scripts/`, документация/конфиги, итог.
+- `PROJECT_STATS.md` генерируется этим скриптом. Хук `.githooks/pre-commit` ищет Python в `.venv` (Linux/Windows), запускает `--write` и делает `git add PROJECT_STATS.md`; если Python не найден, коммит не блокируется, но печатается предупреждение.
+- После клонирования включить: `git config core.hooksPath .githooks`. Ручной запуск: `python scripts/project_stats.py --write`; без `--write` таблица печатается в stdout.
+- В подсчёт не входят `.venv`, `.git`, `__pycache__`, `.pytest_cache`, базы, `models/` и `PROJECT_STATS.md` (файл не считает сам себя).
+- Проверки: **673 passed, 1 skipped, 20 subtests passed**; Ruff и `git diff --check` без ошибок. `tests/test_project_stats.py` сравнивает `PROJECT_STATS.md` со свежим выводом скрипта.
 
 ### Чистка __pycache__ при перезапуске: 01.11.2026
 

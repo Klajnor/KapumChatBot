@@ -14,6 +14,7 @@ pip install pytest pytest-asyncio ruff   # dev-зависимости (в requir
 cp .env.example .env                     # минимум: BOT_TOKEN, AI_API_KEY, OWNER_IDS
 
 python -m bot.main                       # запуск бота (так же в chat_bot.service)
+python scripts/project_stats.py --write   # обновить PROJECT_STATS.md (то же делает pre-commit)
 
 ruff check bot/ tests/                   # линт (ruff.toml: target py312)
 pytest tests/ -v                         # все тесты
@@ -32,6 +33,7 @@ pytest tests/test_regressions.py::RegressionTests::test_name -v   # один т�
 - Новый параметр конфигурации → добавить в `bot/config.py` (Config dataclass), `.env.example` и таблицу в README. Их уже >100 — переменную легко добавить в одну из них и забыть про остальные.
 - Коммиты на русском, тема в subject (история использует и префиксы области — `chat:`, `db:`, `docs:` — и стиль `Тема: описание`, напр. «Саммари: …»). Каждую фичу коммитить с подробным описанием в теле; добавлять запись в `CHANGELOG.md` — датированный раздел в самом верху «История по коммитам» + развернутая заметка ниже в «Подробные заметки».
 - `CLAUDE.md` — зеркальная копия этого файла: менять синхронно.
+- `PROJECT_STATS.md` пересчитывается `scripts/project_stats.py`; хук `.githooks/pre-commit` обновляет его перед каждым коммитом. После клонирования включить: `git config core.hooksPath .githooks`.
 
 ## Архитектура
 

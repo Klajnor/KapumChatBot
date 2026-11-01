@@ -1,0 +1,30 @@
+#!/bin/sh
+# Refresh PROJECT_STATS.md before every commit so line/word/character counts
+# never go stale. The script only reads tracked text files.
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
+
+PYTHON=""
+for candidate in .venv/bin/python .venv/Scripts/python.exe python3 python; do
+    if [ -x "$candidate" ]; then
+        PYTHON="$candidate"
+        break
+    fi
+    if command -v "$candidate" >/dev/null 2>&1; then
+        PYTHON=$(command -v "$candidate")
+        break
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "project_stats: python not found; PROJECT_STATS.md not refreshed" >&2
+    exit 0
+fi
+
+if ! "$PYTHON" scripts/project_stats.py --write; then
+    echo "project_stats: refresh failed; commit continues" >&2
+    exit 0
+fi
+
+git add PROJECT_STATS.md 2>/dev/null || true
+exit 0

@@ -1618,7 +1618,29 @@ bot/
 scripts/                     # Служебные утилиты
 ├── clean_pycache.ps1        # Очистка __pycache__ (Windows, PowerShell)
 ├── clean_pycache.sh         # Очистка __pycache__ (Linux/macOS/Git Bash)
+├── project_stats.py         # Строки/слова/символы → PROJECT_STATS.md
 └── check_telegraph.py       # Диагностика доступности Telegraph с сервера
+```
+
+## 📊 Статистика проекта
+
+Файл [`PROJECT_STATS.md`](PROJECT_STATS.md) содержит количество файлов, строк,
+слов и символов по областям (код бота, тесты, скрипты, документация/конфиги).
+Считаются только текстовые файлы, отслеживаемые Git: `.venv`, кэши, БД и
+локальные секреты не входят.
+
+Информация обновляется **перед каждым коммитом** через версионируемый хук
+`.githooks/pre-commit`. После клонирования включите его один раз:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Вручную:
+
+```bash
+python scripts/project_stats.py --write
+python scripts/project_stats.py          # только показать таблицу
 ```
 
 ## 🧹 Очистка кэша `__pycache__`
