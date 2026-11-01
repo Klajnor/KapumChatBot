@@ -1343,6 +1343,25 @@ def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+# Tools that spend money or send content out of the bot. Untrusted text must
+# not be able to trigger them (the same gate guest-mode already applies).
+_UNTRUSTED_SIDE_EFFECT_TOOLS = frozenset(
+    {"generate_image", "generate_sticker", "send_files"}
+)
+
+
+def _without_untrusted_side_effects(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop paid/content-sending tools while untrusted content is in context."""
+    return [
+        tool
+        for tool in tools
+        if str((tool.get("function") or {}).get("name", ""))
+        not in _UNTRUSTED_SIDE_EFFECT_TOOLS
+    ]
+
+
 @stage("Waiting for model / streaming")
 async def _answer_with_ai(
     message: Message,
@@ -1429,10 +1448,12 @@ async def _answer_with_ai(
     async with waiting(message) as notifier:
         while True:
             # Third-party content (documents, fetched pages, quoted/forwarded
-            # messages, search results) must not drive the private-note tools.
-            # It can be present from the start (and persists in the stored
-            # history) or appear after a search round — re-check every round.
-            if messages_have_untrusted_content(messages):
+            # messages, search results) must not drive private-note, paid or
+            # file-sending tools. It can be present from the start (and
+            # persists in the stored history) or appear after a search round —
+            # re-check every round.
+            untrusted = messages_have_untrusted_content(messages)
+            if untrusted:
                 apply_untrusted_hint(messages)
                 if mcp_ready:
                     mcp_ready = False
@@ -1442,7 +1463,12 @@ async def _answer_with_ai(
                     )
             if mcp_ready:
                 apply_mcp_hint(messages)
-            tools_arg = (tools if mcp_ready else _without_mcp_tools(tools)) or None
+            available_tools = tools
+            if untrusted:
+                available_tools = _without_untrusted_side_effects(available_tools)
+            if not mcp_ready:
+                available_tools = _without_mcp_tools(available_tools)
+            tools_arg = available_tools or None
             if config.stream_responses:
                 printer = _StreamPrinter(message, notifier)
                 try:
