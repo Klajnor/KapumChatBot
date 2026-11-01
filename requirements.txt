@@ -3,7 +3,8 @@
 aiogram>=3.29
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
-# Optional: only needed when DATABASE_URL points at PostgreSQL.
+# Reserved for a possible future PostgreSQL backend; the supported database is
+# SQLite (aiosqlite) only. Nothing in the bot uses asyncpg today.
 asyncpg>=0.30
 aiohttp>=3.11
 python-dotenv>=1.0

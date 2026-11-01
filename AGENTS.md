@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents (Codex, Cursor, Copilot, Claude 
 
 ## Что это
 
-Telegram-бот на **aiogram 3.x (≥ 3.29, Python 3.12+)** поверх OpenAI-совместимого API Qwen (Alibaba Model Studio) и других провайдеров. БД — SQLite по умолчанию (`sqlite+aiosqlite`), опционально PostgreSQL. Документация, README, CHANGELOG и комментарии — на русском; пользовательские сообщения бота — на английском; промпты модели по умолчанию — на русском.
+Telegram-бот на **aiogram 3.x (≥ 3.29, Python 3.12+)** поверх OpenAI-совместимого API Qwen (Alibaba Model Studio) и других провайдеров. БД — **только SQLite** (`sqlite+aiosqlite`); PostgreSQL и другие СУБД — возможное будущее направление, сейчас не поддерживаются (исторические ветки диалектов в коде остаются заделом). Документация, README, CHANGELOG и комментарии — на русском; пользовательские сообщения бота — на английском; промпты модели по умолчанию — на русском.
 
 ## Команды
 
@@ -23,7 +23,7 @@ pytest tests/test_regressions.py::RegressionTests::test_name -v   # один т�
 
 - Тесты — в основном `unittest.IsolatedAsyncioTestCase` (запускаются через pytest). Разброс — `test_regressions.py` (регрессии), `test_database.py` (in-memory SQLite, без моков), `test_audit_fixes.py` (безопасность). Telegram-объекты подменяются `SimpleNamespace` / `unittest.mock`.
 - `ffmpeg` нужен для голосовых (не pip-пакет); `ENABLE_VOICE=false` отключает. На Windows зонеinfo нужен пакет `tzdata` (REMINDER_TIMEZONE).
-- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `check_telegraph.py`, `test_ws_asr.py` — отладка Telegraph и ASR; `migrate_to_sqlite.py` — перенос PostgreSQL → SQLite; `clean_pycache.*` — очистка кэша; `restart.sh` — деплой на сервер (`/opt/KapumChatBot`, systemd).
+- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `check_telegraph.py`, `test_ws_asr.py` — отладка Telegraph и ASR; `clean_pycache.*` — очистка кэша; `restart.sh` — деплой на сервер (`/opt/KapumChatBot`, systemd). Скрипта миграции PostgreSQL → SQLite больше нет: поддерживается только SQLite.
 
 ## Конвенции
 
@@ -41,7 +41,7 @@ pytest tests/test_regressions.py::RegressionTests::test_name -v   # один т�
 - `bot/bot.py` — инициализация Bot/Dispatcher и хелперы идентичности бота.
 - `bot/handlers/` — Telegram-обработчики. `chat.py` (~3000 строк) — ядро: текст/голос/фото/документы/альбомы, ссылки, tool-loop (поиск, картинки, стикеры, MCP), стриминг (`_StreamPrinter`), доставка ответа (`deliver_answer`), callback-и «спросить другую модель» и выбора способа улучшения фото. `guest.py` — guest chat mode (inline-запрос → ровно один `answerGuestQuery`, поэтому там нет индикатора, поиска и многоходовых циклов).
 - `bot/services/` — бизнес-логика. `ai_client.py` — единый `AIClient` (чат, SSE-стриминг, vision, ASR по WebSocket, генерация картинок через нативный DashScope API, замер времени/токенов, fallback-цепочка моделей). `user_service.py` + `access.py` + `limits.py` — уровни доступа (guest → user → admin → owner из `OWNER_IDS`), дневные и персональные лимиты, атомарное списание квоты с возвратом при отказе. `documents.py` — извлечение текста (PDF/DOCX/XLSX/PPTX, OCR сканов через vision в `pdf_ocr.py`), загрузка ссылок с SSRF-защитой и обходом страниц до 3 уровней (`LINK_CRAWL_*`). `search.py` — веб-поиск Tavily/Brave, `mcp.py` — stdio MCP-клиент («второй мозг»), `digest.py` — ежедневное саммари каналов/групп (модель и промпт хранятся в БД), `youtube.py` — субтитры через yt-dlp. `rich.py`/`markdown.py`/`telegraph.py`/`formulas.py`/`science.py` — цепочка форматирования ответа.
-- `bot/database/` — SQLAlchemy 2.0 async: `models.py`, `repository.py`, `session.py`. Миграций через Alembic нет: `init_db()` создаёт таблицы и применяет идемпотентные `ALTER TABLE` (отдельные ветки для SQLite и PostgreSQL) — новые колонки добавлять туда же.
+- `bot/database/` — SQLAlchemy 2.0 async: `models.py`, `repository.py`, `session.py`. Миграций через Alembic нет: `init_db()` создаёт таблицы и применяет идемпотентные `ALTER TABLE` (рабочая ветка — SQLite; PostgreSQL-ветки остались историческим заделом и не поддерживаются). Новые колонки добавлять туда же.
 - `bot/config.py` — единственный `Config` dataclass из env, глобальный объект `config`. Модели задаются слотами `MODEL_1..6_*` + `FALLBACK_MODEL_*` (у каждой свой URL/ключ/`VISION`); `ID` — внутренний id бота, провайдеру уходит `MODEL`. При запуске недоступные у провайдера модели скрываются из `/models`.
 
 Сквозные механизмы, которые видны только при чтении нескольких файлов:
