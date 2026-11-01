@@ -32,6 +32,7 @@ from bot.services import export as export_service
 from bot.services import reminders as reminder_service
 from bot.services.ai_client import (
     AIClient,
+    AIStreamError,
     ChatResult,
     ImageResult,
     ToolCall,
@@ -617,10 +618,38 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             # Unknown primary -> the default model, then what follows it.
             with patch.object(config, "default_model", "m2"):
                 self.assertEqual(client.model_chain("x"), ["m2", "m3", "f1", "f2"])
-            # Vision requests skip text-only models.
+            # Vision requests skip text-only models, including the primary one.
             self.assertEqual(
                 client.model_chain("m2", require_vision=True), ["m2", "f1"]
             )
+            self.assertEqual(
+                client.model_chain("m3", require_vision=True), ["f1"]
+            )
+            with (
+                patch.object(
+                    config,
+                    "ai_models",
+                    [{"id": "t1", "name": "T1", "vision": False}],
+                ),
+                patch.object(config, "ai_fallback_models", []),
+            ):
+                self.assertEqual(client.model_chain("t1", require_vision=True), [])
+
+    async def test_streaming_forwards_require_vision_to_model_chain(self):
+        client = AIClient(api_key="test-key")
+        with (
+            patch.object(client, "model_chain", return_value=[]) as chain,
+            self.assertRaises(AIStreamError),
+        ):
+            await client.stream_chat_completion([], require_vision=True)
+        chain.assert_called_once_with(None, require_vision=True)
+
+    async def test_chat_completion_forwards_require_vision_to_model_chain(self):
+        client = AIClient(api_key="test-key")
+        with patch.object(client, "model_chain", return_value=[]) as chain:
+            result = await client.chat_completion_result([], require_vision=True)
+        chain.assert_called_once_with(None, require_vision=True)
+        self.assertIsNone(result.content)
 
     async def test_chat_retries_with_next_model_on_quota(self):
         client = AIClient(api_key="test-key")

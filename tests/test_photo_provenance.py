@@ -157,6 +157,18 @@ class VisionHistoryTaintTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored, "[Image] what is this?")
         self.assertFalse(has_untrusted_content(stored))
 
+    async def test_streaming_vision_request_requires_vision_models(self):
+        message = photo_message(caption="what is this?")
+        svc = service()
+        stream = AsyncMock(return_value=self.vision)
+        with (
+            patch.object(chat, "_open_registered", AsyncMock(return_value=svc)),
+            patch.object(config, "stream_responses", True),
+            patch.object(chat.ai_client, "stream_chat_completion", stream),
+        ):
+            await chat._handle_photo(message)
+        self.assertTrue(stream.await_args.kwargs["require_vision"])
+
     async def test_reply_to_foreign_photo_taints_only_the_image(self):
         message = photo_message()
         svc = service()
@@ -190,15 +202,17 @@ class VisionHistoryTaintTests(unittest.IsolatedAsyncioTestCase):
         message = photo_message(forwarded=True, caption="summarize")
         message.media_group_id = "g1"
         svc = service()
+        album_call = AsyncMock(
+            return_value=ChatResult(content="Album description", elapsed=0.1)
+        )
         with (
             patch.object(chat, "_open_registered", AsyncMock(return_value=svc)),
-            patch.object(chat.ai_client, "chat_completion_result", AsyncMock(
-                return_value=ChatResult(content="Album description", elapsed=0.1)
-            )),
+            patch.object(chat.ai_client, "chat_completion_result", album_call),
             patch.object(chat, "detect_intent", AsyncMock()) as detect,
             patch.object(chat, "safe_answer", AsyncMock()),
         ):
             await chat._process_album(message, [("f1", b"image")])
+            self.assertTrue(album_call.await_args.kwargs["require_vision"])
         detect.assert_not_awaited()
         svc.consume_photo_intent_budget.assert_not_awaited()
         stored = svc.add_message.await_args_list[0].kwargs["content"]

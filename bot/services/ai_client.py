@@ -645,8 +645,10 @@ class AIClient:
         Starts with the requested model (an id without settings is replaced by
         the default model), then every catalog entry *after* it, and finally
         the ``FALLBACK_MODEL_*`` model. Models the provider does not list are
-        skipped, as are non-vision models when ``require_vision`` is set. The
-        requested model is always first so the caller's choice is honoured.
+        skipped. With ``require_vision`` every non-vision model is skipped,
+        **including the requested one**: an image must never be sent to a model
+        that cannot process it. An empty list means no vision-capable model is
+        configured; the caller must not send the image at all.
         """
         primary = config.resolve_model(model)["id"]
         catalog = [spec["id"] for spec in config.ai_models]
@@ -660,13 +662,16 @@ class AIClient:
         for model_id in candidates:
             if not model_id or model_id in chain:
                 continue
-            if model_id != primary:
-                if self._provider_has(config.resolve_model(model_id)) is False:
-                    continue
-                if require_vision and not is_vision_model(model_id):
-                    continue
+            if require_vision and not is_vision_model(model_id):
+                continue
+            if model_id != primary and self._provider_has(
+                config.resolve_model(model_id)
+            ) is False:
+                continue
             chain.append(model_id)
-        return chain or [primary]
+        if chain:
+            return chain
+        return [] if require_vision else [primary]
 
     # --- Chat completions --------------------------------------------------
 
@@ -689,14 +694,18 @@ class AIClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        *,
+        require_vision: bool = False,
     ) -> ChatResult:
         """Chat completion returning the text plus timing and token usage.
 
         When a model does not answer (API error, quota exhausted, empty
         reply), the next model in :meth:`model_chain` is tried automatically.
+        ``require_vision`` is for multimodal messages: it keeps the request
+        away from models whose ``VISION`` flag is off.
         """
         started = time.monotonic()
-        for attempt_model in self.model_chain(model):
+        for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages, attempt_model, temperature, max_tokens
             )
@@ -881,6 +890,7 @@ class AIClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         on_delta: Any = None,
+        require_vision: bool = False,
     ) -> ChatResult:
         """Streaming chat completion over SSE.
 
@@ -889,10 +899,12 @@ class AIClient:
         fails is skipped in favour of the next one from :meth:`model_chain`;
         when every model failed, :class:`AIStreamError` is raised and the
         caller should fall back to a regular single-shot request.
+        ``require_vision`` keeps multimodal messages away from text-only
+        models; it is passed straight to :meth:`model_chain`.
         """
         started = time.monotonic()
         last_error: AIStreamError | None = None
-        for attempt_model in self.model_chain(model):
+        for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages, attempt_model, temperature, max_tokens
             )

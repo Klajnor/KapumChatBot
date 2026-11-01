@@ -2186,6 +2186,7 @@ async def _handle_photo(
                         temperature=settings["temperature"],
                         max_tokens=settings["max_tokens"],
                         on_delta=printer.on_delta,
+                        require_vision=True,
                     )
                 except AIStreamError as exc:
                     logger.warning(
@@ -3025,6 +3026,7 @@ async def _process_album(
                     model=settings["model"],
                     temperature=settings["temperature"],
                     max_tokens=settings["max_tokens"],
+                    require_vision=True,
                 )
             response = album_result.content or ""
 

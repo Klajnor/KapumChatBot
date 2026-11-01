@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-01
+- **Безопасность: vision-запросы не уходят моделям без `VISION`.** `model_chain(require_vision=True)` теперь фильтрует и запрошенную модель; `stream_chat_completion` и анализ альбома получили этот флаг, а `chat_completion_result` принимает `require_vision`. Если vision-моделей нет, изображение не отправляется вовсе. Устранена передача личных фото/сканов text-only модели и, при разных `MODEL_n_URL`, другому провайдеру.
+
+### 2026-11-01
 - **Безопасность: все пути конфигурации абсолютные.** `Config.validate()` отклоняет относительные `DATABASE_URL` (SQLite), `STICKER_MODEL_DIR`, `TELEGRAPH_ACCOUNT_FILE` и `MCP_CONFIG_FILE` до старта, показывая все проблемные значения сразу. `.env.example`, `chat_bot.service` и README переведены на `/var/lib/kapum-chatbot/...`; запасной `U2NET_HOME` синхронизирован. Добавлены 9 регрессий (`tests/test_config_paths.py`). Относительные пути больше не могут незаметно указывать в root-owned каталог кода.
 
 ### 2026-11-01
@@ -164,6 +167,15 @@
 ---
 
 ## Подробные заметки
+
+### Vision-маршрутизация: 01.11.2026
+
+- `AIClient.model_chain(..., require_vision=True)` больше не оставляет запрошенную модель в цепочке, если у неё `VISION=false`; при отсутствии vision-моделей возвращается пустой список.
+- `stream_chat_completion` принимает `require_vision` и передаёт его в `model_chain`; обработчик одиночного фото вызывает стриминг с `require_vision=True`.
+- Анализ альбома вызывает `chat_completion_result(..., require_vision=True)`; у самого метода появился этот keyword, поэтому мультимодальные сообщения не попадают в text-only модель.
+- OCR использует `chat_with_image_result` (уже с `require_vision=True`), поэтому при text-only `DEFAULT_MODEL` первый запрос с изображением больше не отправляется.
+- Тесты: `model_chain` с не-vision primary и без vision-моделей, передача флага из `stream_chat_completion`/`chat_completion_result`, стриминг фото и альбом. Проверки: **653 passed, 13 subtests passed**; Ruff и `git diff --check` без ошибок.
+- Ограничение: провайдеры вживую не проверялись; выбор пользователя для OCR по-прежнему игнорируется (отдельная низкая находка).
 
 ### Только SQLite; скрипт миграции удалён: 01.11.2026
 
