@@ -21,7 +21,11 @@ from bot.bot import bot
 from bot.config import config
 from bot.services.mcp import mcp_manager
 from bot.services.operations import set_stage, tracked
-from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
+from bot.services.telegram_utils import (
+    require_private_chat,
+    safe_answer_callback,
+    safe_edit_text,
+)
 from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
@@ -128,6 +132,9 @@ async def cmd_add_user(message: Message) -> None:
     user = message.from_user
     if user is None:
         return
+    # The confirmation prints the target's ID and profile.
+    if not await require_private_chat(message, what="/add_user"):
+        return
 
     text = message.text or ""
     parts = text.split(maxsplit=1)
@@ -182,6 +189,8 @@ async def cmd_add_user(message: Message) -> None:
 @_admin_required
 async def cmd_remove_user(message: Message) -> None:
     """Handle /remove_user &lt;id|@username&gt; — revoke a user's access."""
+    if not await require_private_chat(message, what="/remove_user"):
+        return
     text = message.text or ""
     parts = text.split(maxsplit=1)
 
@@ -228,6 +237,8 @@ async def cmd_remove_user(message: Message) -> None:
 @_admin_required
 async def cmd_list_users(message: Message) -> None:
     """Handle /list_users — list all allowed users with their info."""
+    if not await require_private_chat(message, what="/list_users"):
+        return
     text = message.text or ""
     parts = text.split()
     page = 0
@@ -297,6 +308,8 @@ async def cmd_list_users(message: Message) -> None:
 @_admin_required
 async def cmd_admin_stats(message: Message) -> None:
     """Handle /admin_stats — show usage statistics for last 14 days."""
+    if not await require_private_chat(message, what="/admin_stats"):
+        return
     async with user_service() as service:
         stats_data = await service.get_usage_stats_last_14_days()
 
@@ -350,6 +363,8 @@ async def cmd_mcp(message: Message) -> None:
     Owners only (``OWNER_IDS``): the servers expose the owner's private notes,
     and the status call may start the server processes.
     """
+    if not await require_private_chat(message, what="/mcp"):
+        return
     user = message.from_user
     if user is None or not config.is_owner(user.id):
         await message.answer(
@@ -408,6 +423,8 @@ async def cmd_mcp(message: Message) -> None:
 @_admin_required
 async def cmd_reset_daily_usage(message: Message) -> None:
     """Handle /reset_daily_usage &lt;id&gt; — reset daily usage for a user."""
+    if not await require_private_chat(message, what="/reset_daily_usage"):
+        return
     text = message.text or ""
     parts = text.split(maxsplit=1)
 
@@ -470,6 +487,8 @@ async def cmd_broadcast(message: Message) -> None:
     """
     user = message.from_user
     if user is None:
+        return
+    if not await require_private_chat(message, what="/broadcast"):
         return
 
     parts = (message.text or "").split(maxsplit=1)

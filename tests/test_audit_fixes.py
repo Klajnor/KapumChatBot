@@ -95,6 +95,7 @@ class BroadcastAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_overlong_announcement_is_rejected(self):
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(type="private"),
             text="/broadcast " + "x" * (admin._MAX_BROADCAST_LENGTH + 1),
             reply_to_message=None,
             answer=AsyncMock(),
@@ -846,6 +847,32 @@ class GroupPrivacyTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(module, "user_service") as service,
                 ):
                     await getattr(module, handler_name)(message)
+                guard.assert_awaited_once()
+                service.assert_not_called()
+
+    async def test_admin_commands_are_private_only(self):
+        cases = (
+            "cmd_add_user",
+            "cmd_remove_user",
+            "cmd_list_users",
+            "cmd_admin_stats",
+            "cmd_mcp",
+            "cmd_reset_daily_usage",
+            "cmd_broadcast",
+        )
+        for handler_name in cases:
+            with self.subTest(handler=handler_name):
+                message = self._group_message()
+                with (
+                    patch.object(config, "owner_ids", [1]),
+                    patch.object(
+                        admin,
+                        "require_private_chat",
+                        AsyncMock(return_value=False),
+                    ) as guard,
+                    patch.object(admin, "user_service") as service,
+                ):
+                    await getattr(admin, handler_name)(message)
                 guard.assert_awaited_once()
                 service.assert_not_called()
 
