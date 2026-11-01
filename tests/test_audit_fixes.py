@@ -18,6 +18,7 @@ import os
 import unittest
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -358,7 +359,20 @@ class RenamedEnvTests(unittest.TestCase):
             self.assertTrue(Config().mcp_owner_only)
 
     def test_legacy_name_logs_a_deprecation_warning(self):
-        with patch.dict(os.environ, {"OWNER_IDS": "", "ADMIN_IDS": "3"}):
+        absolute = Path.cwd()
+        with patch.dict(
+            os.environ,
+            {
+                "OWNER_IDS": "",
+                "ADMIN_IDS": "3",
+                "DATABASE_URL": (
+                    f"sqlite+aiosqlite:///{(absolute / 'chat_bot-test.db').as_posix()}"
+                ),
+                "STICKER_MODEL_DIR": str(absolute / "rembg-test"),
+                "TELEGRAPH_ACCOUNT_FILE": str(absolute / "telegraph-test.json"),
+                "MCP_CONFIG_FILE": "",
+            },
+        ):
             cfg = Config()
             with self.assertLogs("bot.config", level="WARNING") as logs:
                 cfg.validate()

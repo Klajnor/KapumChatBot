@@ -57,6 +57,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y", "да"}
 
 
+def _absolute_path(value: str) -> bool:
+    """True when a non-empty configurable path is absolute.
+
+    ``~``/``$VAR`` are expanded first: a path that only becomes absolute after
+    expansion (``~/models``) is still an absolute *location* and is accepted by
+    ``configure_model_cache``. A value that stays relative is rejected at
+    startup instead of being resolved against a read-only working directory.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(value))
+    return bool(expanded) and os.path.isabs(expanded)
+
+
 # Number of selectable model slots (MODEL_1_* ... MODEL_6_*) in .env.
 MODEL_SLOTS = 6
 
@@ -1365,7 +1377,14 @@ class Config:
         return telegram_id in self.owner_ids or telegram_id in self.extra_admin_ids
 
     def validate(self) -> None:
-        """Validate that required config values are present."""
+        """Validate required config values and absolute filesystem paths.
+
+        Every configurable path must be absolute: the service runs from a
+        read-only code tree, so a relative SQLite/Telegraph/rembg path would
+        resolve inside ``/opt/...`` and fail (or write data next to the code).
+        Relative values are rejected at startup instead of being silently
+        resolved against the current working directory.
+        """
         log = logging.getLogger(__name__)
         for old, new in _RENAMED_ENV.items():
             if os.getenv(old, "").strip() and not os.getenv(new, "").strip():
@@ -1387,6 +1406,48 @@ class Config:
                 + ", ".join(missing)
                 + ". Check your .env file."
             )
+
+        path_errors = self._relative_path_errors()
+        if path_errors:
+            raise ValueError(
+                "Configuration paths must be absolute (relative paths are "
+                "rejected because the service's working directory is "
+                "read-only). Use the writable state directory, e.g. "
+                "/var/lib/kapum-chatbot/:\n- " + "\n- ".join(path_errors)
+            )
+
+    def _relative_path_errors(self) -> list[str]:
+        """Human-readable errors for configurable paths that are not absolute."""
+        errors: list[str] = []
+        if self.database_url.startswith("sqlite"):
+            try:
+                from sqlalchemy.engine import make_url
+
+                database = make_url(self.database_url).database
+            except Exception:  # noqa: BLE001 - report instead of crashing blindly
+                errors.append("DATABASE_URL is not a valid SQLAlchemy URL")
+            else:
+                if (
+                    database
+                    and database != ":memory:"
+                    and not os.path.isabs(database)
+                ):
+                    errors.append(
+                        "DATABASE_URL points to a relative SQLite file "
+                        f"({database!r}); use four slashes and an absolute "
+                        "path, e.g. "
+                        "sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db"
+                    )
+        for name, value in (
+            ("STICKER_MODEL_DIR", self.sticker_model_dir),
+            ("TELEGRAPH_ACCOUNT_FILE", self.telegraph_account_file),
+            ("MCP_CONFIG_FILE", self.mcp_config_file),
+        ):
+            if value and not _absolute_path(value):
+                errors.append(
+                    f"{name} must be an absolute path (got {value!r})"
+                )
+        return errors
 
 
 config = Config()
