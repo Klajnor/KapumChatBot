@@ -242,6 +242,31 @@ def _album_key(chat_id: int, group_id: str) -> str:
     return f"{chat_id}:{group_id}"
 
 
+async def _album_access_allowed(user_id: int) -> tuple[bool, str | None]:
+    """Check authorization before an album photo is downloaded.
+
+    Album collection runs before ``_process_album`` consumes quota, so without
+    this gate a blocked/denied user could make the bot download up to ten
+    photos per media group. Guests are allowed only after they have a real
+    user row (otherwise the free-trial counter cannot be charged).
+    """
+    if user_id <= 0:
+        return False, None
+    session = async_session_factory()
+    try:
+        service = UserService(session)
+        access = await check_access(service, user_id, consume=False)
+        if not access.allowed:
+            return False, access.message
+        if access.role == "guest":
+            row = await service.user_repo.get_user(user_id)
+            if row is None:
+                return False, access.message
+        return True, None
+    finally:
+        await session.close()
+
+
 # --- Addressing helpers ----------------------------------------------------
 
 
@@ -1861,6 +1886,10 @@ async def handle_photo(message: Message) -> None:
     """Photos: route to album (media group), vision analysis, or generation."""
     # Media groups (albums) are collected and processed together.
     if message.media_group_id:
+        # Do not even start collecting a group photo the bot was not asked
+        # about: collection downloads bytes before any access check.
+        if not _is_addressed(message):
+            return
         await _handle_album_photo(message)
         return
     await _guarded(message, _route_single_photo)
@@ -2666,6 +2695,32 @@ async def _handle_album_photo(message: Message) -> None:
     now = time.monotonic()
     sender = getattr(message, "from_user", None)
     sender_id = sender.id if sender is not None else 0
+
+    # Authorization comes before any download. A denied album still gets one
+    # explanation after collection, but no bytes are fetched.
+    allowed, denial = await _album_access_allowed(sender_id)
+    if not allowed:
+        async with _album_lock:
+            existing = _album_images.get(key)
+            if existing is not None:
+                if existing.get("denied"):
+                    existing["last"] = now
+                return
+            _album_images[key] = {
+                "denied": True,
+                "images": [],
+                "message": message,
+                "last": now,
+                "user_id": sender_id,
+            }
+        await asyncio.sleep(_ALBUM_COLLECT_SECONDS)
+        async with _album_lock:
+            _album_images.pop(key, None)
+            _album_total_bytes.pop(key, None)
+            _album_download_bytes.pop(key, None)
+        if denial:
+            await safe_answer(message, denial)
+        return
 
     declared = max(0, photo.file_size or 0)
     # Неизвестный размер требует максимального резерва. При заниженном размере

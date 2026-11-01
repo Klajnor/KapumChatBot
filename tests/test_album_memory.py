@@ -23,6 +23,11 @@ class AlbumMemoryTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(patch.object(chat.config, "max_photo_bytes", 10))
         stack.enter_context(patch.object(chat.config, "max_album_bytes", 30))
         self.answer = stack.enter_context(patch.object(chat, "safe_answer", AsyncMock()))
+        stack.enter_context(
+            patch.object(
+                chat, "_album_access_allowed", AsyncMock(return_value=(True, None))
+            )
+        )
         self.guarded = stack.enter_context(patch.object(chat, "_guarded", AsyncMock()))
         self.bot = SimpleNamespace(
             get_file=AsyncMock(return_value=SimpleNamespace(file_path="photo")),

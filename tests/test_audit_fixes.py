@@ -115,6 +115,11 @@ class AlbumSizeGuardTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         chat._album_images.clear()
         chat._album_total_bytes.clear()
+        access = patch.object(
+            chat, "_album_access_allowed", AsyncMock(return_value=(True, None))
+        )
+        access.start()
+        self.addCleanup(access.stop)
 
     def tearDown(self) -> None:
         chat._album_images.clear()
