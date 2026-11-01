@@ -6,6 +6,14 @@
 #
 # Использование (на сервере):
 #   sudo ./restart.sh
+#
+# Не запускайте через `source`/`.`: скрипт меняет set -e и не должен
+# переопределять trap/exit интерактивной оболочки (Ctrl+C закрывал SSH-сессию).
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    echo "Ошибка: запускайте ./restart.sh как отдельный процесс, не через source/." >&2
+    return 1
+fi
 
 set -euo pipefail
 
@@ -71,9 +79,5 @@ systemctl daemon-reload
 systemctl restart "$SERVICE"
 systemctl --no-pager --lines=0 status "$SERVICE" || true
 
-echo "Лог (Ctrl+C для выхода):"
-# Без exec: иначе при запуске через `source`/`. restart.sh` он заменяет
-# оболочку терминала, и Ctrl+C закрывает сессию. Ctrl+C гасит только
-# journalctl, скрипт завершается штатно с кодом 0.
-trap 'echo; echo "Выход из лога."; exit 0' INT TERM
+echo "Лог (Ctrl+C останавливает только журнал и возвращает в консоль):"
 journalctl -u "$SERVICE" -f || true

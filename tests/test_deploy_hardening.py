@@ -37,6 +37,15 @@ class RestartHardeningTests(unittest.TestCase):
         self.assertIn("rm -rf", script)
         self.assertIn("systemctl daemon-reload", script)
 
+    def test_restart_does_not_change_the_callers_shell(self):
+        script = (ROOT / "restart.sh").read_text(encoding="utf-8")
+        # Sourcing the script used to override INT/TERM with exit 0: Ctrl+C
+        # closed the SSH session. It must be run as a separate process.
+        self.assertNotIn("trap ", script)
+        self.assertNotIn("exit 0", script)
+        self.assertIn("BASH_SOURCE[0]", script)
+        self.assertIn("journalctl", script)
+
     def test_no_pycache_cleanup_runs_as_the_service_user(self):
         unit = (ROOT / "chat_bot.service").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
