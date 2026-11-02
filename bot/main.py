@@ -9,7 +9,14 @@ from aiogram.types import (
     InputTextMessageContent,
 )
 
-from bot.bot import bot, dp, setup_bot
+from bot.bot import (
+    RETRY_INITIAL_DELAY,
+    RETRYABLE_TELEGRAM_ERRORS,
+    bot,
+    dp,
+    next_retry_delay,
+    setup_bot,
+)
 from bot.config import config
 from bot.database.session import engine, init_db
 
@@ -98,6 +105,17 @@ async def on_unhandled_error(event: ErrorEvent) -> None:
     simply never gets a reply.
     """
     update = event.update
+    if isinstance(event.exception, RETRYABLE_TELEGRAM_ERRORS):
+        # Telegram is unreachable: the user cannot be reached either, and
+        # trying to send an explanation would only block the handler for one
+        # more request timeout.
+        logger.warning(
+            "Telegram is unreachable while handling update %s: %s",
+            getattr(update, "update_id", "?"),
+            event.exception,
+        )
+        return
+
     logger.error(
         "Unhandled error while processing update %s: %r",
         getattr(update, "update_id", "?"),
@@ -132,6 +150,35 @@ async def on_unhandled_error(event: ErrorEvent) -> None:
         await message.answer(ERROR_REPLY)
     except Exception as exc:  # noqa: BLE001 - notifying must never raise again
         logger.warning("Could not notify the user about the error: %s", exc)
+
+
+async def _poll_forever() -> None:
+    """Run polling until shutdown, surviving transient Telegram failures.
+
+    aiogram retries failed ``getUpdates`` calls itself, but its polling task
+    first calls ``getMe`` and runs startup callbacks outside that protection.
+    A single request timeout there used to propagate out of ``start_polling``
+    and terminate the process, so the whole loop is retried here. A normal
+    return means a shutdown signal, not a failure.
+    """
+    delay = RETRY_INITIAL_DELAY
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                close_bot_session=False,
+            )
+            return
+        except RETRYABLE_TELEGRAM_ERRORS as exc:
+            logger.warning(
+                "Polling stopped by a transient Telegram error (%s); "
+                "restarting in %.0f s",
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = next_retry_delay(delay)
 
 
 async def main() -> None:
@@ -220,7 +267,7 @@ async def main() -> None:
             config.enable_guest_mode,
         )
 
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await _poll_forever()
     finally:
         for task in (cleanup_task, reminder_task, digest_task):
             if task is not None:
