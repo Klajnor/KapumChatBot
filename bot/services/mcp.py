@@ -339,13 +339,24 @@ def _note_error_reason(result: Any) -> str:
     for patterns, reason in reasons:
         if any(pattern in text for pattern in patterns):
             return reason
-    stage = re.search(r"ошибка git \(([a-z0-9-]+)\)", text)
+    stage = re.search(r"stage=(file|index|git|validate|internal)(?::\s*([a-z_][a-z0-9_]*))?", text)
     if stage:
-        # Имя стадии — фиксированный код из git_publish, не текст ошибки.
+        name, exc_type = stage.group(1), stage.group(2) or "unknown"
+        if name == "validate":
+            return "некорректные данные записи или конфликт request_id; заметка не изменена"
+        if name == "internal":
+            return f"внутренняя ошибка MCP-сервера ({exc_type}); проверьте его журнал"
+        # Имя стадии — фиксированный код из capture/git_publish, не текст ошибки.
         return (
-            f"сбой Git на стадии {stage.group(1)}; проверьте, что VAULT_PATH указывает "
-            "на корень Git-клона, ветка не detached и у пользователя MCP-сервера есть "
-            "права на файл, индекс и .git"
+            f"сбой на стадии {name} ({exc_type}); проверьте права на файл, индекс, "
+            ".git и данные SQLite, затем повторите"
+        )
+    git_stage = re.search(r"ошибка git \(([a-z0-9-]+)\)", text)
+    if git_stage:
+        # Старый формат git_publish до появления stage=.
+        return (
+            f"сбой Git на стадии {git_stage.group(1)}; проверьте, что VAULT_PATH "
+            "указывает на корень Git-клона, ветка не detached и есть права на .git"
         )
     return "неизвестная ошибка MCP-сервера; проверьте его журнал (исходный ответ скрыт во избежание утечки данных)"
 
@@ -566,7 +577,15 @@ class MCPClient:
             except (ValueError, TypeError):
                 confirmation = None
         if not isinstance(confirmation, dict) or confirmation.get("git_pushed") is not True:
-            raise MCPError("MCP-сервер не подтвердил публикацию заметки в Git; обновите ObsidianBrain")
+            error = confirmation.get("error") if isinstance(confirmation, dict) else None
+            if isinstance(error, str) and error:
+                raise MCPError(
+                    f"Не удалось создать заметку: "
+                    f"{_note_error_reason({'content': [{'type': 'text', 'text': error}]})}"
+                )
+            raise MCPError(
+                "MCP-сервер не подтвердил публикацию заметки в Git; обновите ObsidianBrain"
+            )
         return text
 
     async def close(self) -> None:

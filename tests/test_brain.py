@@ -181,6 +181,24 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не запущен", diagnostic)
         self.assertNotIn("/secret/python", diagnostic)
 
+    async def test_structured_server_error_is_classified(self) -> None:
+        client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
+        for error, expected in [
+            ("stage=index: OperationalError", "сбой индексации SQLite"),
+            ("stage=internal: PermissionError", "внутренняя ошибка MCP-сервера (permissionerror)"),
+            ("stage=validate: ValueError", "некорректные данные"),
+        ]:
+            with (
+                self.subTest(expected=expected),
+                patch.object(client, "start", new_callable=AsyncMock),
+                patch.object(client, "_request", new_callable=AsyncMock, return_value={
+                    "content": [], "structuredContent": {"git_pushed": False, "error": error},
+                }),
+                self.assertRaises(MCPError) as caught,
+            ):
+                await client.create_note("fact", "id")
+            self.assertIn(expected, str(caught.exception))
+
     async def test_create_note_requires_git_push_confirmation(self) -> None:
         client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
         for payload, success in [
