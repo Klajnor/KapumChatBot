@@ -120,6 +120,12 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
             ("Ошибка Git (rev-parse): https://user:secret-token@host", "стадии rev-parse"),
             ("Command '['git']' returned non-zero exit status 128", "обновите ObsidianBrain"),
             ("sqlite3.OperationalError: unable to open database file", "SQLite-индекс"),
+            ("sqlite3.IntegrityError: UNIQUE constraint failed: notes.path", "параллельно"),
+            ("stage=index: OperationalError", "сбой индексации SQLite"),
+            ("stage=file: PermissionError", "создать файл"),
+            ("stage=git: RuntimeError", "сбой Git"),
+            ("sqlite3.OperationalError: no such table: notes", "схема SQLite"),
+            ("sqlite3.OperationalError: database or disk is full", "нет места"),
             ("fatal: cannot lock ref 'refs/heads/master'", "Git занят"),
             ("Unknown problem secret-token /secret/vault", "неизвестная ошибка"),
         ]
