@@ -139,6 +139,17 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("/secret/vault", diagnostic)
             self.assertNotIn("private note content", diagnostic)
 
+    async def test_save_shows_safe_mcp_reason(self) -> None:
+        with (
+            patch.object(brain.mcp_manager, "save_note", new_callable=AsyncMock,
+                         side_effect=MCPError("Не удалось создать заметку: ветка отстаёт")),
+            patch.object(brain, "safe_answer", new_callable=AsyncMock) as answer,
+        ):
+            self.assertFalse(await brain._save(message(), 42, "text", "id"))
+        body = answer.call_args.args[1]
+        self.assertIn("ветка отстаёт", body)
+        self.assertNotIn("Traceback", body)
+
     async def test_transport_error_is_sanitized_for_create_note(self) -> None:
         client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
         with (

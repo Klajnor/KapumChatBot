@@ -1019,8 +1019,10 @@ SQLite/FTS5 и предоставляет инструменты `search_notes`,
 выключена, права, Git identity/upstream, DNS, аутентификация, fetch/push или
 расхождение веток), без исходного ответа MCP и Git stderr с возможными секретами.
 
-Если категория всё ещё «неизвестная ошибка» или нужна профилактическая проверка,
-на сервере запустите doctor из ObsidianBrain **с теми же env, что у MCP-сервера**:
+Если публикация не удалась, бот в личке владельца теперь показывает безопасную
+причину (`ветка отстаёт`, `сбой Git (fetch)`, права и т.п.) вместо общего текста.
+Для профилактики запустите doctor из ObsidianBrain **с теми же env, что у
+MCP-сервера**:
 
 ```bash
 cd /opt/ObsidianBrain
@@ -1029,8 +1031,8 @@ BRAIN_WRITE_ENABLED=true .venv/bin/python write_doctor.py --network
 ```
 
 Он проверит права на хранилище/`Telegram`/SQLite/`.git`, корень Git-клона,
-ветку, upstream, `user.name`/`user.email`, staged-файлы и локальные коммиты.
-Секреты и remote URL не печатаются. Учтите sandbox systemd: при
+ветку, upstream, `user.name`/`user.email`, staged-файлы, отставание клона от
+upstream и локальные коммиты. Секреты и remote URL не печатаются. Учтите sandbox systemd: при
 `ProtectHome=true` хранилище в `/home` недоступно, а `ProtectSystem=full`
 делает read-only `/usr`, `/boot`, `/etc`; нужные пути добавляйте в
 `ReadWritePaths=` или переносите данные в разрешённый каталог.

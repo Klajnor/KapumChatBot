@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -20,7 +21,7 @@ from aiogram.types import (
 
 from bot.services import limits
 from bot.services.ai_client import ai_client
-from bot.services.mcp import mcp_manager, mcp_write_available
+from bot.services.mcp import MCPError, mcp_manager, mcp_write_available
 from bot.services.telegram_utils import is_forwarded, safe_answer, safe_answer_callback
 from bot.services.user_service import user_service
 
@@ -68,6 +69,16 @@ async def _save(message: Message, user_id: int, content: str, request_id: str) -
         return False
     try:
         await mcp_manager.save_note(user_id, content, request_id)
+    except MCPError as exc:
+        logger.warning("Second-brain save failed", exc_info=True)
+        await safe_answer(
+            message,
+            "❌ <b>Could not finish saving/publishing the note.</b>\n\n"
+            f"<code>{html.escape(str(exc))}</code>\n\n"
+            "The note may already exist locally. Fix the cause and retry the same "
+            "button or request; it will not create a duplicate.",
+        )
+        return False
     except Exception:
         logger.warning("Second-brain save failed", exc_info=True)
         await safe_answer(message, "❌ Could not finish saving/publishing the note. It may already exist locally. Retry the same button or request; check the brain server's Git access.")
