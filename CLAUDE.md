@@ -11,7 +11,7 @@ Telegram-бот на **aiogram 3.x (≥ 3.29, Python 3.12+)** поверх OpenA
 ```bash
 pip install -r requirements.txt
 pip install pytest pytest-asyncio ruff   # dev-зависимости (в requirements.txt их нет)
-cp .env.example .env.linux             # Linux; на Windows: copy .env.example .env.win
+cp .env.example .env.linux             # Linux; на Windows: copy .env.example .env.windows
 
 python -m bot.main                       # запуск бота (так же в chat_bot.service)
 python scripts/project_stats.py --write   # обновить PROJECT_STATS.md (то же делает pre-commit)

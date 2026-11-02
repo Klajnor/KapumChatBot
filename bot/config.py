@@ -11,13 +11,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 
-# Platform-specific secrets/config first, then the legacy ``.env`` fallback.
-# Linux servers keep ``.env.linux`` (absolute state paths); Windows tests use
-# ``.env.win`` when present and otherwise reuse the local ``.env``. Neither
-# platform file is tracked: both hold secrets.
+# Сначала платформенный файл с настройками/секретами, затем старый ``.env``.
+# На Linux используется ``.env.linux``, на Windows — ``.env.windows``.
+# Оба платформенных файла исключены из Git, так как содержат секреты.
 def _platform_env_files() -> tuple[str, ...]:
     if os.name == "nt":
-        return (".env.win", ".env")
+        return (".env.windows", ".env")
     return (".env.linux", ".env")
 
 

@@ -48,13 +48,15 @@ class ConfigAbsolutePathTests(unittest.TestCase):
         self._validate()
 
     def test_platform_env_file_order(self):
-        expected = (
-            (".env.win", ".env") if os.name == "nt" else (".env.linux", ".env")
-        )
-        self.assertEqual(_platform_env_files(), expected)
+        for platform, expected in (
+            ("nt", (".env.windows", ".env")),
+            ("posix", (".env.linux", ".env")),
+        ):
+            with self.subTest(platform=platform), patch.object(os, "name", platform):
+                self.assertEqual(_platform_env_files(), expected)
 
     def test_platform_specific_env_file_wins(self):
-        specific = ".env.win" if os.name == "nt" else ".env.linux"
+        specific = ".env.windows" if os.name == "nt" else ".env.linux"
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / specific).write_text("SPECIFIC=1", encoding="utf-8")

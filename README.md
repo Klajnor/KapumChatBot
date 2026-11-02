@@ -246,10 +246,10 @@ PostgreSQL и другие СУБД — **возможное будущее на
 
 ```bash
 cp .env.example .env.linux     # Linux-сервер
-copy .env.example .env.win     # Windows (тесты/локальный запуск)
+copy .env.example .env.windows # Windows (тесты/локальный запуск)
 ```
 
-`bot/config.py` читает **`.env.linux` на Linux** и **`.env.win` на Windows**;
+`bot/config.py` читает **`.env.linux` на Linux** и **`.env.windows` на Windows**;
 если платформенного файла нет, используется старый `.env` как fallback.
 Все три файла с секретами исключены из Git. Переменные, уже заданные в
 окружении (systemd `Environment=`), имеют приоритет.
