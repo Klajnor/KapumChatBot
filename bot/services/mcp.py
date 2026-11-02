@@ -274,6 +274,55 @@ def _format_tool_result(result: Any) -> str:
     return text
 
 
+def _note_error_reason(result: Any) -> str:
+    """Диагностика записи без вывода недоверенного текста, путей и секретов."""
+    if not isinstance(result, dict):
+        return "MCP-сервер вернул некорректный ответ"
+    text = _format_tool_result(result).casefold()
+    reasons = (
+        (("unknown tool", "tool not found", "запись выключена"),
+         "create_note недоступен: проверьте обновление ObsidianBrain и BRAIN_WRITE_ENABLED=true в env MCP-сервера"),
+        (("dubious ownership", "небезопасный владелец git"),
+         "Git отклонил владельца хранилища (dubious ownership); проверьте владельца каталога и safe.directory"),
+        (("user.name", "user.email", "author identity unknown", "unable to auto-detect email"),
+         "не настроены Git user.name/user.email у пользователя MCP-сервера"),
+        (("аутентификация git", "authentication failed", "permission denied (publickey)", "could not read username"),
+         "Git-аутентификация не удалась; проверьте SSH-ключ/credential helper пользователя MCP-сервера"),
+        (("dns git", "could not resolve host", "could not resolve hostname"),
+         "Git не может разрешить имя remote: проверьте DNS/сеть сервера"),
+        (("read-only file system", "readonly database", "read-only database"),
+         "хранилище или SQLite доступны только для чтения; проверьте права и systemd ReadWritePaths"),
+        (("permission denied", "errno 13"),
+         "нет прав на запись файла, SQLite или .git у пользователя MCP-сервера"),
+        (("database is locked",), "SQLite занят: повторите сохранение позже"),
+        (("посторонние локальные коммиты",),
+         "в хранилище есть посторонние локальные коммиты; автоматический push заблокирован"),
+        (("уже staged",), "созданная заметка уже staged; автоматическое изменение индекса заблокировано"),
+        (("нужен upstream", "ошибка git (config)"),
+         "не настроен upstream текущей ветки Git-хранилища"),
+        (("корнем git-репозитория", "not a git repository"),
+         "первое хранилище не является корнем Git-клона"),
+        (("ошибка git (merge-base)",),
+         "ветка хранилища отстаёт от remote или разошлась с ним; синхронизируйте клон вручную"),
+        (("ошибка git (commit-tree)",),
+         "сбой создания Git-коммита; проверьте user.name/user.email и права на .git"),
+        (("ошибка git (fetch)",),
+         "сбой git fetch; проверьте сеть и Git-доступ пользователя MCP-сервера"),
+        (("ошибка git (push)",),
+         "сбой git push; проверьте write-доступ к remote и защиту ветки; заметка может остаться локально"),
+        (("git недоступен",), "Git недоступен или превышен таймаут; заметка может остаться локально"),
+        (("таймаут",), "MCP-сервер не ответил за отведённое время; проверьте его журнал и повторите"),
+        (("не удалось запустить", "не запущен"),
+         "MCP-сервер не запущен; проверьте команду в .mcp.json и журнал сервера"),
+        (("конфликт request_id", "перезапись запрещена"),
+         "конфликт с существующей заметкой; файл не перезаписан"),
+    )
+    for patterns, reason in reasons:
+        if any(pattern in text for pattern in patterns):
+            return reason
+    return "неизвестная ошибка MCP-сервера; проверьте его журнал (исходный ответ скрыт во избежание утечки данных)"
+
+
 def mcp_available(telegram_id: int | None) -> bool:
     """Чтение доступно всем пользователям обычного диалога, при включённом MCP."""
     if not config.enable_mcp or not config.mcp_servers:
@@ -465,17 +514,23 @@ class MCPClient:
 
     async def create_note(self, content: str, request_id: str) -> str:
         """Отдельный канал создания заметок, не доступный модели чата."""
-        await self.start()
-        result = await self._request(
-            "tools/call",
-            {"name": "create_note", "arguments": {
-                "content": content, "request_id": request_id,
-            }},
-            # Создание/индекс + fetch/commit/push занимают дольше обычного чтения.
-            timeout=max(self.timeout, 180.0),
-        )
+        try:
+            await self.start()
+            result = await self._request(
+                "tools/call",
+                {"name": "create_note", "arguments": {
+                    "content": content, "request_id": request_id,
+                }},
+                # Создание/индекс + fetch/commit/push занимают дольше обычного чтения.
+                timeout=max(self.timeout, 180.0),
+            )
+        except MCPError as exc:
+            # Текст JSON-RPC-ошибки не выводим: он может содержать пути/секреты.
+            raise MCPError(
+                f"Не удалось создать заметку: {_note_error_reason({'content': [{'type': 'text', 'text': str(exc)}]})}"
+            ) from None
         if not isinstance(result, dict) or result.get("isError"):
-            raise MCPError("Не удалось создать заметку")
+            raise MCPError(f"Не удалось создать заметку: {_note_error_reason(result)}")
         text = _format_tool_result(result)
         confirmation = result.get("structuredContent")
         if not isinstance(confirmation, dict):

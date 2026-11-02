@@ -108,6 +108,58 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.create_note("fact", "id")
 
+    async def test_write_error_has_safe_actionable_diagnostic(self) -> None:
+        client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
+        cases = [
+            ("Unknown tool: create_note", "BRAIN_WRITE_ENABLED"),
+            ("[Errno 13] Permission denied: /secret/vault", "нет прав"),
+            ("Ошибка Git (fetch): сбой DNS Git; https://user:secret-token@host", "DNS"),
+            ("Ошибка Git (commit-tree): не настроены user.name/user.email", "user.name"),
+            ("Ошибка Git (merge-base); заметка сохранена локально", "отстаёт"),
+            ("Ошибка Git (push); https://user:secret-token@host", "git push"),
+            ("Unknown problem secret-token /secret/vault", "неизвестная ошибка"),
+        ]
+        for error, expected in cases:
+            with (
+                self.subTest(error=expected),
+                patch.object(client, "start", new_callable=AsyncMock),
+                patch.object(client, "_request", new_callable=AsyncMock, return_value={
+                    "isError": True, "content": [{"type": "text", "text": error}],
+                }),
+                self.assertRaises(MCPError) as caught,
+            ):
+                await client.create_note("private note content", "id")
+            diagnostic = str(caught.exception)
+            self.assertIn(expected, diagnostic)
+            self.assertNotIn("secret-token", diagnostic)
+            self.assertNotIn("/secret/vault", diagnostic)
+            self.assertNotIn("private note content", diagnostic)
+
+    async def test_transport_error_is_sanitized_for_create_note(self) -> None:
+        client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
+        with (
+            patch.object(client, "start", new_callable=AsyncMock),
+            patch.object(client, "_request", new_callable=AsyncMock,
+                         side_effect=MCPError("Unknown tool: create_note https://user:secret-token@host")),
+            self.assertRaises(MCPError) as caught,
+        ):
+            await client.create_note("private note", "id")
+        diagnostic = str(caught.exception)
+        self.assertIn("BRAIN_WRITE_ENABLED", diagnostic)
+        self.assertNotIn("secret-token", diagnostic)
+
+    async def test_start_error_is_sanitized_for_create_note(self) -> None:
+        client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
+        with (
+            patch.object(client, "start", new_callable=AsyncMock,
+                         side_effect=MCPError("не удалось запустить MCP-сервер 'brain': /secret/python")),
+            self.assertRaises(MCPError) as caught,
+        ):
+            await client.create_note("private note", "id")
+        diagnostic = str(caught.exception)
+        self.assertIn("не запущен", diagnostic)
+        self.assertNotIn("/secret/python", diagnostic)
+
     async def test_create_note_requires_git_push_confirmation(self) -> None:
         client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
         for payload, success in [
