@@ -5,6 +5,9 @@
 Сверху новые. Подробное описание функций, аудитов и известных ограничений — ниже, в разделе «Подробные заметки».
 
 ### 2026-11-03
+- **Второй мозг: стадия Git в диагностике и `write_doctor.py`.** Неизвестная ошибка записи теперь распознаёт стадию Git (`rev-parse`, `symbolic-ref`, `add`, `update-ref` и т.п.) и подсказывает проверить корень клона, detached HEAD и права. Добавлены категории для старого ObsidianBrain, SQLite и Git lock. В ObsidianBrain появился `write_doctor.py`: проверяет флаг записи, права хранилища/`Telegram`/SQLite/`.git`, upstream, Git identity, staged-файлы и локальные коммиты; секреты и remote URL не печатает.
+
+### 2026-11-03
 - **Второй мозг: безопасная диагностика ошибок записи.** Вместо безусловного «Не удалось создать заметку» в traceback указывается категория сбоя: недоступный `create_note`, права файлов/SQLite, Git identity, upstream, fetch/push, DNS, аутентификация или расхождение веток. Вывод MCP и Git stderr не логируются целиком: URL с токенами, пути и текст заметки не попадают в диагностику. Дополнена классификация Git-ошибок в ObsidianBrain.
 
 ### 2026-11-03
@@ -226,6 +229,14 @@
 ---
 
 ## Подробные заметки
+
+### Второй мозг: стадия Git и write_doctor (2026-11-03)
+
+- Если сервер вернул неизвестную ошибку, бот дополнительно ищет безопасный код `Ошибка Git (<стадия>)` и сообщает стадию с подсказкой. Имя стадии ограничено `[a-z0-9-]`, поэтому недоверенный текст в traceback не попадает.
+- Новые категории: `CalledProcessError` от старой версии ObsidianBrain, `unable to open database file` (SQLite), `cannot lock ref`/`index.lock` (параллельный Git).
+- `ObsidianBrain/write_doctor.py` — безопасная проверка на сервере: `BRAIN_WRITE_ENABLED`, права на хранилище/`Telegram`/SQLite/`.git`, корень Git-клона, ветка, upstream, `user.name`/`user.email`, staged-файлы и коммиты впереди upstream. `--network` дополнительно проверяет `ls-remote`, не печатая URL и stderr.
+- Doctor запускать тем же пользователем и с теми же env, что MCP-сервер; иначе `VAULT_PATH`/`BRAIN_WRITE_ENABLED` могут отличаться. Проверка `ProtectHome`/`ReadWritePaths` важна, если хранилище лежит в `/home`.
+- Профильные тесты бота: 42 passed, 7 subtests; ObsidianBrain: 13 passed.
 
 ### Диагностика create_note (2026-11-03)
 

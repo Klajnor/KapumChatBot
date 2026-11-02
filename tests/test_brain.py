@@ -117,6 +117,10 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
             ("Ошибка Git (commit-tree): не настроены user.name/user.email", "user.name"),
             ("Ошибка Git (merge-base); заметка сохранена локально", "отстаёт"),
             ("Ошибка Git (push); https://user:secret-token@host", "git push"),
+            ("Ошибка Git (rev-parse): https://user:secret-token@host", "стадии rev-parse"),
+            ("Command '['git']' returned non-zero exit status 128", "обновите ObsidianBrain"),
+            ("sqlite3.OperationalError: unable to open database file", "SQLite-индекс"),
+            ("fatal: cannot lock ref 'refs/heads/master'", "Git занят"),
             ("Unknown problem secret-token /secret/vault", "неизвестная ошибка"),
         ]
         for error, expected in cases:

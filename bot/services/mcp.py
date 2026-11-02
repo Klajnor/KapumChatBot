@@ -310,6 +310,12 @@ def _note_error_reason(result: Any) -> str:
          "сбой git fetch; проверьте сеть и Git-доступ пользователя MCP-сервера"),
         (("ошибка git (push)",),
          "сбой git push; проверьте write-доступ к remote и защиту ветки; заметка может остаться локально"),
+        (("returned non-zero exit status", "calledprocesserror"),
+         "сервер не смог выполнить Git-команду; обновите ObsidianBrain и проверьте его журнал"),
+        (("unable to open database file", "disk i/o error"),
+         "не удаётся открыть SQLite-индекс; проверьте путь, права и свободное место"),
+        (("cannot lock ref", "unable to create", "index.lock"),
+         "Git занят другим процессом или не может создать lock-файл; повторите позже"),
         (("git недоступен",), "Git недоступен или превышен таймаут; заметка может остаться локально"),
         (("таймаут",), "MCP-сервер не ответил за отведённое время; проверьте его журнал и повторите"),
         (("не удалось запустить", "не запущен"),
@@ -320,6 +326,14 @@ def _note_error_reason(result: Any) -> str:
     for patterns, reason in reasons:
         if any(pattern in text for pattern in patterns):
             return reason
+    stage = re.search(r"ошибка git \(([a-z0-9-]+)\)", text)
+    if stage:
+        # Имя стадии — фиксированный код из git_publish, не текст ошибки.
+        return (
+            f"сбой Git на стадии {stage.group(1)}; проверьте, что VAULT_PATH указывает "
+            "на корень Git-клона, ветка не detached и у пользователя MCP-сервера есть "
+            "права на файл, индекс и .git"
+        )
     return "неизвестная ошибка MCP-сервера; проверьте его журнал (исходный ответ скрыт во избежание утечки данных)"
 
 
