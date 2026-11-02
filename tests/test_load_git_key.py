@@ -22,9 +22,16 @@ trap ':' INT TERM
 ssh-add() {
     printf 'ssh-add %s\n' "$*" >> calls.log
     if [[ "$1" == -l ]]; then
+        if [[ -f added ]]; then
+            return "$L_STATUS_AFTER_ADD"
+        fi
         return "$AGENT_STATUS"
     fi
-    return "$ADD_STATUS"
+    if [[ "$ADD_STATUS" != 0 ]]; then
+        return "$ADD_STATUS"
+    fi
+    : > added
+    return 0
 }
 ssh-agent() {
     printf 'ssh-agent %s\n' "$*" >> calls.log
@@ -77,6 +84,7 @@ class LoadGitKeyTests(unittest.TestCase):
             "SSH_AGENT_PID": "123",
             "MISSING_COMMAND": "",
             "DIRECT": str(int(direct)),
+            "L_STATUS_AFTER_ADD": "0",
             **overrides,
         }
         env.pop("BASH_ENV", None)
@@ -135,7 +143,8 @@ class LoadGitKeyTests(unittest.TestCase):
                 self.assertIn("SOCK=/old-agent\nPID=123", result.stdout)
                 self.assertEqual(calls[0], "ssh-add -l")
                 self.assertTrue(calls[1].endswith("/test key"))
-                self.assertEqual(len(calls), 2)
+                # Финальная проверка, что ключ действительно виден агенту.
+                self.assertEqual(calls[2:], ["ssh-add -l"])
 
     def test_starts_new_agent_and_exports_environment(self) -> None:
         result, calls = self._run()
@@ -144,7 +153,7 @@ class LoadGitKeyTests(unittest.TestCase):
         self.assertIn("загружен", result.stdout)
         self.assertEqual(calls[:2], ["ssh-add -l", "ssh-agent -s"])
         self.assertTrue(calls[2].endswith("/test key"))
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[3:], ["ssh-add -l"])
 
     def test_unexpected_probe_error_is_not_treated_as_missing_agent(self) -> None:
         result, calls = self._run(AGENT_STATUS="3")
@@ -192,3 +201,16 @@ class LoadGitKeyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("не удалось остановить", result.stderr)
         self.assertEqual(calls[-1], "ssh-agent -k")
+
+    def test_agent_lost_after_load_keeps_previous_environment(self) -> None:
+        result, calls = self._run(L_STATUS_AFTER_ADD="2")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ssh-add -l не видит агента", result.stderr)
+        self.assertIn("SOCK=/old-agent\nPID=123", result.stdout)
+        self.assertNotIn("загружен", result.stdout)
+        self.assertEqual(calls[-1], "ssh-agent -k")
+
+    def test_successful_load_reports_socket(self) -> None:
+        result, _ = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SSH_AUTH_SOCK=/new-agent", result.stdout)

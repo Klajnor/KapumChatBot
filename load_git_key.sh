@@ -4,6 +4,8 @@
 #   source ./load_git_key.sh
 # Путь к ключу намеренно фиксирован; сам ключ хранится вне проекта.
 # Не меняем set/trap оболочки и не останавливаем чужие агенты.
+# После загрузки скрипт проверяет ssh-add -l: окружение агента живёт только
+# в той оболочке, где выполнен source.
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     printf 'Ошибка: используйте source ./load_git_key.sh, иначе окружение агента не сохранится в текущей оболочке.\n' >&2
@@ -68,6 +70,16 @@ _load_git_key_main() {
             fi
             exit 1
         fi
+        # Проверяем итог до изменения окружения вызывающей оболочки: иначе при
+        # сбое агента в сессии остался бы нерабочий SSH_AUTH_SOCK.
+        if ! ssh-add -l >/dev/null 2>&1; then
+            printf 'Ошибка: ssh-add -l не видит агента после загрузки (SSH_AUTH_SOCK=%s).\n' "${SSH_AUTH_SOCK:-не задан}" >&2
+            printf 'Подсказка: source и ssh-add -L должны выполняться в одной оболочке.\n' >&2
+            if [[ -n "$agent_env" ]]; then
+                ssh-agent -k >/dev/null 2>&1 || printf 'Предупреждение: не удалось остановить созданный ssh-agent.\n' >&2
+            fi
+            exit 1
+        fi
     ); then
         return 1
     fi
@@ -75,7 +87,7 @@ _load_git_key_main() {
     if [[ -n "$agent_env" ]]; then
         eval "$agent_env" >/dev/null || return 1
     fi
-    printf 'Ключ %s загружен в ssh-agent текущей сессии.\n' "$key_file"
+    printf 'Ключ %s загружен; SSH_AUTH_SOCK=%s\n' "$key_file" "${SSH_AUTH_SOCK:-не задан}"
 }
 
 if _load_git_key_main; then
