@@ -286,6 +286,8 @@ def _note_error_reason(result: Any) -> str:
          "сбой индексации SQLite; проверьте data/brain.db, права, свободное место и повторите"),
         (("stage=git",),
          "сбой Git при публикации; проверьте права на .git, ветку/upstream и доступ к remote"),
+        (("stage=sync",),
+         "не удалось синхронизировать хранилище с origin; проверьте сеть, upstream и Git-доступ; заметка не создана"),
         (("unknown tool", "tool not found", "запись выключена"),
          "create_note недоступен: проверьте обновление ObsidianBrain и BRAIN_WRITE_ENABLED=true в env MCP-сервера"),
         (("dubious ownership", "небезопасный владелец git"),
@@ -339,7 +341,7 @@ def _note_error_reason(result: Any) -> str:
     for patterns, reason in reasons:
         if any(pattern in text for pattern in patterns):
             return reason
-    stage = re.search(r"stage=(file|index|git|validate|internal)(?::\s*([a-z_][a-z0-9_]*))?", text)
+    stage = re.search(r"stage=(file|index|git|sync|validate|internal)(?::\s*([a-z_][a-z0-9_]*))?", text)
     if stage:
         name, exc_type = stage.group(1), stage.group(2) or "unknown"
         if name == "validate":

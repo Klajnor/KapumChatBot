@@ -124,6 +124,7 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
             ("stage=index: OperationalError", "сбой индексации SQLite"),
             ("stage=file: PermissionError", "создать файл"),
             ("stage=git: RuntimeError", "сбой Git"),
+            ("stage=sync: RuntimeError", "синхронизировать хранилище"),
             ("sqlite3.OperationalError: no such table: notes", "схема SQLite"),
             ("sqlite3.OperationalError: database or disk is full", "нет места"),
             ("fatal: cannot lock ref 'refs/heads/master'", "Git занят"),
