@@ -896,15 +896,14 @@ class Config:
     # --- MCP (Model Context Protocol) providers ---
     # The chat model gets tools exposed by one or more MCP servers. The main
     # use case is the Obsidian "second brain": search and read personal notes
-    # through the ``brain`` server. The whole feature is owner-only by default
-    # (MCP_OWNER_ONLY: only OWNER_IDS, not promoted admins) because the notes
-    # are private. MCP_ADMIN_ONLY is the legacy name of the same switch.
+    # through the ``brain`` server. Чтение открыто всем; запись только OWNER_IDS.
     enable_mcp: bool = field(
         default_factory=lambda: _env_bool("MCP_ENABLED", True)
     )
+    # Устаревшая настройка, сохраняется для совместимости старых конфигов.
     mcp_owner_only: bool = field(
         default_factory=lambda: _env_bool(
-            "MCP_OWNER_ONLY", _env_bool("MCP_ADMIN_ONLY", True)
+            "MCP_OWNER_ONLY", _env_bool("MCP_ADMIN_ONLY", False)
         )
     )
     # Claude-style .mcp.json with a "mcpServers" object (path to the file or
@@ -933,6 +932,10 @@ class Config:
     )
     # Parsed server definitions: name -> {command, args, env, cwd?}.
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Сервер с create_note; запись идёт отдельно от инструментов модели.
+    mcp_write_server: str = field(
+        default_factory=lambda: _env("MCP_WRITE_SERVER", default="brain")
+    )
     # Per-request timeout for MCP calls (seconds).
     mcp_timeout: int = field(
         default_factory=lambda: _env_int("MCP_TIMEOUT", 60)

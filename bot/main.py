@@ -17,6 +17,7 @@ from bot.database.session import engine, init_db
 from bot.handlers import (
     admin,
     admin_panel,
+    brain,
     chat,
     clear,
     export,
@@ -48,6 +49,8 @@ from bot.services.user_service import user_service
 # Order matters: command routers are registered before the catch-all chat router.
 # The digest router only observes channel/group posts and passes them on.
 dp.include_router(digest_handler.router)
+# Форвард владельца — данные, а не команда (даже если текст начинается с /clear).
+dp.include_router(brain.router)
 dp.include_router(start.router)
 dp.include_router(help.router)
 dp.include_router(models.router)

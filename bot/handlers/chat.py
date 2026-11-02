@@ -60,6 +60,7 @@ from bot.services.mcp import (
     apply_mcp_hint,
     mcp_available,
     mcp_manager,
+    mcp_write_available,
     remove_mcp_hint,
 )
 from bot.services.operations import stage, tracked
@@ -732,6 +733,9 @@ def forget_chat_state(chat_id: int, user_id: int) -> None:
     """
     _last_questions.pop(chat_id, None)
     _pending_enhance.pop(user_id, None)
+    from bot.handlers.brain import clear_pending
+
+    clear_pending(user_id)
 
 
 def _retry_markup(message: Message, export_id: int | None = None) -> Any:
@@ -746,6 +750,10 @@ def _retry_markup(message: Message, export_id: int | None = None) -> Any:
     return get_answer_keyboard(
         export_id=export_id if config.enable_export else None,
         ask_other=config.enable_ask_other_model,
+        remember_id=(
+            export_id if message.from_user is not None
+            and mcp_write_available(message.from_user.id) else None
+        ),
     )
 
 
@@ -1724,6 +1732,10 @@ async def handle_text(message: Message) -> None:
         if not granted:
             await safe_answer(message, limits.BUSY_MESSAGE)
             return
+        from bot.handlers.brain import maybe_remember
+
+        if await maybe_remember(message, text):
+            return
         if await maybe_timezone_dialog(message, text):
             return
         if await maybe_freeform_reminder(message, text):
@@ -1876,6 +1888,11 @@ async def _handle_voice(message: Message) -> None:
         # text. Creation is free, so the question taken for this voice
         # message is given back. Links are NOT expanded for voice: speech
         # recognition may have distorted the address.
+        from bot.handlers.brain import maybe_remember
+
+        if await maybe_remember(message, transcript):
+            await refund_access(service, user.id, access)
+            return
         if await maybe_freeform_reminder(message, transcript):
             await refund_access(service, user.id, access)
             return
@@ -2320,11 +2337,10 @@ async def _handle_photo(
         )
         # No "Ask another model" button: re-asking needs the image attached.
         # The 📄/📝 export buttons still apply to the answer text.
-        export_markup = (
-            get_answer_keyboard(export_id=saved.id if saved else None)
-            if config.enable_export and _is_private(message)
-            else None
-        )
+        export_markup = get_answer_keyboard(
+            export_id=saved.id if saved and config.enable_export else None,
+            remember_id=saved.id if saved and mcp_write_available(user.id) else None,
+        ) if _is_private(message) else None
         await deliver_answer(
             message,
             printer,
@@ -3144,7 +3160,7 @@ async def _process_album(
                 await safe_answer(message, "❌ <b>Error analyzing the images.</b>")
                 return
 
-            await service.add_message(
+            saved = await service.add_message(
                 chat_id=message.chat.id,
                 user_id=user.id,
                 role="assistant",
@@ -3166,6 +3182,10 @@ async def _process_album(
                 footer,
                 title_source=caption,
                 # Album analysis is private image content.
+                reply_markup=get_answer_keyboard(
+                    export_id=saved.id if saved and config.enable_export else None,
+                    remember_id=saved.id if saved and mcp_write_available(user.id) else None,
+                ) if _is_private(message) else None,
                 allow_telegraph=False,
             )
 

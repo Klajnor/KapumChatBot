@@ -408,10 +408,10 @@ async def cmd_mcp(message: Message) -> None:
             shown = ", ".join(html.escape(str(name)) for name in hidden[:10])
             more = f" … +{len(hidden) - 10}" if len(hidden) > 10 else ""
             lines.append(
-                f"   🚫 Hidden (not in <code>MCP_ALLOWED_TOOLS</code>): {shown}{more}"
+                f"   🚫 Hidden from chat tools: {shown}{more}"
             )
     lines.append("")
-    lines.append(f"🔐 Owner-only: <b>{'yes' if config.mcp_owner_only else 'no'}</b>")
+    lines.append("🔐 Read: <b>all users</b>; write: <b>owner only, DM</b>")
     if config.mcp_config_file:
         lines.append(
             f"📄 Config: <code>{html.escape(config.mcp_config_file)}</code>"

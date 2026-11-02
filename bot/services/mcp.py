@@ -21,9 +21,8 @@ Design notes:
   ``DATABASE_URL`` — are never inherited by third-party MCP code, and
   ``${VAR}`` references to them in the config are refused. Anything a server
   needs beyond the allowlist must be listed explicitly in its ``env``.
-* The feature is **owner-only by default** (``MCP_OWNER_ONLY``): notes and
-  personal knowledge bases belong to the owner (``OWNER_IDS``) and must not
-  leak to anyone else — admins promoted from the admin menu included.
+* Чтение открыто пользователям диалога. Запись — отдельный канал владельца,
+  никогда не инструмент модели; приватное хранилище подключать нельзя.
 
 See README → «🧠 MCP-провайдер „Второй мозг“ (Obsidian)».
 """
@@ -61,10 +60,10 @@ _MAX_LINE_BYTES = 8 * 1024 * 1024
 _NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
-# Appended to the system prompt while MCP tools are offered to an admin.
+# Appended to the system prompt while read-only MCP tools are offered.
 MCP_SYSTEM_HINT = (
-    "Тебе доступен «второй мозг» пользователя — база личных заметок Obsidian "
-    "(инструменты с префиксом mcp__). Если вопрос может касаться личных "
+    "Тебе доступен общий «второй мозг» бота — база заметок Obsidian "
+    "(инструменты с префиксом mcp__). Если вопрос может касаться сохранённых "
     "заметок, проектов, прошлых решений, документации или сохранённых знаний, "
     "сначала найди подходящие заметки (search_notes), при необходимости "
     "прочитай фрагмент (get_chunk) или всю заметку (get_note); если get_note "
@@ -276,19 +275,18 @@ def _format_tool_result(result: Any) -> str:
 
 
 def mcp_available(telegram_id: int | None) -> bool:
-    """True when MCP tools may be offered to this user.
-
-    With the default ``MCP_OWNER_ONLY=true`` only the owners (IDs from
-    ``OWNER_IDS``) get the tools. Admins promoted at runtime from the admin
-    menu are deliberately excluded: they can be granted by an owner without
-    being trusted with the owner's private notes. Everyone else chats exactly
-    as before.
-    """
+    """Чтение доступно всем пользователям обычного диалога, при включённом MCP."""
     if not config.enable_mcp or not config.mcp_servers:
         return False
-    if config.mcp_owner_only:
-        return telegram_id is not None and config.is_owner(telegram_id)
-    return True
+    return telegram_id is not None
+
+
+def mcp_write_available(telegram_id: int | None) -> bool:
+    """Запись доступна только владельцам, независимо от настроек чтения."""
+    return mcp_available(telegram_id) and config.is_owner(telegram_id)
+
+
+READ_TOOLS = frozenset({"search_notes", "get_chunk", "get_note", "list_notes"})
 
 
 def apply_mcp_hint(messages: list[dict[str, Any]]) -> None:
@@ -464,6 +462,30 @@ class MCPClient:
             {"name": name, "arguments": arguments},
         )
         return _format_tool_result(result)
+
+    async def create_note(self, content: str, request_id: str) -> str:
+        """Отдельный канал создания заметок, не доступный модели чата."""
+        await self.start()
+        result = await self._request(
+            "tools/call",
+            {"name": "create_note", "arguments": {
+                "content": content, "request_id": request_id,
+            }},
+            # Создание/индекс + fetch/commit/push занимают дольше обычного чтения.
+            timeout=max(self.timeout, 180.0),
+        )
+        if not isinstance(result, dict) or result.get("isError"):
+            raise MCPError("Не удалось создать заметку")
+        text = _format_tool_result(result)
+        confirmation = result.get("structuredContent")
+        if not isinstance(confirmation, dict):
+            try:
+                confirmation = json.loads(text)
+            except (ValueError, TypeError):
+                confirmation = None
+        if not isinstance(confirmation, dict) or confirmation.get("git_pushed") is not True:
+            raise MCPError("MCP-сервер не подтвердил публикацию заметки в Git; обновите ObsidianBrain")
+        return text
 
     async def close(self) -> None:
         """Stop the server process and fail any in-flight request."""
@@ -714,7 +736,10 @@ class MCPManager:
     async def openai_tools(self) -> list[dict[str, Any]]:
         """The tool catalog in OpenAI function format (empty on failure)."""
         await self._load()
-        return [tool.openai_schema() for tool, _ in self._tools.values()]
+        return [
+            tool.openai_schema() for tool, _ in self._tools.values()
+            if tool.name in READ_TOOLS
+        ]
 
     def is_mcp_tool(self, name: str) -> bool:
         """True when ``name`` belongs to a known MCP tool."""
@@ -745,6 +770,8 @@ class MCPManager:
                 "mcp", f"Ошибка: неизвестный MCP-инструмент {name!r}."
             )
         tool, client = entry
+        if tool.name not in READ_TOOLS:
+            return wrap_untrusted("mcp", "Ошибка: в диалоге разрешено только чтение.")
         logger.info("MCP call: %s.%s", tool.server, tool.name)
         try:
             text = await client.call_tool(tool.name, arguments or {})
@@ -764,15 +791,28 @@ class MCPManager:
         # рамку, а следующий раунд снимет MCP-инструменты по общему taint-gate.
         return wrap_untrusted("mcp", text)
 
+    async def save_note(self, telegram_id: int, content: str, request_id: str) -> str:
+        """Создать заметку по явному действию владельца; ошибки не маскируются."""
+        if not mcp_write_available(telegram_id):
+            raise MCPError("Запись разрешена только владельцу")
+        if not content.strip() or len(content) > 100_000:
+            raise MCPError("Недопустимый размер заметки")
+        if config.mcp_write_server not in config.mcp_servers:
+            raise MCPError("Сервер записи не настроен")
+        return await self._client(config.mcp_write_server).create_note(content, request_id)
+
     async def status(self) -> list[dict[str, Any]]:
         """Per-server diagnostic for the admin ``/mcp`` command."""
         report: list[dict[str, Any]] = []
         for name in config.mcp_servers:
             client = self._client(name)
             tools: list[str] = []
+            hidden: list[str] = []
             error: str | None = None
             try:
-                tools = [tool.name for tool in await client.list_tools()]
+                listed = await client.list_tools()
+                tools = [tool.name for tool in listed if tool.name in READ_TOOLS]
+                hidden = [tool.name for tool in listed if tool.name not in READ_TOOLS]
             except Exception as exc:  # noqa: BLE001 - diagnostics only
                 error = str(exc)
             report.append(
@@ -780,7 +820,7 @@ class MCPManager:
                     "name": name,
                     "running": client.running,
                     "tools": tools,
-                    "hidden": list(client.hidden_tools),
+                    "hidden": list(client.hidden_tools) + hidden,
                     "error": error,
                 }
             )

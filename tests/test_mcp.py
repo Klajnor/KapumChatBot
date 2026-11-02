@@ -32,6 +32,7 @@ from bot.services.mcp import (
     _normalize_schema,
     apply_mcp_hint,
     mcp_available,
+    mcp_write_available,
     remove_mcp_hint,
 )
 
@@ -290,7 +291,7 @@ class MCPAllowlistTests(unittest.TestCase):
 
 
 class MCPAccessTests(unittest.TestCase):
-    def test_owner_only_by_default(self) -> None:
+    def test_read_for_everyone_write_only_for_owner(self) -> None:
         saved = (
             config.enable_mcp,
             config.mcp_owner_only,
@@ -305,9 +306,13 @@ class MCPAccessTests(unittest.TestCase):
             config.owner_ids = [42]
             config.extra_admin_ids = {44}  # promoted admin: not an owner
             self.assertTrue(mcp_available(42))
-            self.assertFalse(mcp_available(43))
-            self.assertFalse(mcp_available(44))
+            self.assertTrue(mcp_available(43))
+            self.assertTrue(mcp_available(44))
             self.assertFalse(mcp_available(None))
+            self.assertTrue(mcp_write_available(42))
+            self.assertFalse(mcp_write_available(43))
+            self.assertFalse(mcp_write_available(44))
+            self.assertFalse(mcp_write_available(None))
 
             config.mcp_owner_only = False
             self.assertTrue(mcp_available(43))

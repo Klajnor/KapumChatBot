@@ -63,7 +63,8 @@ def get_ask_other_model_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_answer_keyboard(
-    export_id: int | None = None, *, ask_other: bool = False
+    export_id: int | None = None, *, ask_other: bool = False,
+    remember_id: int | None = None,
 ) -> InlineKeyboardMarkup | None:
     """Action row under an AI answer: 📄 PDF / 📝 MD export + re-ask.
 
@@ -72,7 +73,7 @@ def get_answer_keyboard(
     (with an owner check) instead of trusting callback text. Returns None
     when there would be no buttons at all.
     """
-    if export_id is None and not ask_other:
+    if export_id is None and not ask_other and remember_id is None:
         return None
     builder = InlineKeyboardBuilder()
     if export_id is not None:
@@ -80,6 +81,8 @@ def get_answer_keyboard(
         builder.button(text="📝 MD", callback_data=f"expans:md:{export_id}")
     if ask_other:
         builder.button(text="🔀 Ask another model", callback_data="askother")
+    if remember_id is not None:
+        builder.button(text="🧠 Remember", callback_data=f"brain:answer:{remember_id}")
     builder.adjust(2)
     return builder.as_markup()
 
