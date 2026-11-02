@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
+from xml.etree import ElementTree
 
 import aiohttp
 
@@ -864,6 +865,7 @@ class AIClient:
 
             if status == 200 and data is not None:
                 result = self._parse_result(data)
+                self._recover_search_dsml(result, payload.get("tools") or [])
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
@@ -1901,6 +1903,60 @@ class AIClient:
                 await asyncio.sleep(min(2**attempt, 8))
 
         return None, None, _elapsed()
+
+    @staticmethod
+    def _recover_search_dsml(result: ChatResult, tools: list[dict[str, Any]]) -> None:
+        """Восстановить текстовый DSML-поиск только при явно предложенном search_web.
+
+        Принимается только целое сообщение с вызовами поиска, не цитата внутри
+        ответа. Другие инструменты не исполняются; лимиты остаются в tool-loop.
+        Повреждённый DSML не является ответом: вызывающий код попробует fallback.
+        """
+        content = (result.content or "").strip()
+        if not content.startswith("<｜DSML｜"):
+            return
+        result.content = None
+        if result.tool_calls:
+            return
+        allowed = any(tool.get("function", {}).get("name") == "search_web" for tool in tools)
+        if not allowed or len(content) > 65_536 or "<!" in content:
+            logger.warning("Ignoring DSML response: search unavailable or invalid envelope")
+            return
+        xml = re.sub(r"<(/?)｜DSML｜\s*(\w+)", r"<\1\2", content)
+        try:
+            root = ElementTree.fromstring(xml)
+            if root.tag != "calls" or root.attrib or (root.text or "").strip() or not len(root):
+                raise ValueError("invalid calls envelope")
+            calls: list[ToolCall] = []
+            for invoke in root:
+                if (
+                    invoke.tag != "invoke" or invoke.attrib != {"name": "search_web"}
+                    or (invoke.text or "").strip() or (invoke.tail or "").strip()
+                ):
+                    raise ValueError("unexpected tool")
+                arguments: dict[str, Any] = {}
+                for parameter in invoke:
+                    name = parameter.get("name")
+                    if (
+                        parameter.tag != "parameter" or len(parameter)
+                        or (parameter.tail or "").strip()
+                        or set(parameter.attrib) != {"name", "string"}
+                        or name not in {"query", "max_results"} or name in arguments
+                        or parameter.get("string") not in {"true", "false"}
+                    ):
+                        raise ValueError("invalid parameter")
+                    value = parameter.text or ""
+                    arguments[name] = value if parameter.get("string") == "true" else json.loads(value)
+                if not isinstance(arguments.get("query"), str) or not arguments["query"].strip():
+                    raise ValueError("missing query")
+                if "max_results" in arguments and type(arguments["max_results"]) is not int:
+                    raise ValueError("invalid max_results")
+                calls.append(ToolCall(id=f"call_{uuid4().hex}", name="search_web", arguments=arguments))
+        except (ElementTree.ParseError, ValueError):
+            logger.warning("Ignoring malformed or unsupported DSML tool response")
+            return
+        result.tool_calls = calls
+        logger.info("Recovered %s DSML search calls from model content", len(calls))
 
     @classmethod
     def _extract_content(cls, data: dict[str, Any]) -> str | None:
