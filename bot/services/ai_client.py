@@ -32,6 +32,7 @@ from bot.services.stickers import (  # noqa: F401 - совместимость �
     prepare_sticker_result,
     to_sticker_webp,
 )
+from bot.services.tool_markup import TOOL_CALLS_HINT, strip_tool_markup
 
 logger = logging.getLogger(__name__)
 
@@ -831,14 +832,16 @@ class AIClient:
         """
         started = time.monotonic()
         for attempt_model in self.model_chain(model):
+            offered = tools if tools is not None else [IMAGE_TOOL]
             payload = self._chat_payload(
                 messages,
                 attempt_model,
                 temperature,
                 max_tokens,
                 public=public and attempt_model not in self._thinking_unsupported,
+                tools=offered,
             )
-            payload["tools"] = tools if tools is not None else [IMAGE_TOOL]
+            payload["tools"] = offered
 
             status, data, _elapsed = await self._post_chat(
                 payload, retries=2, model_id=attempt_model
@@ -849,6 +852,9 @@ class AIClient:
             # disable thinking for this model.
             if status in {400, 404, 422}:
                 payload.pop("tools", None)
+                payload["messages"] = self._without_hint(
+                    payload["messages"], TOOL_CALLS_HINT
+                )
                 status, data, _elapsed = await self._post_chat(
                     payload, retries=2, model_id=attempt_model
                 )
@@ -864,8 +870,9 @@ class AIClient:
                 )
 
             if status == 200 and data is not None:
-                result = self._parse_result(data)
+                result = self._parse_result(data, finalize=False)
                 self._recover_search_dsml(result, payload.get("tools") or [])
+                result.content = self._finalize(result.content)
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
@@ -1019,6 +1026,7 @@ class AIClient:
                 temperature,
                 max_tokens,
                 public=public and attempt_model not in self._thinking_unsupported,
+                tools=tools,
             )
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
@@ -1728,10 +1736,16 @@ class AIClient:
         max_tokens: int | None,
         *,
         public: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        rendered = AIClient._with_style_hint(messages)
+        if tools:
+            # Модель должна вызывать инструменты штатно, а не «рисовать»
+            # вызов текстом в ответе (см. bot/services/tool_markup.py).
+            rendered = AIClient._with_hint(rendered, TOOL_CALLS_HINT)
         payload = {
             "model": (spec := config.resolve_model(model)).get("model", spec["id"]),
-            "messages": AIClient._with_style_hint(messages),
+            "messages": rendered,
             "temperature": (
                 config.default_temperature if temperature is None else temperature
             ),
@@ -1742,6 +1756,37 @@ class AIClient:
         if public:
             payload.update(thinking.payload_fields())
         return payload
+
+    @staticmethod
+    def _with_hint(
+        messages: list[dict[str, Any]], hint: str
+    ) -> list[dict[str, Any]]:
+        """Append ``hint`` to the system prompt of a copy of ``messages``."""
+        result = [dict(entry) for entry in messages]
+        for entry in result:
+            if entry.get("role") == "system":
+                content = entry.get("content")
+                if isinstance(content, str) and hint not in content:
+                    entry["content"] = f"{content}\n\n{hint}".strip()
+                return result
+        result.insert(0, {"role": "system", "content": hint})
+        return result
+
+    @staticmethod
+    def _without_hint(
+        messages: list[dict[str, Any]], hint: str
+    ) -> list[dict[str, Any]]:
+        """Remove ``hint`` from a copy of ``messages`` (tools were rejected)."""
+        result = [dict(entry) for entry in messages]
+        for entry in result:
+            if entry.get("role") != "system":
+                continue
+            content = entry.get("content")
+            if isinstance(content, str) and hint in content:
+                entry["content"] = content.replace(
+                    f"\n\n{hint}", ""
+                ).replace(hint, "").strip()
+        return result
 
     @staticmethod
     def _with_style_hint(
@@ -1763,24 +1808,19 @@ class AIClient:
                 hint = FORMULA_STYLE_HINT
         if not hint:
             return messages
-
-        result = [dict(entry) for entry in messages]
-        for entry in result:
-            if entry.get("role") == "system":
-                content = entry.get("content")
-                if isinstance(content, str) and hint not in content:
-                    entry["content"] = f"{content}\n\n{hint}".strip()
-                return result
-        result.insert(0, {"role": "system", "content": hint})
-        return result
+        return AIClient._with_hint(messages, hint)
 
     @staticmethod
     def _finalize(content: str | None) -> str | None:
-        """Rewrite scientific notation in the answer as Unicode for Telegram.
+        """Clean the answer and normalize scientific notation for Telegram.
 
-        With rich messages the raw LaTeX survives for Telegram's native
-        renderer, so the Unicode rewrite only matters on the legacy path.
+        Text-form tool calls (search_notes, DSML, …) are removed first: the
+        bot executes only structured tool calls, so such markup must never
+        reach the user. With rich messages the raw LaTeX survives for
+        Telegram's native renderer, so the Unicode rewrite only matters on the
+        legacy path.
         """
+        content = strip_tool_markup(content)
         if (
             not content
             or config.rich_messages
@@ -1979,7 +2019,9 @@ class AIClient:
         return str(content)
 
     @classmethod
-    def _parse_result(cls, data: dict[str, Any], elapsed: float = 0.0) -> ChatResult:
+    def _parse_result(
+        cls, data: dict[str, Any], elapsed: float = 0.0, *, finalize: bool = True
+    ) -> ChatResult:
         choices = data.get("choices") or []
         if not choices:
             return ChatResult()
@@ -2006,8 +2048,11 @@ class AIClient:
                 )
             )
 
+        content = cls._normalize_content(message.get("content"))
+        if finalize:
+            content = cls._finalize(content)
         return ChatResult(
-            content=cls._finalize(cls._normalize_content(message.get("content"))),
+            content=content,
             tool_calls=calls,
             elapsed=elapsed,
             usage=_extract_usage(data),
