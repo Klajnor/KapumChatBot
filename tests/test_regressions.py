@@ -1647,6 +1647,82 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             req.call_args.args[0], "https://api.search.brave.com/res/v1/web/search"
         )
 
+    def test_search_configured_duckduckgo_needs_no_key(self):
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "duckduckgo"),
+            patch.object(config, "search_api_key", ""),
+            patch.object(search, "duckduckgo_available", return_value=True),
+        ):
+            self.assertTrue(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "ddg"),  # short alias
+            patch.object(config, "search_api_key", ""),
+            patch.object(search, "duckduckgo_available", return_value=True),
+        ):
+            self.assertTrue(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "duckduckgo"),
+            patch.object(config, "search_api_key", "k"),
+            # Without the ddgs package the provider cannot work at all.
+            patch.object(search, "duckduckgo_available", return_value=False),
+        ):
+            self.assertFalse(search.search_configured())
+
+    async def test_search_duckduckgo_parses_results(self):
+        rows = [
+            {
+                "title": "T <b>x</b>",
+                "href": (
+                    "https://duckduckgo.com/l/?uddg="
+                    "https%3A%2F%2Ft.test%2Fa%3Fb%3D1"
+                ),
+                "body": "C &amp; more",
+            },
+            {"title": "skip-me"},  # no url -> skipped
+            {"title": "mail", "href": "mailto:x@y.test", "body": "skip"},
+        ]
+        with (
+            patch.object(config, "search_provider", "ddg"),
+            patch.object(config, "search_api_key", ""),
+            patch.object(search, "duckduckgo_available", return_value=True),
+            patch.object(search, "_duckduckgo_sync", return_value=rows) as provider,
+            patch.object(search, "fetch_url_text", AsyncMock(return_value=None)),
+        ):
+            results = await search.search_web("q", 5)
+        self.assertEqual(len(results), 1)
+        # ddgs returns HTML-ish fields; the model must get plain text.
+        self.assertEqual(results[0].title, "T x")
+        # /l/?uddg=… wrappers are resolved to the real page.
+        self.assertEqual(results[0].url, "https://t.test/a?b=1")
+        self.assertEqual(results[0].snippet, "C & more")
+        provider.assert_called_once_with("q", 5)
+
+    async def test_search_duckduckgo_failure_is_reported(self):
+        with (
+            patch.object(config, "search_provider", "duckduckgo"),
+            patch.object(search, "duckduckgo_available", return_value=True),
+            patch.object(
+                search, "_duckduckgo_sync", side_effect=RuntimeError("blocked")
+            ),
+        ):
+            results = await search.search_web("q")
+        self.assertEqual(results, [])
+        self.assertTrue(results.failed)
+        self.assertEqual(results.error, "provider_error")
+
+    async def test_search_duckduckgo_without_package_is_a_failure(self):
+        with (
+            patch.object(config, "search_provider", "duckduckgo"),
+            patch.object(search, "duckduckgo_available", return_value=False),
+        ):
+            results = await search.search_web("q")
+        self.assertEqual(results, [])
+        self.assertTrue(results.failed)
+        self.assertEqual(results.error, "missing_dependency")
+
     async def test_search_failure_returns_empty(self):
         with (
             patch.object(config, "search_provider", "tavily"),
@@ -1916,7 +1992,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не удался", retry_messages[-1]["content"])
 
     async def test_answer_with_ai_no_search_tool_without_key(self):
-        """Backward compat: no key -> the model is not offered search_web."""
+        """Backward compat: a keyed provider without a key offers no search."""
         from bot.services.access import AccessResult
 
         message = SimpleNamespace(
@@ -1942,6 +2018,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
             patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_key", ""),  # no key
             patch.object(chat, "waiting", no_wait),
             patch.object(

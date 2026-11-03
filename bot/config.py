@@ -855,16 +855,24 @@ class Config:
     # --- Web search (RAG) ---
     # The chat model gets a search_web tool and queries the live internet when
     # a question needs current information; numbered results are fed back and
-    # the answer cites them as [n]. Needs SEARCH_API_KEY — with no key the
-    # tool is not offered and nothing changes.
+    # the answer cites them as [n]. DuckDuckGo (the default) needs no key, only
+    # the ddgs package; Tavily/Brave need SEARCH_API_KEY — with no key they are
+    # not offered and nothing changes.
     enable_web_search: bool = field(
         default_factory=lambda: _env_bool("ENABLE_WEB_SEARCH", True)
     )
+    # "duckduckgo" (https://duckduckgo.com, package ddgs, no key),
     # "tavily" (https://tavily.com) or "brave" (Brave Search API).
     search_provider: str = field(
-        default_factory=lambda: _env("SEARCH_PROVIDER", default="tavily").lower()
+        default_factory=lambda: _env("SEARCH_PROVIDER", default="duckduckgo").lower()
     )
-    # Provider key (alias TAVILY_API_KEY is also accepted).
+    # DuckDuckGo backend inside ddgs: "duckduckgo" (the site's own HTML results,
+    # fast) or "auto" / a comma list such as "duckduckgo,bing" (more sources,
+    # noticeably slower — html.duckduckgo.com throttles busy IPs with HTTP 202).
+    search_ddgs_backend: str = field(
+        default_factory=lambda: _env("SEARCH_DDGS_BACKEND", default="duckduckgo").lower()
+    )
+    # Key for tavily/brave (alias TAVILY_API_KEY is also accepted).
     search_api_key: str = field(
         default_factory=lambda: _env("SEARCH_API_KEY", "TAVILY_API_KEY")
     )

@@ -8,12 +8,16 @@ as a ``tool`` message and lets the model compose a cited answer
 
 Supported providers (``SEARCH_PROVIDER``):
 
+* ``duckduckgo`` (default) — DuckDuckGo through the optional ``ddgs`` package;
+  no API key and no account, so search works right after installation;
 * ``tavily`` — LLM-oriented search API (https://tavily.com, ``tvly-…`` keys);
 * ``brave``  — Brave Search API (``BSA…`` subscription tokens).
 
-Both speak plain HTTPS through aiohttp and need ``SEARCH_API_KEY``. Without a
-key the tool is simply not offered to the model and the bot behaves exactly
-as before. Первые результаты читаются через SSRF-защищённый загрузчик
+Tavily/Brave speak plain HTTPS through aiohttp and need ``SEARCH_API_KEY``;
+without a key they are not offered to the model and the bot behaves exactly as
+before. DuckDuckGo is a scraping provider — ``ddgs`` (or a proxy) may be
+blocked by the site, so successes and failures are logged with an operation id.
+Первые результаты читаются через SSRF-защищённый загрузчик
 ``bot/services/documents.py`` перед передачей модели для общего саммари.
 """
 
@@ -21,14 +25,16 @@ from __future__ import annotations
 
 import asyncio
 import html
+import importlib.util
 import json
 import logging
 import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 
@@ -41,7 +47,10 @@ from bot.services.untrusted import wrap_untrusted
 logger = logging.getLogger(__name__)
 
 # Providers with a built-in implementation.
-PROVIDERS = ("tavily", "brave")
+PROVIDERS = ("duckduckgo", "tavily", "brave")
+
+# Short spellings accepted in SEARCH_PROVIDER.
+_PROVIDER_ALIASES = {"ddg": "duckduckgo", "duck": "duckduckgo"}
 
 # Snippets are trimmed so one search cannot flood the model's context.
 # A search provider response is JSON with short snippets; anything larger is
@@ -170,11 +179,36 @@ def _response_parts(value: Any) -> tuple[Any, str]:
     return value, ""
 
 
+@lru_cache(maxsize=1)
+def duckduckgo_available() -> bool:
+    """True when the optional ``ddgs`` package is installed.
+
+    DuckDuckGo has no keyless JSON API: the provider scrapes the HTML result
+    page through ``ddgs``. A broken installation counts as "not installed" so
+    the tool is simply not offered instead of failing on every question.
+    """
+    try:
+        return importlib.util.find_spec("ddgs") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def provider_name() -> str:
+    """Normalised ``SEARCH_PROVIDER`` (lower-case, aliases resolved)."""
+    value = (config.search_provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(value, value)
+
+
 def search_configured() -> bool:
     """True when the ``search_web`` tool should be offered to the model."""
-    if not config.enable_web_search or not config.search_api_key:
+    if not config.enable_web_search:
         return False
-    return config.search_provider.strip().lower() in PROVIDERS
+    provider = provider_name()
+    if provider not in PROVIDERS:
+        return False
+    if provider == "duckduckgo":
+        return duckduckgo_available()
+    return bool(config.search_api_key)
 
 
 # --- HTTP helpers (keys are never logged) --------------------------------------
@@ -233,6 +267,94 @@ async def _request_json(
 
 
 # --- Providers ------------------------------------------------------------------
+
+
+def _direct_url(url: str) -> str:
+    """Resolve DuckDuckGo's ``/l/?uddg=<real url>`` redirect wrapper."""
+    cleaned = (url or "").strip()
+    if "duckduckgo.com/l/" in cleaned:
+        target = (parse_qs(urlsplit(cleaned).query).get("uddg") or [""])[0]
+        if target:
+            cleaned = target
+    return cleaned
+
+
+def _duckduckgo_sync(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Blocking ``ddgs`` query; runs in a worker thread.
+
+    ``ddgs`` is synchronous and spawns its own threads, so the event loop must
+    never call it directly. An empty result set is a normal answer from the
+    library (``DDGSException('No results found.')``), not a provider failure:
+    ``html.duckduckgo.com`` answers 202 (an anti-bot page) instead of an error
+    when the IP is throttled, and the library reports that as "no results".
+    """
+    from ddgs import DDGS
+    from ddgs.exceptions import DDGSException
+
+    backend = (config.search_ddgs_backend or "duckduckgo").strip().lower()
+    try:
+        with DDGS(timeout=config.search_timeout) as ddgs:
+            return ddgs.text(
+                query,
+                region="wt-wt",
+                safesearch="moderate",
+                max_results=max_results,
+                backend=backend or "duckduckgo",
+            ) or []
+    except DDGSException as exc:
+        if "no results" in str(exc).lower():
+            return []
+        raise
+
+
+async def _search_duckduckgo(query: str, max_results: int) -> SearchResults:
+    """DuckDuckGo via the optional ``ddgs`` package (no API key)."""
+    if not duckduckgo_available():
+        logger.warning(
+            "SEARCH_PROVIDER=duckduckgo needs the ddgs package "
+            "(pip install ddgs) [%s]",
+            _operation_context(),
+        )
+        return SearchResults(error="missing_dependency")
+    try:
+        # ddgs bounds each HTTP request by SEARCH_TIMEOUT; this also bounds the
+        # thread call in case the library stalls inside its own thread pool.
+        async with asyncio.timeout(config.search_timeout + 5):
+            rows = await asyncio.to_thread(_duckduckgo_sync, query, max_results)
+    except TimeoutError:
+        logger.warning(
+            "DuckDuckGo search timed out after %ss [%s]",
+            config.search_timeout, _operation_context(),
+        )
+        return SearchResults(error="timeout")
+    except Exception as exc:  # noqa: BLE001 — поиск не должен ломать ответ
+        # Class name only: library messages may echo the query.
+        reason = (
+            "ratelimit" if "ratelimit" in type(exc).__name__.lower()
+            else "provider_error"
+        )
+        logger.warning(
+            "DuckDuckGo search failed [%s]: %s",
+            _operation_context(), type(exc).__name__,
+        )
+        return SearchResults(error=reason)
+    results: list[SearchResult] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        url = _direct_url(str(item.get("href") or item.get("url") or ""))
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        results.append(
+            SearchResult(
+                title=_clean(item.get("title")) or url,
+                url=url,
+                snippet=_clean(item.get("body"))[:_SNIPPET_CHARS],
+            )
+        )
+        if len(results) >= max_results:
+            break
+    return SearchResults(results)
 
 
 async def _search_tavily(query: str, max_results: int) -> SearchResults:
@@ -360,9 +482,11 @@ async def search_web(query: str, max_results: int | None = None) -> SearchResult
         else config.search_max_results
     )
     limit = max(1, min(limit, 10))
-    provider = config.search_provider.strip().lower()
+    provider = provider_name()
     try:
-        if provider == "tavily":
+        if provider == "duckduckgo":
+            raw = await _search_duckduckgo(query, limit)
+        elif provider == "tavily":
             raw = await _search_tavily(query, limit)
         elif provider == "brave":
             raw = await _search_brave(query, limit)

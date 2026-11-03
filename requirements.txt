@@ -30,6 +30,10 @@ yt-dlp>=2025.1.1
 # Link analysis (optional): high-quality main-content extraction from web
 # pages. Without it a built-in stdlib HTML parser is used as a fallback.
 trafilatura>=2.0
+# Web search without an API key (SEARCH_PROVIDER=duckduckgo): ddgs fetches the
+# DuckDuckGo HTML result page. Without the package the search tool is simply
+# not offered to the model (Tavily/Brave keep working from their API keys).
+ddgs>=9.0
 # Conversation export (optional): PDF rendering for /export and the 📄 button.
 # Unicode (Cyrillic) works via the DejaVu fonts that matplotlib already ships;
 # without fpdf2 the export falls back to Markdown automatically.

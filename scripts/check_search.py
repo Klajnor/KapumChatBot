@@ -31,11 +31,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bot.config import config
 from bot.services.ai_client import ai_client
 from bot.services.search import (
+    PROVIDERS,
     SEARCH_TOOL,
     _search_brave,
+    _search_duckduckgo,
     _search_tavily,
     apply_search_hint,
+    duckduckgo_available,
     format_search_results,
+    provider_name,
     search_configured,
     search_web,
 )
@@ -51,14 +55,17 @@ def mask(key: str) -> str:
 def endpoint() -> str:
     if config.search_api_url:
         return config.search_api_url
-    if config.search_provider.strip().lower() == "brave":
+    provider = provider_name()
+    if provider == "brave":
         return "https://api.search.brave.com/res/v1/web/search"
+    if provider == "duckduckgo":
+        return "https://html.duckduckgo.com/html/ (through ddgs)"
     return "https://api.tavily.com/search"
 
 
 async def raw_probe(query: str) -> bool:
     """One hand-made request: is the body JSON at all?"""
-    provider = config.search_provider.strip().lower()
+    provider = provider_name()
     url = endpoint()
     headers = {"Accept": "application/json"}
     if provider == "brave":
@@ -110,11 +117,14 @@ async def raw_probe(query: str) -> bool:
 
 
 async def probe(query: str) -> int:
-    provider = config.search_provider.strip().lower()
+    provider = provider_name()
     print("=== configuration ===")
     print(f"ENABLE_WEB_SEARCH : {config.enable_web_search}")
     print(f"SEARCH_PROVIDER   : {provider or '(empty)'}")
     print(f"SEARCH_API_KEY    : {mask(config.search_api_key)}")
+    if provider == "duckduckgo":
+        print(f"ddgs installed    : {duckduckgo_available()}")
+        print(f"ddgs backend      : {config.search_ddgs_backend or 'duckduckgo'}")
     print(f"endpoint          : {endpoint()}")
     print(f"timeout / results : {config.search_timeout}s / {config.search_max_results}")
     print(f"max rounds        : {config.max_search_rounds}")
@@ -122,30 +132,46 @@ async def probe(query: str) -> int:
     if not config.enable_web_search:
         print("\nDISABLED: set ENABLE_WEB_SEARCH=true and restart the bot.")
         return 1
-    if not config.search_api_key:
-        print("\nNO KEY: set SEARCH_API_KEY (tvly-… for Tavily, BSA… for Brave).")
+    if provider not in PROVIDERS:
+        print(f"\nUNKNOWN PROVIDER {provider!r}: use 'duckduckgo', 'tavily' or 'brave'.")
         return 1
-    if provider not in ("tavily", "brave"):
-        print(f"\nUNKNOWN PROVIDER {provider!r}: use 'tavily' or 'brave'.")
+    if provider == "duckduckgo":
+        if not duckduckgo_available():
+            print("\nNO PACKAGE: pip install ddgs (or switch to tavily/brave).")
+            return 1
+    elif not config.search_api_key:
+        print("\nNO KEY: set SEARCH_API_KEY (tvly-… for Tavily, BSA… for Brave).")
         return 1
     print(f"\nsearch_configured() -> {search_configured()}")
 
     print("\n=== step 1: raw endpoint ===")
-    raw_ok = await raw_probe(query)
+    raw_ok: bool | None
+    if provider == "duckduckgo":
+        # The provider parses HTML through ddgs; there is no JSON API to probe.
+        print("    skipped: ddgs builds its own request to html.duckduckgo.com")
+        raw_ok = None
+    else:
+        raw_ok = await raw_probe(query)
 
     print("\n=== step 2: provider parser ===")
     try:
-        results = (
-            await _search_brave(query, 3)
-            if provider == "brave"
-            else await _search_tavily(query, 3)
-        )
+        if provider == "duckduckgo":
+            results = await _search_duckduckgo(query, 3)
+        elif provider == "brave":
+            results = await _search_brave(query, 3)
+        else:
+            results = await _search_tavily(query, 3)
     except Exception as exc:  # noqa: BLE001 - diagnostics must not crash
         print(f"    parser raised: {exc!r}")
         results = []
     print(f"    parsed {len(results)} result(s)")
     if getattr(results, "error", ""):
         print(f"    provider failure: {results.error}")
+    if provider == "duckduckgo" and not results:
+        print(
+            "    note: ddgs also returns an empty list when html.duckduckgo.com "
+            "answers 202 (rate limit) instead of a result page"
+        )
 
     print("\n=== step 3: search_web() (the handler's path) ===")
     live = await search_web(query, 3)
@@ -161,13 +187,18 @@ async def probe(query: str) -> int:
     if live:
         print(format_search_results(query, live)[:400])
         print("\nOK: the model will receive this as a tool result.")
-        if not raw_ok:
+        if raw_ok is False:
             print(
                 "Note: the raw probe failed but parsing worked — check the "
                 "content-type/URL override later."
             )
         return 0
-    if raw_ok:
+    if raw_ok is None:
+        print(
+            "FAIL: DuckDuckGo returned no hits — the query found nothing or the "
+            "server IP is being throttled. Try SEARCH_DDGS_BACKEND=auto."
+        )
+    elif raw_ok:
         print(
             "FAIL: the API answered valid JSON but no results were parsed — "
             "response shape changed or the query found nothing."
