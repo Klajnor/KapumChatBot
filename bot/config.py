@@ -1090,6 +1090,16 @@ class Config:
     log_prompts: bool = field(
         default_factory=lambda: _env_bool("LOG_PROMPTS", False)
     )
+    # Rotating file for warnings/errors (post-mortem diagnostics). ``auto``
+    # puts ``errors.log`` next to the SQLite database, a directory the service
+    # can already write to; ``off`` keeps journald/stdout only. An absolute
+    # path overrides the location.
+    log_file: str = field(
+        default_factory=lambda: _env("LOG_FILE", "auto")
+    )
+    log_file_level: str = field(
+        default_factory=lambda: _env("LOG_FILE_LEVEL", "WARNING")
+    )
 
     # --- Slow-request feedback ---
     # If an AI request runs longer than ``progress_delay`` seconds, a "waiting"
@@ -1501,6 +1511,14 @@ class Config:
                 errors.append(
                     f"{name} must be an absolute path (got {value!r})"
                 )
+        if (
+            self.log_file.lower() not in {"", "auto", "off", "none"}
+            and not _absolute_path(self.log_file)
+        ):
+            errors.append(
+                "LOG_FILE must be 'auto', 'off' or an absolute path "
+                f"(got {self.log_file!r})"
+            )
         return errors
 
 

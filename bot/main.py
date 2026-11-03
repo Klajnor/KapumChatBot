@@ -44,6 +44,7 @@ from bot.handlers import (
     digest as digest_handler,
 )
 from bot.handlers.chat import _album_cleanup
+from bot.logging_setup import setup_file_logging
 from bot.services import telegraph, thinking
 from bot.services.ai_client import ai_client, ffmpeg_available
 from bot.services.digest import digest_scheduler_loop
@@ -184,6 +185,7 @@ async def _poll_forever() -> None:
 async def main() -> None:
     """Entry point: validate config, init DB, start polling."""
     config.validate()
+    setup_file_logging()
     logger.info("Configuration validated successfully")
     if config.log_prompts:
         logger.warning(

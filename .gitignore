@@ -14,6 +14,10 @@ telegraph_account.json
 *.db-wal
 *.db-shm
 
+# Rotating error log (LOG_FILE=auto puts it next to the database)
+errors.log
+errors.log.*
+
 # Локальные веса rembg; в Git хранится только пустой каталог.
 /models/rembg/*
 !/models/rembg/.gitkeep

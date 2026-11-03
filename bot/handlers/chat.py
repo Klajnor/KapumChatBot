@@ -82,6 +82,7 @@ from bot.services.search import (
     build_assistant_tool_message,
     build_tool_response,
     format_search_results,
+    remove_search_hint,
     search_configured,
     search_web,
 )
@@ -172,6 +173,14 @@ MSG_ENHANCE_CHOICE = (
     "denoise, sharpen, colour; the content is never altered.\n"
     "🧠 <b>Neural network</b> — the photo is re-drawn to restore lost "
     "detail; slower, may slightly change small details."
+)
+
+# Private chats only: a failed search must not look like "nothing was found".
+# The model is then asked again without the search tool (see _answer_with_ai).
+SEARCH_UNAVAILABLE_NOTICE = (
+    "⚠️ <b>Web search is unavailable right now.</b>\n\n"
+    "Answering from the model's own knowledge, without live sources. "
+    "The failure has been logged."
 )
 
 # Display math still reaches the PNG renderer, so the streamed text must not
@@ -1318,7 +1327,7 @@ async def _resolve_tool_round(
     search_allowed: bool,
     mcp_allowed: bool,
     budget: ToolBudget | None = None,
-) -> None:
+) -> bool:
     """Run the model's search/MCP calls and append the tool exchange.
 
     Adds the assistant turn that requested the calls, one ``tool`` response
@@ -1329,9 +1338,13 @@ async def _resolve_tool_round(
     results. The exchange lives **only** in this request: nothing here is
     written to the database — the history stores the user question and the
     final answer, never tool calls or tool output.
+
+    Returns True when the search provider itself failed (as opposed to simply
+    finding nothing), so the caller can retry without the search tool.
     """
     messages.append(build_assistant_tool_message(result.content, calls))
     budget = budget or ToolBudget()
+    search_failed = False
 
     search_calls = [
         call for call in calls
@@ -1363,9 +1376,17 @@ async def _resolve_tool_round(
             if not isinstance(max_results, int) or isinstance(max_results, bool):
                 max_results = None
             results = await search_web(query, max_results) if query else []
+            error = str(getattr(results, "error", "") or "")
+            if error:
+                search_failed = True
             messages.append(
                 build_tool_response(
-                    call.id, budget.clip(format_search_results(query, results))
+                    call.id,
+                    budget.clip(
+                        format_search_results(
+                            query, results, failed=bool(error)
+                        )
+                    ),
                 )
             )
             continue
@@ -1377,6 +1398,8 @@ async def _resolve_tool_round(
             call.name, call.arguments, max_chars=budget.context_chars
         )
         messages.append(build_tool_response(call.id, budget.clip(output)))
+
+    return search_failed
 
 
 def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1390,6 +1413,19 @@ def _without_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tool
         for tool in tools
         if not str((tool.get("function") or {}).get("name", "")).startswith("mcp__")
+    ]
+
+
+def _without_search_tool(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop ``search_web`` after the provider failed.
+
+    The next model request must not offer a tool that cannot answer; otherwise
+    the model may spend another round on the same broken search.
+    """
+    return [
+        tool
+        for tool in tools
+        if str((tool.get("function") or {}).get("name", "")) != "search_web"
     ]
 
 
@@ -1490,6 +1526,7 @@ async def _answer_with_ai(
     total_elapsed = 0.0
     search_rounds = 0
     mcp_rounds = 0
+    search_failed_once = False
     # Total calls/context for this question, not per round: one model turn may
     # ask for many searches or MCP reads.
     budget = ToolBudget()
@@ -1608,7 +1645,7 @@ async def _answer_with_ai(
                 if printer is not None:
                     await printer.discard()
                     printer = None
-                await _resolve_tool_round(
+                search_failed = await _resolve_tool_round(
                     message,
                     messages,
                     result,
@@ -1618,11 +1655,28 @@ async def _answer_with_ai(
                     mcp_allowed=can_mcp,
                     budget=budget,
                 )
+                if search_failed:
+                    # The provider is down (not just "zero hits"): make one
+                    # more request without the broken tool and tell the user in
+                    # private chats, where the failure would otherwise look
+                    # like a confident "nothing found" answer.
+                    search_failed_once = True
+                    search_ready = False
+                    tools = _without_search_tool(tools)
+                    remove_search_hint(messages)
+                    logger.warning(
+                        "Web search failed; retrying without the search tool "
+                        "(chat=%s model=%s)",
+                        message.chat.id,
+                        model,
+                    )
+                    if _is_private(message):
+                        await safe_answer(message, SEARCH_UNAVAILABLE_NOTICE)
                 continue
-            if handled_calls and not result.content:
-                # Budget spent and the model still only wants to use tools: one
-                # final tools-less request so the user gets an answer from the
-                # results already gathered.
+            if (handled_calls or search_failed_once) and not result.content:
+                # Budget spent / search broke and the model still only wants
+                # to use tools: one final tools-less request so the user gets
+                # an answer from the results already gathered.
                 logger.info("Tool round limit reached; forcing a final answer")
                 result = await _single_shot(messages, model, settings, None)
                 result.tool_calls = []

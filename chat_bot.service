@@ -13,7 +13,7 @@ WorkingDirectory=/opt/KapumChatBot
 # а каталог с кодом может оставаться недоступным на запись для сервиса.
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 # Каталоги данных и кэша создаются systemd с владельцем brain:
-#   /var/lib/kapum-chatbot   — chat_bot.db (+ WAL), telegraph_account.json и модель rembg
+#   /var/lib/kapum-chatbot   — chat_bot.db (+ WAL), errors.log, telegraph_account.json и модель rembg
 #   /var/cache/kapum-chatbot — кэш шрифтов matplotlib
 # В .env.linux на сервере укажите абсолютные пути (относительные отклоняются):
 #   DATABASE_URL=sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db

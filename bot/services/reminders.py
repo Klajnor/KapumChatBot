@@ -56,6 +56,7 @@ from bot.services.search import (
     build_assistant_tool_message,
     build_tool_response,
     format_search_results,
+    remove_search_hint,
     search_configured,
     search_web,
 )
@@ -588,11 +589,24 @@ async def _run_ai_prompt(
             if not isinstance(max_results, int) or isinstance(max_results, bool):
                 max_results = None
             found = await search_web(query, max_results) if query else []
+            failed = bool(getattr(found, "error", "") or "")
             messages.append(
                 build_tool_response(
-                    call.id, budget.clip(format_search_results(query, found))
+                    call.id,
+                    budget.clip(
+                        format_search_results(query, found, failed=failed)
+                    ),
                 )
             )
+            if failed:
+                # Same rule as the interactive chat: retry the prompt without
+                # the broken tool instead of asking the model to search again.
+                remove_search_hint(messages)
+                tools = None
+                logger.warning(
+                    "Reminder %s: web search failed; retrying without it",
+                    due.id,
+                )
         if not served:
             # The per-request budget is spent: ask once more without tools.
             tools = None

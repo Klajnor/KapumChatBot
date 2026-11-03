@@ -144,10 +144,14 @@ async def probe(query: str) -> int:
         print(f"    parser raised: {exc!r}")
         results = []
     print(f"    parsed {len(results)} result(s)")
+    if getattr(results, "error", ""):
+        print(f"    provider failure: {results.error}")
 
     print("\n=== step 3: search_web() (the handler's path) ===")
     live = await search_web(query, 3)
     print(f"    search_web() -> {len(live)} result(s)")
+    if getattr(live, "error", ""):
+        print(f"    provider failure: {live.error}")
     for index, item in enumerate(live, start=1):
         print(f"    [{index}] {item.title[:70]}")
         print(f"         {item.url}")

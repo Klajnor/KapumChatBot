@@ -24,6 +24,8 @@ import html
 import json
 import logging
 import re
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,7 +35,7 @@ import aiohttp
 from bot.config import config
 from bot.services.ai_client import ToolCall
 from bot.services.documents import fetch_url_text
-from bot.services.operations import stage
+from bot.services.operations import current_operation, stage
 from bot.services.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,60 @@ class SearchResult:
     page_text: str = ""
 
 
+class SearchResults(list[SearchResult]):
+    """Search hits plus a short failure code when the provider did not answer.
+
+    Behaves exactly like a plain list, so callers that only need the hits keep
+    working (and ``== []`` still holds on failure). ``error`` is a log-safe
+    category such as ``timeout`` or ``http_401`` — never the provider body or
+    the user's query.
+    """
+
+    def __init__(
+        self, results: Iterable[SearchResult] = (), *, error: str = ""
+    ) -> None:
+        super().__init__(results)
+        self.error = error
+
+    @property
+    def failed(self) -> bool:
+        """True when the search provider could not be queried."""
+        return bool(self.error)
+
+
+@dataclass(slots=True)
+class _RequestResult:
+    """One search API response: parsed JSON or a log-safe failure code."""
+
+    data: Any = None
+    error: str = ""
+
+
+def _operation_context() -> str:
+    """Identify the request in the log without any user content."""
+    operation = current_operation()
+    if operation is None:
+        return "op=-"
+    return (
+        f"op={operation.id} kind={operation.kind!r} "
+        f"chat={operation.chat_id} user={operation.user_id} "
+        f"stage={operation.stage!r}"
+    )
+
+
+def _response_parts(value: Any) -> tuple[Any, str]:
+    """Split a response object into data and a failure code.
+
+    ``None`` is accepted as a failure for backward compatibility with tests and
+    older callers that patched :func:`_request_json` directly.
+    """
+    if isinstance(value, _RequestResult):
+        return value.data, value.error
+    if value is None:
+        return None, "request_failed"
+    return value, ""
+
+
 def search_configured() -> bool:
     """True when the ``search_web`` tool should be offered to the model."""
     if not config.enable_web_search or not config.search_api_key:
@@ -131,10 +187,11 @@ async def _request_json(
     method: str = "POST",
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
-) -> Any | None:
-    """One JSON request to a search API; None on any failure."""
+) -> _RequestResult:
+    """One JSON request to a search API; never raises."""
     host = urlsplit(url).netloc
     timeout = aiohttp.ClientTimeout(total=config.search_timeout)
+    started = time.monotonic()
     try:
         async with (
             aiohttp.ClientSession(timeout=timeout) as session,
@@ -143,32 +200,45 @@ async def _request_json(
             ) as resp,
         ):
             body_bytes = await resp.content.read(_MAX_SEARCH_BODY + 1)
+            elapsed = time.monotonic() - started
             if len(body_bytes) > _MAX_SEARCH_BODY:
-                logger.warning("Search API %s returned an oversized body", host)
-                return None
+                logger.warning(
+                    "Search API %s returned an oversized body after %.2fs [%s]",
+                    host, elapsed, _operation_context(),
+                )
+                return _RequestResult(error="oversized_response")
             body = body_bytes.decode("utf-8", "replace")
             if resp.status != 200:
                 logger.warning(
-                    "Search API %s returned HTTP %s: %s",
-                    host, resp.status, body[:200],
+                    "Search API %s returned HTTP %s after %.2fs [%s]: %s",
+                    host, resp.status, elapsed, _operation_context(), body[:200],
                 )
-                return None
-            return json.loads(body)
+                return _RequestResult(error=f"http_{resp.status}")
+            try:
+                return _RequestResult(data=json.loads(body))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Search API %s returned invalid JSON after %.2fs [%s]",
+                    host, elapsed, _operation_context(),
+                )
+                return _RequestResult(error="invalid_json")
     except (TimeoutError, aiohttp.ClientError, OSError) as exc:
-        logger.warning("Search API request to %s failed: %s", host, exc)
-        return None
-    except json.JSONDecodeError:
-        logger.warning("Search API %s returned invalid JSON", host)
-        return None
+        reason = "timeout" if isinstance(exc, TimeoutError) else "network"
+        logger.warning(
+            "Search API request to %s failed after %.2fs [%s]: %s: %s",
+            host, time.monotonic() - started, _operation_context(),
+            type(exc).__name__, exc,
+        )
+        return _RequestResult(error=reason)
 
 
 # --- Providers ------------------------------------------------------------------
 
 
-async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
+async def _search_tavily(query: str, max_results: int) -> SearchResults:
     """Tavily Search API (POST /search, Bearer auth)."""
     url = config.search_api_url or "https://api.tavily.com/search"
-    data = await _request_json(
+    data, error = _response_parts(await _request_json(
         url,
         {
             "Authorization": f"Bearer {config.search_api_key}",
@@ -180,10 +250,16 @@ async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
             "search_depth": "basic",
             "include_answer": False,
         },
-    )
+    ))
+    if error:
+        return SearchResults(error=error)
     if not isinstance(data, dict):
-        return []
-    results = []
+        logger.warning(
+            "Search API tavily returned an unexpected payload [%s]",
+            _operation_context(),
+        )
+        return SearchResults(error="unexpected_response")
+    results: list[SearchResult] = []
     for item in data.get("results") or []:
         if not isinstance(item, dict) or not item.get("url"):
             continue
@@ -196,13 +272,13 @@ async def _search_tavily(query: str, max_results: int) -> list[SearchResult]:
         )
         if len(results) >= max_results:
             break
-    return results
+    return SearchResults(results)
 
 
-async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
+async def _search_brave(query: str, max_results: int) -> SearchResults:
     """Brave Search API (GET /res/v1/web/search, subscription token header)."""
     url = config.search_api_url or "https://api.search.brave.com/res/v1/web/search"
-    data = await _request_json(
+    data, error = _response_parts(await _request_json(
         url,
         {
             "X-Subscription-Token": config.search_api_key,
@@ -210,10 +286,16 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
         },
         method="GET",
         params={"q": query, "count": max_results},
-    )
+    ))
+    if error:
+        return SearchResults(error=error)
     if not isinstance(data, dict):
-        return []
-    results = []
+        logger.warning(
+            "Search API brave returned an unexpected payload [%s]",
+            _operation_context(),
+        )
+        return SearchResults(error="unexpected_response")
+    results: list[SearchResult] = []
     web = data.get("web") or {}
     for item in web.get("results") or []:
         if not isinstance(item, dict) or not item.get("url"):
@@ -227,7 +309,7 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
         )
         if len(results) >= max_results:
             break
-    return results
+    return SearchResults(results)
 
 
 # --- Entry point ----------------------------------------------------------------
@@ -236,6 +318,7 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
 async def _read_result_pages(results: list[SearchResult]) -> None:
     """Прочитать страницы без обхода ссылок; сбой одной не теряет выдачу."""
     semaphore = asyncio.Semaphore(_PAGE_CONCURRENCY)
+    context = _operation_context()
 
     async def read(item: SearchResult) -> None:
         async with semaphore:
@@ -247,20 +330,30 @@ async def _read_result_pages(results: list[SearchResult]) -> None:
                     item.page_text = text[:_PAGE_CHARS]
                     if len(text) > _PAGE_CHARS:
                         item.page_text += "\n[Текст страницы сокращён]"
-            except Exception:  # noqa: BLE001 — недоступный источник не ломает ответ
-                logger.warning("Search result page could not be read")
+            except Exception as exc:  # noqa: BLE001 — недоступный источник не ломает ответ
+                logger.warning(
+                    "Search result page %s could not be read [%s]: %s",
+                    urlsplit(item.url).netloc or "?",
+                    context,
+                    type(exc).__name__,
+                )
 
     await asyncio.gather(*(read(item) for item in results))
 
 
 @stage("Searching web / reading results")
-async def search_web(query: str, max_results: int | None = None) -> list[SearchResult]:
-    """Run one web search; returns [] on any failure (never raises)."""
+async def search_web(query: str, max_results: int | None = None) -> SearchResults:
+    """Run one web search; never raises.
+
+    Returns a :class:`SearchResults` list. On a provider error the list is
+    empty and ``results.failed`` is true with a short ``results.error`` code,
+    so the caller can tell a broken search from a search with zero hits.
+    """
     # The query comes from the model's tool call: cap it so a degenerate
     # answer cannot turn into an oversized request URL.
     query = (query or "").strip()[:512]
     if not query:
-        return []
+        return SearchResults()
     limit = (
         max_results
         if isinstance(max_results, int) and not isinstance(max_results, bool)
@@ -270,23 +363,35 @@ async def search_web(query: str, max_results: int | None = None) -> list[SearchR
     provider = config.search_provider.strip().lower()
     try:
         if provider == "tavily":
-            results = await _search_tavily(query, limit)
+            raw = await _search_tavily(query, limit)
         elif provider == "brave":
-            results = await _search_brave(query, limit)
+            raw = await _search_brave(query, limit)
         else:
             logger.warning("Unknown SEARCH_PROVIDER %r; search skipped", provider)
-            return []
+            return SearchResults(error="unknown_provider")
     except Exception:  # search must never break an answer
-        logger.exception("Web search failed (%s)", provider)
-        return []
-    results = results[:limit]
+        logger.exception(
+            "Web search failed (%s) [%s]", provider, _operation_context()
+        )
+        return SearchResults(error="internal_error")
+    # Provider functions may be patched with a plain list in tests.
+    results = raw if isinstance(raw, SearchResults) else SearchResults(raw or ())
+    results = SearchResults(results[:limit], error=results.error)
     await _read_result_pages(results)
     # The query itself is user/model content: keep it out of the logs.
-    logger.info("Web search (%s) -> %d result(s)", provider, len(results))
+    if results.failed:
+        logger.warning(
+            "Web search (%s) failed: %s [%s]",
+            provider, results.error, _operation_context(),
+        )
+    else:
+        logger.info("Web search (%s) -> %d result(s)", provider, len(results))
     return results
 
 
-def format_search_results(query: str, results: list[SearchResult]) -> str:
+def format_search_results(
+    query: str, results: list[SearchResult], *, failed: bool = False
+) -> str:
     """Tool-message body: numbered results the model cites as [n].
 
     The results contain third-party page text and snippets, so they are wrapped as
@@ -294,6 +399,13 @@ def format_search_results(query: str, results: list[SearchResult]) -> str:
     steer the model stays data. The closing instruction stays outside the
     tags — it is ours, not the web's.
     """
+    if failed:
+        return (
+            f"Веб-поиск по запросу {query!r} не удался по технической причине "
+            "(провайдер поиска недоступен). Это не означает, что результатов "
+            "нет. Ответь из собственных знаний и явно скажи пользователю, что "
+            "поиск в интернете сейчас недоступен."
+        )
     if not results:
         return (
             f"Живой поиск по запросу {query!r} не дал результатов. Ответь из "
@@ -361,4 +473,20 @@ def apply_search_hint(messages: list[dict[str, Any]]) -> None:
             content = entry.get("content")
             if isinstance(content, str) and SEARCH_SYSTEM_HINT not in content:
                 entry["content"] = f"{content}\n\n{SEARCH_SYSTEM_HINT}"
+            return
+
+
+def remove_search_hint(messages: list[dict[str, Any]]) -> None:
+    """Remove the search guidance after the tool failed, in place.
+
+    The next request must not tell the model that a working search tool exists
+    when the tool is no longer offered.
+    """
+    for entry in messages:
+        if entry.get("role") == "system":
+            content = entry.get("content")
+            if isinstance(content, str) and SEARCH_SYSTEM_HINT in content:
+                entry["content"] = content.replace(
+                    f"\n\n{SEARCH_SYSTEM_HINT}", ""
+                ).replace(SEARCH_SYSTEM_HINT, "")
             return

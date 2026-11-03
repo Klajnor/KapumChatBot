@@ -1655,6 +1655,39 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(await search.search_web("q"), [])
 
+    async def test_search_failure_records_reason(self):
+        with (
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "k"),
+            patch.object(
+                search,
+                "_request_json",
+                AsyncMock(return_value=search._RequestResult(error="http_503")),
+            ),
+        ):
+            results = await search.search_web("q")
+        self.assertEqual(results, [])
+        self.assertTrue(results.failed)
+        self.assertEqual(results.error, "http_503")
+
+    async def test_search_empty_success_is_not_a_failure(self):
+        payload = {"results": []}
+        with (
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "k"),
+            patch.object(search, "_request_json", AsyncMock(return_value=payload)),
+        ):
+            results = await search.search_web("q")
+        self.assertEqual(results, [])
+        self.assertFalse(results.failed)
+        self.assertEqual(results.error, "")
+
+    def test_format_search_results_failure_is_not_no_results(self):
+        text = search.format_search_results("q", [], failed=True)
+        self.assertIn("не удался", text)
+        self.assertIn("недоступен", text)
+        self.assertNotIn("не дал результатов", text)
+
     async def test_unknown_provider_returns_empty(self):
         with patch.object(config, "search_provider", "nope"):
             self.assertEqual(await search.search_web("q"), [])
@@ -1729,6 +1762,25 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[-1]["role"], "tool")
         self.assertIn("не дал результатов", messages[-1]["content"])
 
+    async def test_resolve_search_round_reports_provider_failure(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1))
+        messages = []
+        call = ToolCall(id="c3", name="search_web", arguments={"query": "q"})
+        result = ChatResult(content=None, tool_calls=[call])
+        failed = search.SearchResults(error="http_503")
+        with (
+            patch.object(chat, "search_web", AsyncMock(return_value=failed)),
+            patch.object(chat, "safe_answer", AsyncMock()),
+        ):
+            search_failed = await chat._resolve_tool_round(
+                message, messages, result, [call],
+                search_ready=True, search_allowed=True, mcp_allowed=False,
+            )
+        self.assertTrue(search_failed)
+        self.assertEqual(messages[-1]["role"], "tool")
+        self.assertIn("не удался", messages[-1]["content"])
+        self.assertIn("недоступен", messages[-1]["content"])
+
     async def test_answer_with_ai_runs_search_loop(self):
         """End-to-end: model asks to search -> results fed back -> answer."""
         from bot.services.access import AccessResult
@@ -1791,6 +1843,77 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool", roles)
         deliver.assert_awaited_once()
         self.assertIn("Here is the news", deliver.call_args.args[2])
+
+    async def test_answer_with_ai_retries_without_search_on_failure(self):
+        """Provider failure: tell the private chat and retry with no search tool."""
+        from bot.services.access import AccessResult
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"),
+            from_user=SimpleNamespace(id=1),
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        service = SimpleNamespace(
+            get_user_settings=AsyncMock(return_value={
+                "model": "m", "system_prompt": "sys",
+                "temperature": 0.5, "max_tokens": 100,
+            }),
+            get_history=AsyncMock(return_value=[]),
+            add_message=AsyncMock(),
+        )
+        access = AccessResult(allowed=True, role="admin", consumed=False)
+
+        search_result = ChatResult(
+            content=None,
+            tool_calls=[
+                ToolCall(id="c1", name="search_web", arguments={"query": "news"})
+            ],
+            elapsed=1.0,
+        )
+        final_result = ChatResult(content="Answer without search.", elapsed=2.0)
+
+        with (
+            patch.object(config, "stream_responses", False),
+            patch.object(config, "enable_image_generation", False),
+            patch.object(config, "enable_sticker_generation", False),
+            patch.object(config, "enable_file_replies", False),
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "tavily"),
+            patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "max_search_rounds", 2),
+            patch.object(chat, "waiting", no_wait),
+            patch.object(
+                chat, "_single_shot",
+                AsyncMock(side_effect=[search_result, final_result]),
+            ) as single,
+            patch.object(
+                chat,
+                "search_web",
+                AsyncMock(return_value=search.SearchResults(error="http_503")),
+            ) as sw,
+            patch.object(chat, "deliver_answer", AsyncMock(return_value=True)),
+            patch.object(chat, "safe_answer", AsyncMock()) as notice,
+            patch.object(chat, "guest_hint", return_value=None),
+            patch.object(chat, "_retry_markup", return_value=None),
+        ):
+            await chat._answer_with_ai(message, service, "what's the news?", access)
+
+        sw.assert_awaited_once()
+        # One search round, then a fresh request without the broken tool.
+        self.assertEqual(single.await_count, 2)
+        retry_tools = single.call_args_list[1].args[3]
+        self.assertIsNone(retry_tools)
+        self.assertTrue(
+            any(
+                "Web search is unavailable" in str(call.args[1])
+                for call in notice.await_args_list
+                if len(call.args) > 1
+            )
+        )
+        retry_messages = single.call_args_list[1].args[0]
+        self.assertNotIn(search.SEARCH_SYSTEM_HINT, retry_messages[0]["content"])
+        self.assertIn("не удался", retry_messages[-1]["content"])
 
     async def test_answer_with_ai_no_search_tool_without_key(self):
         """Backward compat: no key -> the model is not offered search_web."""
