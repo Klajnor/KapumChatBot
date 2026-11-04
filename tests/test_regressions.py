@@ -20,6 +20,7 @@ from bot.config import (
     Config,
     _env_float,
     _parse_personas,
+    _search_api_key,
     config,
 )
 from bot.database.repository import UserRepository
@@ -1547,6 +1548,77 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         props = search.SEARCH_TOOL["function"]["parameters"]["properties"]
         self.assertIn("query", props)
 
+    def test_search_result_urls_are_http_only(self):
+        self.assertEqual(search._http_url("https://a.test/x"), "https://a.test/x")
+        self.assertEqual(search._http_url(" HTTP://a.test/x "), "HTTP://a.test/x")
+        for bad in (
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "/relative",
+            "https://",
+            "https://a.test/\nforged line",
+            "https://a.test/\tforged",
+        ):
+            self.assertEqual(search._http_url(bad), "", bad)
+
+    def test_search_log_helpers_hide_credentials(self):
+        self.assertEqual(
+            search._safe_host("https://user:pass@api.exa.ai:8443/search?q=1"),
+            "api.exa.ai:8443",
+        )
+        self.assertEqual(search._safe_host("http://[broken"), "?")
+        self.assertEqual(
+            search._redact_secrets("bad key secret-1", {"x-api-key": "secret-1"}),
+            "bad key ***",
+        )
+        self.assertEqual(
+            search._redact_secrets(
+                "token secret-2", {"Authorization": "Bearer secret-2"}
+            ),
+            "token ***",
+        )
+
+    async def test_search_request_does_not_follow_redirects(self):
+        class FakeContent:
+            async def read(self, limit):
+                return b'{"ok": true}'
+
+        class FakeResponse:
+            status = 200
+            content = FakeContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeSession:
+            last_kwargs = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def request(self, *args, **kwargs):
+                FakeSession.last_kwargs = kwargs
+                return FakeResponse()
+
+        with patch.object(search.aiohttp, "ClientSession", FakeSession):
+            result = await search._request_json(
+                "https://api.exa.ai/search", {"x-api-key": "secret"}
+            )
+        self.assertEqual(result.data, {"ok": True})
+        # A 3xx must not forward x-api-key to another host.
+        self.assertIsNotNone(FakeSession.last_kwargs)
+        self.assertFalse(FakeSession.last_kwargs["allow_redirects"])
+
     def test_search_configured_requires_key_and_provider(self):
         with (
             patch.object(config, "enable_web_search", True),
@@ -1572,6 +1644,20 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "search_api_key", "k"),
         ):
             self.assertFalse(search.search_configured())
+
+    def test_search_configured_exa_requires_key(self):
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "exa"),
+            patch.object(config, "search_api_key", ""),
+        ):
+            self.assertFalse(search.search_configured())
+        with (
+            patch.object(config, "enable_web_search", True),
+            patch.object(config, "search_provider", "exa"),
+            patch.object(config, "search_api_key", "exa-key"),
+        ):
+            self.assertTrue(search.search_configured())
 
     def test_format_search_results_numbered(self):
         results = [
@@ -1646,6 +1732,108 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             req.call_args.args[0], "https://api.search.brave.com/res/v1/web/search"
         )
+
+    async def test_search_exa_parses_results(self):
+        payload = {
+            "results": [
+                {
+                    "title": "E <b>x</b>",
+                    "url": "https://e.test/a",
+                    "highlights": ["first &amp; point", "second"],
+                },
+                {"title": "skip-me"},  # no url -> skipped
+                {"title": "bad", "url": "javascript:alert(1)"},
+            ]
+        }
+        fetch = AsyncMock(return_value=None)
+        with (
+            patch.object(config, "search_provider", "exa"),
+            patch.object(config, "search_api_key", "exa-key"),
+            patch.object(config, "search_api_url", ""),
+            patch.object(search, "fetch_url_text", fetch),
+            patch.object(
+                search, "_request_json", AsyncMock(return_value=payload)
+            ) as req,
+        ):
+            results = await search.search_web("q", 5)
+        self.assertEqual(len(results), 1)
+        # The result page still goes through the SSRF-protected loader.
+        fetch.assert_awaited_once_with("https://e.test/a")
+        # Exa returns HTML-ish titles and highlights; the model gets plain text.
+        self.assertEqual(results[0].title, "E x")
+        self.assertEqual(results[0].url, "https://e.test/a")
+        self.assertEqual(results[0].snippet, "first & point … second")
+        # The key travels in the header, never in the JSON body.
+        call = req.call_args
+        self.assertEqual(call.args[0], "https://api.exa.ai/search")
+        self.assertEqual(call.args[1]["x-api-key"], "exa-key")
+        self.assertNotIn("exa-key", str(call.kwargs.get("json_payload", {})))
+        self.assertEqual(call.kwargs["json_payload"]["numResults"], 5)
+        self.assertTrue(call.kwargs["json_payload"]["contents"]["highlights"])
+
+    def test_provider_specific_search_keys_do_not_cross(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "exa",
+                "EXA_API_KEY": "exa-key",
+                "TAVILY_API_KEY": "tvly-key",
+            },
+            clear=True,
+        ):
+            self.assertEqual(_search_api_key(), "exa-key")
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "tavily",
+                "EXA_API_KEY": "exa-key",
+                "TAVILY_API_KEY": "tvly-key",
+            },
+            clear=True,
+        ):
+            self.assertEqual(_search_api_key(), "tvly-key")
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "brave",
+                "EXA_API_KEY": "exa-key",
+                "TAVILY_API_KEY": "tvly-key",
+            },
+            clear=True,
+        ):
+            # Neither provider-specific alias belongs to Brave.
+            self.assertEqual(_search_api_key(), "")
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "exa",
+                "SEARCH_API_KEY": "common-key",
+                "EXA_API_KEY": "exa-key",
+            },
+            clear=True,
+        ):
+            # The provider-specific Exa key wins over the shared key.
+            self.assertEqual(_search_api_key(), "exa-key")
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "exa",
+                "SEARCH_API_KEY": "common-key",
+            },
+            clear=True,
+        ):
+            self.assertEqual(_search_api_key(), "common-key")
+        with patch.dict(
+            os.environ,
+            {
+                "SEARCH_PROVIDER": "tavily",
+                "SEARCH_API_KEY": "common-key",
+                "TAVILY_API_KEY": "tvly-key",
+            },
+            clear=True,
+        ):
+            # Historic Tavily precedence is unchanged.
+            self.assertEqual(_search_api_key(), "common-key")
 
     def test_search_configured_duckduckgo_needs_no_key(self):
         with (

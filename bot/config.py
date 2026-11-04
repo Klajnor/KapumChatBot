@@ -75,6 +75,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y", "да"}
 
 
+def _search_api_key() -> str:
+    """API key for the selected search provider.
+
+    Provider-specific aliases are read only when their provider is selected,
+    so a leftover ``TAVILY_API_KEY`` is never sent to Exa or Brave (and
+    ``EXA_API_KEY`` never to Tavily/Brave). For Exa ``EXA_API_KEY`` is
+    preferred over the common ``SEARCH_API_KEY``; Tavily keeps the historic
+    ``SEARCH_API_KEY``-first order, then ``TAVILY_API_KEY``.
+    """
+    provider = _env("SEARCH_PROVIDER", default="duckduckgo").strip().lower()
+    explicit = _env("SEARCH_API_KEY")
+    if provider == "exa":
+        return _env("EXA_API_KEY") or explicit
+    if provider == "tavily":
+        return explicit or _env("TAVILY_API_KEY")
+    return explicit
+
+
 def _absolute_path(value: str) -> bool:
     """True when a non-empty configurable path is absolute.
 
@@ -856,13 +874,14 @@ class Config:
     # The chat model gets a search_web tool and queries the live internet when
     # a question needs current information; numbered results are fed back and
     # the answer cites them as [n]. DuckDuckGo (the default) needs no key, only
-    # the ddgs package; Tavily/Brave need SEARCH_API_KEY — with no key they are
-    # not offered and nothing changes.
+    # the ddgs package; Tavily/Brave/Exa need SEARCH_API_KEY — with no key they
+    # are not offered and nothing changes.
     enable_web_search: bool = field(
         default_factory=lambda: _env_bool("ENABLE_WEB_SEARCH", True)
     )
     # "duckduckgo" (https://duckduckgo.com, package ddgs, no key),
-    # "tavily" (https://tavily.com) or "brave" (Brave Search API).
+    # "tavily" (https://tavily.com), "brave" (Brave Search API) or
+    # "exa" (https://exa.ai).
     search_provider: str = field(
         default_factory=lambda: _env("SEARCH_PROVIDER", default="duckduckgo").lower()
     )
@@ -872,10 +891,9 @@ class Config:
     search_ddgs_backend: str = field(
         default_factory=lambda: _env("SEARCH_DDGS_BACKEND", default="duckduckgo").lower()
     )
-    # Key for tavily/brave (alias TAVILY_API_KEY is also accepted).
-    search_api_key: str = field(
-        default_factory=lambda: _env("SEARCH_API_KEY", "TAVILY_API_KEY")
-    )
+    # Key for tavily/brave/exa. TAVILY_API_KEY and EXA_API_KEY are read only
+    # for their own provider; EXA_API_KEY takes precedence for Exa.
+    search_api_key: str = field(default_factory=_search_api_key)
     # Optional endpoint override (empty = the provider's default URL).
     search_api_url: str = field(
         default_factory=lambda: os.getenv("SEARCH_API_URL", "").strip()

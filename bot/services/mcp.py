@@ -17,8 +17,9 @@ Design notes:
   after a cooldown instead of on every message.
 * A server process receives a **minimal environment** (see
   :func:`_child_environment`): the bot's own secrets — ``BOT_TOKEN``,
-  ``AI_API_KEY``, ``SEARCH_API_KEY``, ``TELEGRAPH_ACCESS_TOKEN``,
-  ``DATABASE_URL`` — are never inherited by third-party MCP code, and
+  ``AI_API_KEY``, ``SEARCH_API_KEY`` (and its ``TAVILY_API_KEY`` /
+  ``EXA_API_KEY`` aliases), ``TELEGRAPH_ACCESS_TOKEN``, ``DATABASE_URL`` —
+  are never inherited by third-party MCP code, and
   ``${VAR}`` references to them in the config are refused. Anything a server
   needs beyond the allowlist must be listed explicitly in its ``env``.
 * Чтение открыто пользователям диалога. Запись — отдельный канал владельца,
@@ -131,7 +132,8 @@ class MCPTool:
 # inheritance (see ``_expand_env`` and ``_child_environment``).
 _SECRET_ENV_NAMES = frozenset({
     "BOT_TOKEN", "AI_API_KEY", "QWEN_API_KEY", "DASHSCOPE_API_KEY",
-    "SEARCH_API_KEY", "TAVILY_API_KEY", "TELEGRAPH_ACCESS_TOKEN",
+    "SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY",
+    "TELEGRAPH_ACCESS_TOKEN",
     "DATABASE_URL",
 })
 

@@ -11,12 +11,14 @@ Supported providers (``SEARCH_PROVIDER``):
 * ``duckduckgo`` (default) — DuckDuckGo through the optional ``ddgs`` package;
   no API key and no account, so search works right after installation;
 * ``tavily`` — LLM-oriented search API (https://tavily.com, ``tvly-…`` keys);
-* ``brave``  — Brave Search API (``BSA…`` subscription tokens).
+* ``brave``  — Brave Search API (``BSA…`` subscription tokens);
+* ``exa``    — Exa Search API (https://exa.ai, keys from the dashboard).
 
-Tavily/Brave speak plain HTTPS through aiohttp and need ``SEARCH_API_KEY``;
-without a key they are not offered to the model and the bot behaves exactly as
-before. DuckDuckGo is a scraping provider — ``ddgs`` (or a proxy) may be
-blocked by the site, so successes and failures are logged with an operation id.
+Tavily/Brave/Exa speak plain HTTPS through aiohttp and need
+``SEARCH_API_KEY``; without a key they are not offered to the model and the
+bot behaves exactly as before. DuckDuckGo is a scraping provider — ``ddgs``
+(or a proxy) may be blocked by the site, so successes and failures are logged
+with an operation id.
 Первые результаты читаются через SSRF-защищённый загрузчик
 ``bot/services/documents.py`` перед передачей модели для общего саммари.
 """
@@ -47,7 +49,7 @@ from bot.services.untrusted import wrap_untrusted
 logger = logging.getLogger(__name__)
 
 # Providers with a built-in implementation.
-PROVIDERS = ("duckduckgo", "tavily", "brave")
+PROVIDERS = ("duckduckgo", "tavily", "brave", "exa")
 
 # Short spellings accepted in SEARCH_PROVIDER.
 _PROVIDER_ALIASES = {"ddg": "duckduckgo", "duck": "duckduckgo"}
@@ -73,6 +75,37 @@ def _clean(text: Any) -> str:
     """Plain text from a provider's HTML-ish field."""
     value = html.unescape(str(text or ""))
     return " ".join(_TAGS.sub(" ", value).split())
+
+
+def _safe_host(url: str) -> str:
+    """Host for logs, without URL userinfo or query parameters."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or "?"
+        port = parts.port
+    except ValueError:
+        return "?"
+    return f"{host}:{port}" if port else host
+
+
+def _redact_secrets(text: str, headers: dict[str, str]) -> str:
+    """Remove search credentials from a body/exception before logging.
+
+    A broken custom proxy or a debugging endpoint can reflect request headers.
+    The provider key must stay out of logs even then.
+    """
+    redacted = text
+    for name, value in headers.items():
+        if name.lower() not in {
+            "authorization", "x-api-key", "x-subscription-token"
+        }:
+            continue
+        secret = value.strip()
+        if secret.lower().startswith("bearer "):
+            secret = secret[7:].strip()
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
 
 
 # Tool exposed to the chat model for live web search.
@@ -222,15 +255,25 @@ async def _request_json(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
 ) -> _RequestResult:
-    """One JSON request to a search API; never raises."""
-    host = urlsplit(url).netloc
+    """One JSON request to a search API; never raises.
+
+    Redirects are not followed: a cross-origin 3xx would otherwise forward
+    custom auth headers (``x-api-key`` / ``X-Subscription-Token``) to another
+    host. Search APIs answer directly, so a 3xx is a configuration error.
+    """
+    host = _safe_host(url)
     timeout = aiohttp.ClientTimeout(total=config.search_timeout)
     started = time.monotonic()
     try:
         async with (
             aiohttp.ClientSession(timeout=timeout) as session,
             session.request(
-                method, url, json=json_payload, params=params, headers=headers
+                method,
+                url,
+                json=json_payload,
+                params=params,
+                headers=headers,
+                allow_redirects=False,
             ) as resp,
         ):
             body_bytes = await resp.content.read(_MAX_SEARCH_BODY + 1)
@@ -245,7 +288,8 @@ async def _request_json(
             if resp.status != 200:
                 logger.warning(
                     "Search API %s returned HTTP %s after %.2fs [%s]: %s",
-                    host, resp.status, elapsed, _operation_context(), body[:200],
+                    host, resp.status, elapsed, _operation_context(),
+                    _redact_secrets(body[:200], headers),
                 )
                 return _RequestResult(error=f"http_{resp.status}")
             try:
@@ -261,7 +305,7 @@ async def _request_json(
         logger.warning(
             "Search API request to %s failed after %.2fs [%s]: %s: %s",
             host, time.monotonic() - started, _operation_context(),
-            type(exc).__name__, exc,
+            type(exc).__name__, _redact_secrets(str(exc), headers),
         )
         return _RequestResult(error=reason)
 
@@ -277,6 +321,28 @@ def _direct_url(url: str) -> str:
         if target:
             cleaned = target
     return cleaned
+
+
+def _http_url(value: Any) -> str:
+    """Only absolute HTTP(S) links are returned; provider junk is dropped.
+
+    The URL is displayed to the model and later fetched by the SSRF-protected
+    loader, so ``javascript:``/``file:``/relative values must not get through.
+    Whitespace and control characters are rejected too: a raw newline inside
+    a URL could forge a line in the model's numbered result block.
+    """
+    url = str(value or "").strip()
+    if not url or any(
+        ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url
+    ):
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        return ""
+    return url
 
 
 def _duckduckgo_sync(query: str, max_results: int) -> list[dict[str, Any]]:
@@ -342,8 +408,8 @@ async def _search_duckduckgo(query: str, max_results: int) -> SearchResults:
     for item in rows:
         if not isinstance(item, dict):
             continue
-        url = _direct_url(str(item.get("href") or item.get("url") or ""))
-        if not url.lower().startswith(("http://", "https://")):
+        url = _http_url(_direct_url(str(item.get("href") or item.get("url") or "")))
+        if not url:
             continue
         results.append(
             SearchResult(
@@ -383,12 +449,15 @@ async def _search_tavily(query: str, max_results: int) -> SearchResults:
         return SearchResults(error="unexpected_response")
     results: list[SearchResult] = []
     for item in data.get("results") or []:
-        if not isinstance(item, dict) or not item.get("url"):
+        if not isinstance(item, dict):
+            continue
+        item_url = _http_url(item.get("url"))
+        if not item_url:
             continue
         results.append(
             SearchResult(
-                title=_clean(item.get("title")) or str(item["url"]),
-                url=str(item["url"]),
+                title=_clean(item.get("title")) or item_url,
+                url=item_url,
                 snippet=_clean(item.get("content"))[:_SNIPPET_CHARS],
             )
         )
@@ -420,13 +489,78 @@ async def _search_brave(query: str, max_results: int) -> SearchResults:
     results: list[SearchResult] = []
     web = data.get("web") or {}
     for item in web.get("results") or []:
-        if not isinstance(item, dict) or not item.get("url"):
+        if not isinstance(item, dict):
+            continue
+        item_url = _http_url(item.get("url"))
+        if not item_url:
             continue
         results.append(
             SearchResult(
-                title=_clean(item.get("title")) or str(item["url"]),
-                url=str(item["url"]),
+                title=_clean(item.get("title")) or item_url,
+                url=item_url,
                 snippet=_clean(item.get("description"))[:_SNIPPET_CHARS],
+            )
+        )
+        if len(results) >= max_results:
+            break
+    return SearchResults(results)
+
+
+async def _search_exa(query: str, max_results: int) -> SearchResults:
+    """Exa Search API (POST /search, ``x-api-key`` header).
+
+    Only highlights are requested: full page text would duplicate the
+    SSRF-protected deep read that every provider goes through and would make
+    the provider response (and its cost) much larger. Highlights are also the
+    fallback snippet when a result page cannot be fetched.
+    """
+    url = config.search_api_url or "https://api.exa.ai/search"
+    data, error = _response_parts(await _request_json(
+        url,
+        {
+            "x-api-key": config.search_api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        json_payload={
+            "query": query,
+            "type": "auto",
+            "numResults": max_results,
+            "contents": {"highlights": True},
+        },
+    ))
+    if error:
+        return SearchResults(error=error)
+    if not isinstance(data, dict):
+        logger.warning(
+            "Search API exa returned an unexpected payload [%s]",
+            _operation_context(),
+        )
+        return SearchResults(error="unexpected_response")
+    results: list[SearchResult] = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        item_url = _http_url(item.get("url"))
+        if not item_url:
+            continue
+        highlights = item.get("highlights")
+        if isinstance(highlights, list):
+            parts = [_clean(part) for part in highlights if part]
+            snippet = " … ".join(part for part in parts if part)
+        elif isinstance(highlights, str):
+            snippet = _clean(highlights)
+        else:
+            snippet = ""
+        if not snippet:
+            # Defensive fallback: Exa may include text only when asked, but a
+            # provider-side change must not leave the model without a snippet.
+            snippet = _clean(item.get("text"))
+        results.append(
+            SearchResult(
+                title=_clean(item.get("title")) or item_url,
+                url=item_url,
+                snippet=snippet[:_SNIPPET_CHARS],
             )
         )
         if len(results) >= max_results:
@@ -490,6 +624,8 @@ async def search_web(query: str, max_results: int | None = None) -> SearchResult
             raw = await _search_tavily(query, limit)
         elif provider == "brave":
             raw = await _search_brave(query, limit)
+        elif provider == "exa":
+            raw = await _search_exa(query, limit)
         else:
             logger.warning("Unknown SEARCH_PROVIDER %r; search skipped", provider)
             return SearchResults(error="unknown_provider")

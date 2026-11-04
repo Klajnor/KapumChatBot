@@ -33,8 +33,10 @@ from bot.services.ai_client import ai_client
 from bot.services.search import (
     PROVIDERS,
     SEARCH_TOOL,
+    _redact_secrets,
     _search_brave,
     _search_duckduckgo,
+    _search_exa,
     _search_tavily,
     apply_search_hint,
     duckduckgo_available,
@@ -58,6 +60,8 @@ def endpoint() -> str:
     provider = provider_name()
     if provider == "brave":
         return "https://api.search.brave.com/res/v1/web/search"
+    if provider == "exa":
+        return "https://api.exa.ai/search"
     if provider == "duckduckgo":
         return "https://html.duckduckgo.com/html/ (through ddgs)"
     return "https://api.tavily.com/search"
@@ -71,6 +75,16 @@ async def raw_probe(query: str) -> bool:
     if provider == "brave":
         headers["X-Subscription-Token"] = config.search_api_key
         method, params, payload = "GET", {"q": query, "count": 1}, None
+    elif provider == "exa":
+        headers["x-api-key"] = config.search_api_key
+        headers["Content-Type"] = "application/json"
+        method, params = "POST", None
+        payload = {
+            "query": query,
+            "type": "auto",
+            "numResults": 1,
+            "contents": {"highlights": True},
+        }
     else:
         headers["Authorization"] = f"Bearer {config.search_api_key}"
         headers["Content-Type"] = "application/json"
@@ -89,13 +103,18 @@ async def raw_probe(query: str) -> bool:
         async with (
             aiohttp.ClientSession(timeout=timeout) as session,
             session.request(
-                method, url, headers=headers, params=params, json=payload
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+                allow_redirects=False,
             ) as resp,
         ):
             body = await resp.text()
             ctype = resp.headers.get("Content-Type", "?")
             print(f"    HTTP {resp.status} | Content-Type: {ctype}")
-            print(f"    body: {body[:300]!r}")
+            print(f"    body: {_redact_secrets(body[:300], headers)!r}")
             if resp.status != 200:
                 return False
             try:
@@ -110,9 +129,12 @@ async def raw_probe(query: str) -> bool:
     except TimeoutError:
         print(f"    TIMEOUT after {config.search_timeout}s (blocked or unreachable?)")
     except aiohttp.ClientConnectorError as exc:
-        print(f"    CONNECT ERROR (DNS/network): {exc.os_error or exc}")
+        print(
+            "    CONNECT ERROR (DNS/network): "
+            f"{_redact_secrets(str(exc.os_error or exc), headers)}"
+        )
     except aiohttp.ClientError as exc:
-        print(f"    CLIENT ERROR: {exc!r}")
+        print(f"    CLIENT ERROR: {_redact_secrets(repr(exc), headers)}")
     return False
 
 
@@ -133,14 +155,20 @@ async def probe(query: str) -> int:
         print("\nDISABLED: set ENABLE_WEB_SEARCH=true and restart the bot.")
         return 1
     if provider not in PROVIDERS:
-        print(f"\nUNKNOWN PROVIDER {provider!r}: use 'duckduckgo', 'tavily' or 'brave'.")
+        print(
+            f"\nUNKNOWN PROVIDER {provider!r}: use 'duckduckgo', 'tavily', "
+            "'brave' or 'exa'."
+        )
         return 1
     if provider == "duckduckgo":
         if not duckduckgo_available():
-            print("\nNO PACKAGE: pip install ddgs (or switch to tavily/brave).")
+            print("\nNO PACKAGE: pip install ddgs (or switch to tavily/brave/exa).")
             return 1
     elif not config.search_api_key:
-        print("\nNO KEY: set SEARCH_API_KEY (tvly-… for Tavily, BSA… for Brave).")
+        print(
+            "\nNO KEY: set SEARCH_API_KEY (tvly-… for Tavily, BSA… for Brave, "
+            "an Exa dashboard key for Exa)."
+        )
         return 1
     print(f"\nsearch_configured() -> {search_configured()}")
 
@@ -159,6 +187,8 @@ async def probe(query: str) -> int:
             results = await _search_duckduckgo(query, 3)
         elif provider == "brave":
             results = await _search_brave(query, 3)
+        elif provider == "exa":
+            results = await _search_exa(query, 3)
         else:
             results = await _search_tavily(query, 3)
     except Exception as exc:  # noqa: BLE001 - diagnostics must not crash

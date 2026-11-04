@@ -344,6 +344,7 @@ class MCPEnvironmentTests(unittest.TestCase):
         "DASHSCOPE_API_KEY",
         "SEARCH_API_KEY",
         "TAVILY_API_KEY",
+        "EXA_API_KEY",
         "TELEGRAPH_ACCESS_TOKEN",
         "DATABASE_URL",
     )
@@ -391,6 +392,11 @@ class MCPEnvironmentTests(unittest.TestCase):
         ):
             # A default is harmless and still honoured.
             self.assertEqual(_expand_env("${AI_API_KEY:-fallback}"), "fallback")
+        with (
+            patch.dict(os.environ, {"EXA_API_KEY": "secret-exa-key"}),
+            self.assertLogs("bot.services.mcp", level="WARNING"),
+        ):
+            self.assertEqual(_expand_env("${EXA_API_KEY}"), "")
         # Non-secret variables keep expanding as before.
         with patch.dict(os.environ, {"MCP_TEST_PATH": "/vault"}):
             self.assertEqual(_expand_env("${MCP_TEST_PATH}/notes"), "/vault/notes")
@@ -428,6 +434,7 @@ class MCPEnvironmentIsolationTests(unittest.IsolatedAsyncioTestCase):
         old = dict(os.environ)
         os.environ["BOT_TOKEN"] = "secret-bot-token"
         os.environ["AI_API_KEY"] = "secret-ai-key"
+        os.environ["EXA_API_KEY"] = "secret-exa-key"
         os.environ["TELEGRAPH_ACCESS_TOKEN"] = "secret-telegraph-token"
         os.environ["DATABASE_URL"] = "postgresql+asyncpg://u:p@localhost/db"
         try:
