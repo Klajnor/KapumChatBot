@@ -30,6 +30,7 @@ import html
 import importlib.util
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Iterable
@@ -88,11 +89,17 @@ def _safe_host(url: str) -> str:
     return f"{host}:{port}" if port else host
 
 
+_PROXY_ENV_NAMES = (
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
 def _redact_secrets(text: str, headers: dict[str, str]) -> str:
     """Remove search credentials from a body/exception before logging.
 
     A broken custom proxy or a debugging endpoint can reflect request headers.
-    The provider key must stay out of logs even then.
+    The provider key and proxy password must stay out of logs even then.
     """
     redacted = text
     for name, value in headers.items():
@@ -105,7 +112,44 @@ def _redact_secrets(text: str, headers: dict[str, str]) -> str:
             secret = secret[7:].strip()
         if secret:
             redacted = redacted.replace(secret, "***")
+    for name in _PROXY_ENV_NAMES:
+        proxy = os.environ.get(name, "").strip()
+        if not proxy:
+            continue
+        redacted = redacted.replace(proxy, "***")
+        try:
+            password = urlsplit(proxy).password
+        except ValueError:
+            password = None
+        if password:
+            redacted = redacted.replace(password, "***")
     return redacted
+
+
+_BLOCK_PAGE_MARKERS = (
+    "attention required",
+    "just a moment",
+    "checking your browser",
+    "enable javascript and cookies",
+    "cloudflare ray id",
+)
+
+
+def _looks_like_block_page(body: str, content_type: str, server: str) -> bool:
+    """Cloudflare WAF block/challenge page instead of provider JSON.
+
+    Exa blocks API access from several regions (Russia, Ukraine and others)
+    before the request reaches the API. The page is HTML, sometimes with
+    status 200, so ``json.loads`` would misreport it as ``invalid_json``.
+    Ordinary Cloudflare 5xx pages do not carry these challenge markers and
+    keep their real ``http_<code>`` error.
+    """
+    head = body[:4096].lower()
+    if "html" not in content_type.lower() and "<html" not in head:
+        return False
+    if "cloudflare" not in server.lower() and "cloudflare" not in head:
+        return False
+    return any(marker in head for marker in _BLOCK_PAGE_MARKERS)
 
 
 # Tool exposed to the chat model for live web search.
@@ -163,8 +207,8 @@ class SearchResults(list[SearchResult]):
 
     Behaves exactly like a plain list, so callers that only need the hits keep
     working (and ``== []`` still holds on failure). ``error`` is a log-safe
-    category such as ``timeout`` or ``http_401`` — never the provider body or
-    the user's query.
+    category such as ``timeout``, ``http_401`` or ``blocked`` — never the
+    provider body or the user's query.
     """
 
     def __init__(
@@ -260,13 +304,17 @@ async def _request_json(
     Redirects are not followed: a cross-origin 3xx would otherwise forward
     custom auth headers (``x-api-key`` / ``X-Subscription-Token``) to another
     host. Search APIs answer directly, so a 3xx is a configuration error.
+
+    ``trust_env`` honours the standard ``HTTPS_PROXY`` / ``HTTP_PROXY``
+    variables: Exa blocks API access from several regions, so the bot must be
+    able to reach it through a proxy/VPN egress.
     """
     host = _safe_host(url)
     timeout = aiohttp.ClientTimeout(total=config.search_timeout)
     started = time.monotonic()
     try:
         async with (
-            aiohttp.ClientSession(timeout=timeout) as session,
+            aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
             session.request(
                 method,
                 url,
@@ -285,6 +333,16 @@ async def _request_json(
                 )
                 return _RequestResult(error="oversized_response")
             body = body_bytes.decode("utf-8", "replace")
+            content_type = resp.headers.get("Content-Type", "")
+            server = resp.headers.get("Server", "")
+            if _looks_like_block_page(body, content_type, server):
+                logger.warning(
+                    "Search API %s returned a Cloudflare block page (HTTP %s) "
+                    "after %.2fs [%s]; the provider may be regionally blocked — "
+                    "set HTTPS_PROXY to an allowed network",
+                    host, resp.status, elapsed, _operation_context(),
+                )
+                return _RequestResult(error="blocked")
             if resp.status != 200:
                 logger.warning(
                     "Search API %s returned HTTP %s after %.2fs [%s]: %s",

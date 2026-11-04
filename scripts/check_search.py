@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,9 @@ from bot.services.ai_client import ai_client
 from bot.services.search import (
     PROVIDERS,
     SEARCH_TOOL,
+    _looks_like_block_page,
     _redact_secrets,
+    _safe_host,
     _search_brave,
     _search_duckduckgo,
     _search_exa,
@@ -52,6 +55,18 @@ def mask(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key) if key else "(empty)"
     return f"{key[:4]}…{key[-2:]} ({len(key)} chars)"
+
+
+def proxy_url() -> str:
+    """First configured standard proxy URL (credentials are never printed)."""
+    for name in (
+        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+        "ALL_PROXY", "all_proxy",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def endpoint() -> str:
@@ -101,7 +116,7 @@ async def raw_probe(query: str) -> bool:
     print(f"--- {method} {url}")
     try:
         async with (
-            aiohttp.ClientSession(timeout=timeout) as session,
+            aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
             session.request(
                 method,
                 url,
@@ -113,8 +128,16 @@ async def raw_probe(query: str) -> bool:
         ):
             body = await resp.text()
             ctype = resp.headers.get("Content-Type", "?")
+            server = resp.headers.get("Server", "")
             print(f"    HTTP {resp.status} | Content-Type: {ctype}")
             print(f"    body: {_redact_secrets(body[:300], headers)!r}")
+            if _looks_like_block_page(body, ctype, server):
+                print(
+                    "    CLOUDFLARE BLOCK: the provider refused this network or "
+                    "region (Exa blocks Russia, Ukraine and others). Set "
+                    "HTTPS_PROXY to an allowed network."
+                )
+                return False
             if resp.status != 200:
                 return False
             try:
@@ -148,6 +171,8 @@ async def probe(query: str) -> int:
         print(f"ddgs installed    : {duckduckgo_available()}")
         print(f"ddgs backend      : {config.search_ddgs_backend or 'duckduckgo'}")
     print(f"endpoint          : {endpoint()}")
+    proxy = proxy_url()
+    print(f"proxy             : {_safe_host(proxy) if proxy else '(not set)'}")
     print(f"timeout / results : {config.search_timeout}s / {config.search_max_results}")
     print(f"max rounds        : {config.max_search_rounds}")
 
@@ -223,7 +248,13 @@ async def probe(query: str) -> int:
                 "content-type/URL override later."
             )
         return 0
-    if raw_ok is None:
+    if getattr(live, "error", "") == "blocked":
+        print(
+            "FAIL: the provider blocked this network/region (Cloudflare). "
+            "Set HTTPS_PROXY to an allowed network; the key itself is not "
+            "the problem."
+        )
+    elif raw_ok is None:
         print(
             "FAIL: DuckDuckGo returned no hits — the query found nothing or the "
             "server IP is being throttled. Try SEARCH_DDGS_BACKEND=auto."

@@ -1588,6 +1588,9 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             status = 200
             content = FakeContent()
 
+            def __init__(self):
+                self.headers = {}
+
             async def __aenter__(self):
                 return self
 
@@ -1596,9 +1599,10 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeSession:
             last_kwargs = None
+            last_init_kwargs = None
 
             def __init__(self, *args, **kwargs):
-                pass
+                FakeSession.last_init_kwargs = kwargs
 
             async def __aenter__(self):
                 return self
@@ -1618,6 +1622,68 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         # A 3xx must not forward x-api-key to another host.
         self.assertIsNotNone(FakeSession.last_kwargs)
         self.assertFalse(FakeSession.last_kwargs["allow_redirects"])
+        # HTTPS_PROXY from .env/systemd is honoured by the search session.
+        self.assertIsNotNone(FakeSession.last_init_kwargs)
+        self.assertTrue(FakeSession.last_init_kwargs["trust_env"])
+
+    async def test_search_cloudflare_block_is_reported(self):
+        class FakeContent:
+            async def read(self, limit):
+                return (
+                    b"<html><title>Attention Required! | Cloudflare</title>"
+                    b"</html>"
+                )
+
+        class FakeResponse:
+            status = 403
+            content = FakeContent()
+
+            def __init__(self):
+                self.headers = {
+                    "Content-Type": "text/html",
+                    "Server": "cloudflare",
+                }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def request(self, *args, **kwargs):
+                return FakeResponse()
+
+        with (
+            patch.object(search.aiohttp, "ClientSession", FakeSession),
+            self.assertLogs("bot.services.search", level="WARNING") as logs,
+        ):
+            result = await search._request_json(
+                "https://api.exa.ai/search", {"x-api-key": "secret"}
+            )
+        # A regional Cloudflare block must not look like broken JSON.
+        self.assertEqual(result.error, "blocked")
+        self.assertIn("Cloudflare block page", "\n".join(logs.output))
+
+    def test_proxy_password_is_redacted(self):
+        proxy = "http://user:proxy-secret@proxy.test:8080"
+        with patch.dict(os.environ, {"HTTPS_PROXY": proxy}):
+            text = search._redact_secrets(
+                f"cannot connect via {proxy}", {"x-api-key": "exa-secret"}
+            )
+        self.assertNotIn("proxy-secret", text)
+        self.assertNotIn(proxy, text)
+        self.assertNotIn("exa-secret", text)
+        self.assertIn("***", text)
 
     def test_search_configured_requires_key_and_provider(self):
         with (
