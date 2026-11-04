@@ -3,13 +3,12 @@ Description=Kapum ChatBot auto-update every 10 minutes
 
 [Timer]
 # Первая проверка после загрузки (сеть уже должна подняться), затем каждые
-# 10 минут от прошлого запуска. Случайный сдвиг до 2 минут размазывает
-# нагрузку; Persistent запускает пропущенное срабатывание после простоя.
+# 10 минут после завершения прошлой проверки. Случайный сдвиг до 2 минут размазывает
+# нагрузку. OnBootSec даёт проверку после простоя/перезагрузки.
 OnBootSec=5min
-OnUnitActiveSec=10min
+OnUnitInactiveSec=10min
 RandomizedDelaySec=2min
 AccuracySec=1min
-Persistent=true
 
 [Install]
 WantedBy=timers.target

@@ -24,7 +24,7 @@ pytest tests/test_regressions.py::RegressionTests::test_name -v   # один т�
 
 - Тесты — в основном `unittest.IsolatedAsyncioTestCase` (запускаются через pytest). Разброс — `test_regressions.py` (регрессии), `test_database.py` (in-memory SQLite, без моков), `test_audit_fixes.py` (безопасность). Telegram-объекты подменяются `SimpleNamespace` / `unittest.mock`.
 - `ffmpeg` нужен для голосовых (не pip-пакет); `ENABLE_VOICE=false` отключает. На Windows зонеinfo нужен пакет `tzdata` (REMINDER_TIMEZONE).
-- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `check_telegraph.py`, `test_ws_asr.py` — отладка Telegraph и ASR; `clean_pycache.*` — очистка кэша; `restart.sh` — деплой на сервер (`/opt/KapumChatBot`, systemd; для скриптов — флаг `--no-follow` без `journalctl -f`); `scripts/update.sh` + `kapum-update.timer` — автообновление на сервере (read-only deploy-ключ, health-check, автооткат). Скрипта миграции PostgreSQL → SQLite больше нет: поддерживается только SQLite.
+- `scripts/check_search.py --query "..." [--ask]` — диагностика веб-поиска; `check_telegraph.py`, `test_ws_asr.py` — отладка Telegraph и ASR; `clean_pycache.*` — очистка кэша; `restart.sh` — перезапуск сервера (`/opt/KapumChatBot`, systemd; `--no-follow` без `journalctl -f`). `scripts/update.sh` + `update_support.py` + `kapum-update.timer` — обновление бота и кода `/opt/brain` (раздельные read-only deploy-ключи, только fast-forward, root-owned код/venv, снимки окружений для отката, MCP handshake от brain, состояние `/var/lib/kapum-update`). Заметки, SQLite и установленные systemd-юниты не откатываются/не заменяются. Скрипта миграции PostgreSQL → SQLite больше нет: поддерживается только SQLite.
 
 ## Конвенции
 
