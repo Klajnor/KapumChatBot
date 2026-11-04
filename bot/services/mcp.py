@@ -42,7 +42,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bot.config import config
+from bot.services.note_metadata import generate_note_metadata
 from bot.services.untrusted import wrap_untrusted
+from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
 
@@ -558,15 +560,18 @@ class MCPClient:
         )
         return _format_tool_result(result)
 
-    async def create_note(self, content: str, request_id: str) -> str:
+    async def create_note(
+        self, content: str, request_id: str, *, title: str = "", tags: list[str] | None = None,
+    ) -> str:
         """Отдельный канал создания заметок, не доступный модели чата."""
+        arguments: dict[str, Any] = {"content": content, "request_id": request_id}
+        if title or tags is not None:
+            arguments.update(title=title, tags=tags or [])
         try:
             await self.start()
             result = await self._request(
                 "tools/call",
-                {"name": "create_note", "arguments": {
-                    "content": content, "request_id": request_id,
-                }},
+                {"name": "create_note", "arguments": arguments},
                 # Создание/индекс + fetch/commit/push занимают дольше обычного чтения.
                 timeout=max(self.timeout, 180.0),
             )
@@ -906,9 +911,16 @@ class MCPManager:
             raise MCPError("Запись разрешена только владельцу")
         if not content.strip() or len(content) > 100_000:
             raise MCPError("Недопустимый размер заметки")
+        if not request_id or len(request_id) > 200:
+            raise MCPError("Недопустимый request_id заметки")
         if config.mcp_write_server not in config.mcp_servers:
             raise MCPError("Сервер записи не настроен")
-        return await self._client(config.mcp_write_server).create_note(content, request_id)
+        async with user_service() as service:
+            settings = await service.get_user_settings(telegram_id)
+        metadata = await generate_note_metadata(content, settings["model"])
+        return await self._client(config.mcp_write_server).create_note(
+            content, request_id, title=metadata.title, tags=metadata.tags,
+        )
 
     async def status(self) -> list[dict[str, Any]]:
         """Per-server diagnostic for the admin ``/mcp`` command."""

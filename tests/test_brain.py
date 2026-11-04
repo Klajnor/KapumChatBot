@@ -17,7 +17,9 @@ from aiogram.types import CallbackQuery, Chat, Message, User
 from bot.config import config
 from bot.handlers import brain
 from bot.keyboards.inline import get_answer_keyboard
+from bot.services import mcp as mcp_service
 from bot.services.mcp import MCPClient, MCPError, MCPManager, MCPServerConfig, MCPTool
+from bot.services.note_metadata import NoteMetadata
 
 
 def message(text: str = "запомни факт", user_id: int = 42) -> Message:
@@ -50,6 +52,50 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(MCPError):
                 await manager.save_note(43, "fact", "id")
             client.assert_not_called()
+
+    async def test_save_passes_ai_metadata_and_unmodified_content_to_server(self) -> None:
+        context = AsyncMock()
+        context.__aenter__.return_value.get_user_settings.return_value = {"model": "selected"}
+        client = AsyncMock()
+        content = "**Точный** исходный текст #SQL"
+        metadata = NoteMetadata("НастройкаSQL", ["sql", "настройка"])
+        manager = MCPManager()
+        with (
+            patch.object(mcp_service, "user_service", return_value=context),
+            patch.object(mcp_service, "generate_note_metadata", new_callable=AsyncMock,
+                         return_value=metadata) as generate,
+            patch.object(manager, "_client", return_value=client),
+        ):
+            await manager.save_note(42, content, "tg:42:10")
+        generate.assert_awaited_once_with(content, "selected")
+        client.create_note.assert_awaited_once_with(
+            content, "tg:42:10", title="НастройкаSQL", tags=["sql", "настройка"],
+        )
+
+    async def test_invalid_save_does_not_generate_metadata(self) -> None:
+        manager = MCPManager()
+        with (
+            patch.object(mcp_service, "generate_note_metadata", new_callable=AsyncMock) as generate,
+            patch.object(mcp_service, "user_service") as service,
+        ):
+            for user_id, content, key in ((43, "text", "id"), (42, " ", "id"),
+                                          (42, "x" * 100001, "id"), (42, "text", "")):
+                with self.subTest(user=user_id, size=len(content)), self.assertRaises(MCPError):
+                    await manager.save_note(user_id, content, key)
+            generate.assert_not_awaited()
+            service.assert_not_called()
+
+    async def test_mcp_write_transport_includes_title_and_tags(self) -> None:
+        client = MCPClient(MCPServerConfig("brain", "x"), timeout=1)
+        with (
+            patch.object(client, "start", new_callable=AsyncMock),
+            patch.object(client, "_request", new_callable=AsyncMock,
+                         return_value={"structuredContent": {"git_pushed": True}}) as request,
+        ):
+            await client.create_note("body", "id", title="ЗаметкаSQL", tags=["sql"])
+        self.assertEqual(request.call_args.args[1], {"name": "create_note", "arguments": {
+            "content": "body", "request_id": "id", "title": "ЗаметкаSQL", "tags": ["sql"],
+        }})
 
     async def test_incomplete_chat_metadata_fails_closed(self) -> None:
         incomplete = SimpleNamespace(from_user=SimpleNamespace(id=42), chat=SimpleNamespace(id=42))
