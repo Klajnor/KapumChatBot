@@ -24,6 +24,7 @@ from bot.config import (
     config,
 )
 from bot.services import thinking
+from bot.services.http_body import read_bounded
 from bot.services.image_tools import canonical_operations
 from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
@@ -88,7 +89,7 @@ _MAX_SSE_BUFFER = 1 * 1024 * 1024
 
 async def _read_response_text(response: Any, limit: int) -> str:
     """Read at most ``limit`` bytes of a provider response and decode them."""
-    data = await response.content.read(limit + 1)
+    data = await read_bounded(response.content, limit)
     if len(data) > limit:
         data = data[:limit]
     encoding = getattr(response, "charset", None) or "utf-8"

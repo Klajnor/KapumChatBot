@@ -101,7 +101,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         response = MagicMock()
         response.status = 200
         response.charset = "utf-8"
-        response.content.read = AsyncMock(return_value=b'{"choices": []}')
+        response.content.read = AsyncMock(side_effect=[b'{"choices": []}', b''])
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=response)
         session = MagicMock()
@@ -127,7 +127,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         response = MagicMock()
         response.status = 200
         response.charset = "utf-8"
-        response.content.read = AsyncMock(return_value=b'{"choices": []}')
+        response.content.read = AsyncMock(side_effect=[b'{"choices": []}', b''])
         context = MagicMock()
         context.__aenter__ = AsyncMock(return_value=response)
         session = MagicMock()
@@ -1581,8 +1581,11 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_search_request_does_not_follow_redirects(self):
         class FakeContent:
+            def __init__(self):
+                self.chunks = iter([b'{"ok":', b' true}', b''])
+
             async def read(self, limit):
-                return b'{"ok": true}'
+                return next(self.chunks)
 
         class FakeResponse:
             status = 200
@@ -1628,11 +1631,14 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_search_cloudflare_block_is_reported(self):
         class FakeContent:
+            def __init__(self):
+                self.chunks = iter([
+                    b"<html><title>Attention Required! | Cloudflare</title>",
+                    b"</html>", b"",
+                ])
+
             async def read(self, limit):
-                return (
-                    b"<html><title>Attention Required! | Cloudflare</title>"
-                    b"</html>"
-                )
+                return next(self.chunks)
 
         class FakeResponse:
             status = 403

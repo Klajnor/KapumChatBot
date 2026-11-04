@@ -44,6 +44,7 @@ import aiohttp
 from bot.config import config
 from bot.services.ai_client import ToolCall
 from bot.services.documents import fetch_url_text
+from bot.services.http_body import read_bounded
 from bot.services.operations import current_operation, stage
 from bot.services.untrusted import wrap_untrusted
 
@@ -324,7 +325,7 @@ async def _request_json(
                 allow_redirects=False,
             ) as resp,
         ):
-            body_bytes = await resp.content.read(_MAX_SEARCH_BODY + 1)
+            body_bytes = await read_bounded(resp.content, _MAX_SEARCH_BODY)
             elapsed = time.monotonic() - started
             if len(body_bytes) > _MAX_SEARCH_BODY:
                 logger.warning(
