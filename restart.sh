@@ -5,7 +5,8 @@
 # brain:brain. Перезапускает сервис и показывает лог.
 #
 # Использование (на сервере):
-#   sudo ./restart.sh
+#   sudo ./restart.sh               # перезапуск + слежение за журналом
+#   sudo ./restart.sh --no-follow   # то же без journalctl -f (для скриптов)
 #
 # Не запускайте через `source`/`.`: скрипт меняет set -e и не должен
 # переопределять trap/exit интерактивной оболочки (Ctrl+C закрывал SSH-сессию).
@@ -16,6 +17,17 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
 fi
 
 set -euo pipefail
+
+NO_FOLLOW=0
+case "${1:-}" in
+    --no-follow) NO_FOLLOW=1 ;;
+    "") ;;
+    *)
+        echo "Ошибка: неизвестный аргумент: $1" >&2
+        echo "Использование: sudo ./restart.sh [--no-follow]" >&2
+        exit 1
+        ;;
+esac
 
 APP_DIR="/opt/KapumChatBot"
 SERVICE="chat_bot.service"
@@ -67,6 +79,11 @@ echo "Перезапуск $SERVICE..."
 systemctl daemon-reload
 systemctl restart "$SERVICE"
 systemctl --no-pager --lines=0 status "$SERVICE" || true
+
+if [ "$NO_FOLLOW" -eq 1 ]; then
+    echo "Перезапуск выполнен. Журнал: journalctl -u $SERVICE -f"
+    exit 0
+fi
 
 echo "Лог (Ctrl+C останавливает только журнал и возвращает в консоль):"
 journalctl -u "$SERVICE" -f || true

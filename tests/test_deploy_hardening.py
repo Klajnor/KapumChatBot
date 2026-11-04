@@ -38,12 +38,14 @@ class RestartHardeningTests(unittest.TestCase):
 
     def test_restart_does_not_change_the_callers_shell(self):
         script = (ROOT / "restart.sh").read_text(encoding="utf-8")
-        # Sourcing the script used to override INT/TERM with exit 0: Ctrl+C
-        # closed the SSH session. It must be run as a separate process.
+        # Sourcing the script used to override INT/TERM with a trap: Ctrl+C
+        # closed the SSH session. It must be run as a separate process. The
+        # only successful exit is the explicit --no-follow branch, not a trap.
         self.assertNotIn("trap ", script)
-        self.assertNotIn("exit 0", script)
+        self.assertIn('if [ "$NO_FOLLOW" -eq 1 ]; then', script)
         self.assertIn("BASH_SOURCE[0]", script)
         self.assertIn("journalctl", script)
+        self.assertIn("--no-follow", script)
 
     def test_no_pycache_cleanup_runs_as_the_service_user(self):
         unit = (ROOT / "chat_bot.service").read_text(encoding="utf-8")

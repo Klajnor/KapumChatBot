@@ -1,0 +1,17 @@
+[Unit]
+Description=Kapum ChatBot auto-update (fetch origin/master + restart)
+Documentation=file:/opt/KapumChatBot/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Запускается только таймером kapum-update.timer, поэтому без [Install].
+# Root: скрипт делает git fetch/reset в /opt/KapumChatBot, pip install
+# в .venv и systemctl restart chat_bot.service; бот и пользователь brain
+# код не трогают (README, «Автообновление»).
+User=root
+Group=root
+ExecStart=/opt/KapumChatBot/scripts/update.sh
+# pip install и health-check могут занять пару минут.
+TimeoutStartSec=10min

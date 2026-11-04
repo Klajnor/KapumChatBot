@@ -1959,6 +1959,63 @@ ls -l /var/lib/kapum-chatbot          # владелец brain, файлы -rw--
 `SystemCallFilter` в юнит намеренно не добавлены: они ломают часть
 C-расширений (numpy/matplotlib/Pillow) — включайте только после проверки.
 
+### 🔄 Автообновление на сервере (systemd timer)
+
+`scripts/update.sh` и `kapum-update.timer` раз в ~10 минут сверяют `HEAD` в
+`/opt/KapumChatBot` с `origin/master`. Обновление выполняется от root: бот и
+пользователь `brain` код по-прежнему не трогают. При расхождении скрипт
+обновляет код, ставит зависимости (только если менялся `requirements.txt`),
+возвращает схему прав и перезапускает сервис через `restart.sh --no-follow`,
+затем ждёт готовности (`GET /health`, без порта — активность юнита без
+перезапусков по кругу). Если бот не поднялся — автоматический откат на прежний
+коммит со старыми зависимостями и повторный рестарт. О результате владелец
+получает сообщение в Telegram (успех, блокировка, откат); повторяющиеся сбои
+не спамят: уведомление о блокировке приходит один раз до восстановления, а
+провалившийся коммит не пробуется снова, пока в `origin/master` не появится
+новый.
+
+Репозиторий закрытый, поэтому серверу нужен отдельный read-only deploy-ключ
+**без парольной фразы** (пароль в автоматике вводить некому). Такой ключ
+читает только этот репозиторий и не может публиковать изменения; ключ с
+фразой из `load_git_key.sh` остаётся для ручных сессий.
+
+```bash
+# 1. Deploy-ключ (на сервере); публичную часть добавить в GitHub:
+#    репозиторий → Settings → Deploy keys → Add deploy key.
+#    Галку «Allow write access» НЕ включать.
+sudo ssh-keygen -t ed25519 -f /root/id_ed25519_kapum_deploy -N "" -C "kapum-server-deploy"
+sudo cat /root/id_ed25519_kapum_deploy.pub
+
+# 2. origin переключить на SSH (клон по инструкции выше сделан по HTTPS)
+sudo git -C /opt/KapumChatBot remote set-url origin git@github.com:Klajnor/KapumChatBot.git
+
+# 3. Юниты таймера
+sudo cp /opt/KapumChatBot/kapum-update.service /opt/KapumChatBot/kapum-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now kapum-update.timer
+systemctl list-timers kapum-update.timer        # следующее срабатывание
+sudo systemctl start kapum-update.service       # первая проверка вручную
+sudo journalctl -u kapum-update -n 50 --no-pager
+```
+
+Для проверки готовности включите `HEALTH_PORT` в серверном `.env.linux`
+(эндпоинт слушает `127.0.0.1` и наружу не виден); уведомления используют
+`BOT_TOKEN` и `OWNER_IDS` из того же файла. Откат и уведомления работают и
+без порта — тогда готовность проверяется активностью юнита без роста
+автоперезапусков.
+
+Что делает скрипт (коротко):
+
+- `flock` не даёт запускам накладываться; state-файл `/run/kapum-update.state`
+  подавляет повторы уведомлений;
+- `git fetch origin master` с deploy-ключом; без изменений — тихий выход;
+- `git reset --hard origin/master` — только когда tracked-файлы чисты; локальные
+  правки или сбой fetch отменяют обновление с уведомлением, untracked-файлы
+  (`.env`, `.env.linux`, `.mcp.json`, базы) не трогаются и не удаляются;
+- сбой после обновления — `git reset` на прежний коммит, возврат старых
+  зависимостей, рестарт и повторная проверка; уведомление `⚠️`, а если и откат
+  не помог — `🆘` с просьбой разобраться вручную (`journalctl -u kapum-update`).
+
 ## 🗄️ База данных
 
 Сейчас поддерживается **только SQLite**: один файл в каталоге данных

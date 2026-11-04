@@ -3,5 +3,6 @@
 *.sh  text eol=lf
 # systemd units are parsed on Linux: keep LF there too.
 *.service text eol=lf
+*.timer text eol=lf
 # PowerShell-скрипты — родные Windows, храним CRLF.
 *.ps1 text eol=crlf
