@@ -369,6 +369,25 @@ class UserService:
         await self.session.commit()
         return count
 
+    async def try_reserve_status_search(
+        self,
+        telegram_id: int,
+        *,
+        now: datetime.datetime | None = None,
+    ) -> datetime.datetime | None:
+        """Reserve the hourly live search check of the status report.
+
+        Returns ``None`` when the caller may run the probe, or the time of the
+        previous probe when the cooldown has not elapsed yet.
+        """
+        previous = await self.user_repo.try_reserve_status_search(
+            telegram_id,
+            now or datetime.datetime.now(datetime.UTC),
+            config.status_search_interval,
+        )
+        await self.session.commit()
+        return previous
+
     async def consume_daily_usage(self, telegram_id: int) -> int | None:
         """Atomically count a query; the new count, or None at the daily limit."""
         count = await self.user_repo.try_consume_daily_usage(

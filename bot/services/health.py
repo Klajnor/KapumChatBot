@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 _STARTED = time.monotonic()
 
 
+def uptime_seconds() -> float:
+    """Seconds since the bot process imported this module."""
+    return max(0.0, time.monotonic() - _STARTED)
+
+
 async def _health(_request: web.Request) -> web.Response:
     """Liveness probe payload.
 
@@ -32,7 +37,7 @@ async def _health(_request: web.Request) -> web.Response:
     return web.json_response(
         {
             "status": "ok",
-            "uptime_seconds": round(time.monotonic() - _STARTED, 1),
+            "uptime_seconds": round(uptime_seconds(), 1),
         }
     )
 

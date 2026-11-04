@@ -913,6 +913,12 @@ class Config:
     search_max_calls: int = field(
         default_factory=lambda: _env_int("SEARCH_MAX_CALLS", 3)
     )
+    # Minimum interval between live search checks in the bot status report,
+    # seconds (one hour by default). The check itself is a real provider call;
+    # a per-user cooldown keeps "статус" from turning into a paid search loop.
+    status_search_interval: int = field(
+        default_factory=lambda: _env_int("STATUS_SEARCH_INTERVAL", 3600)
+    )
     # Total characters of search/MCP output added to the model context for one
     # question. Trimming keeps the untrusted frame intact.
     tool_max_context_chars: int = field(
@@ -1378,6 +1384,9 @@ class Config:
         self.search_max_results = max(1, min(self.search_max_results, 10))
         self.max_search_rounds = max(1, min(self.max_search_rounds, 5))
         self.search_max_calls = max(1, min(self.search_max_calls, 20))
+        self.status_search_interval = max(
+            60, min(self.status_search_interval, 86_400)
+        )
         self.tool_max_context_chars = max(
             1_000, min(self.tool_max_context_chars, 200_000)
         )

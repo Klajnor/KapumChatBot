@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from bot.services.request_intent import (
     Intent,
     classify_request,
+    looks_like_status_request,
     truncate_for_intent,
 )
 
@@ -88,6 +89,35 @@ class TestClassify(unittest.IsolatedAsyncioTestCase):
         self.assertIs(intent, Intent.CHAT)
         client.chat_completion_result.assert_not_awaited()
 
+    async def test_status_prefilter(self):
+        for text in ("статус", "как дела?", "How are you?", "what's up"):
+            self.assertTrue(looks_like_status_request(text), text)
+        for text in ("почему небо синее", "статус проекта в другом чате"):
+            # The second phrase still reaches the cheap prefilter; the AI
+            # confirmation must reject it (tested below).
+            if text.startswith("статус"):
+                self.assertTrue(looks_like_status_request(text))
+            else:
+                self.assertFalse(looks_like_status_request(text))
+
+    async def test_status_confirmed_by_model(self):
+        client = _client("status")
+        with patch("bot.services.request_intent.ai_client", client):
+            intent = await classify_request("как дела")
+        self.assertIs(intent, Intent.STATUS)
+
+    async def test_status_words_but_model_says_chat(self):
+        client = _client("chat")
+        with patch("bot.services.request_intent.ai_client", client):
+            intent = await classify_request("статус проекта в другом чате")
+        self.assertIs(intent, Intent.CHAT)
+
+    async def test_image_intent_wins_over_status_words(self):
+        client = _client("image")
+        with patch("bot.services.request_intent.ai_client", client):
+            intent = await classify_request("нарисуй статус")
+        self.assertIs(intent, Intent.IMAGE)
+
     async def test_image_confirmed_by_model(self):
         client = _client("image")
         with patch("bot.services.request_intent.ai_client", client):
@@ -109,6 +139,12 @@ class TestClassify(unittest.IsolatedAsyncioTestCase):
             with patch("bot.services.request_intent.ai_client", client):
                 intent = await classify_request("нарисуй кота")
             self.assertIs(intent, Intent.CHAT)
+
+    async def test_status_model_failure_falls_back_to_chat(self):
+        client = _client(error=RuntimeError("down"))
+        with patch("bot.services.request_intent.ai_client", client):
+            intent = await classify_request("статус")
+        self.assertIs(intent, Intent.CHAT)
 
     async def test_at_most_256_chars_reach_the_model(self):
         client = _client("image")

@@ -152,6 +152,24 @@ class ReminderIntentUsage(Base):
     call_count: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class StatusSearchCheck(Base):
+    """Последняя живая проверка поиска в отчёте о статусе.
+
+    Отдельная таблица, а не кэш в памяти: часовой лимит должен переживать
+    перезапуск бота и не сбрасываться спамом «статус». Хранится только
+    Telegram ID и время попытки — без запроса и результатов поиска.
+    """
+
+    __tablename__ = "status_search_checks"
+
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    last_checked_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class Reminder(Base):
     """Scheduled one-time reminders and recurring messages / AI requests.
 

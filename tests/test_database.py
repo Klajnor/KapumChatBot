@@ -106,6 +106,35 @@ class TestAtomicQuotas(DBTest):
 
         self._loop.run_until_complete(_run())
 
+    def test_status_search_cooldown_is_persistent_and_atomic(self):
+        async def _run() -> None:
+            start = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                self.assertIsNone(
+                    await repo.try_reserve_status_search(700, start, 3600)
+                )
+                await session.commit()
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                previous = await repo.try_reserve_status_search(
+                    700, start + datetime.timedelta(minutes=30), 3600
+                )
+                self.assertIsNotNone(previous)
+                await session.commit()
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                self.assertIsNone(
+                    await repo.try_reserve_status_search(
+                        700, start + datetime.timedelta(minutes=61), 3600
+                    )
+                )
+                await session.commit()
+
+        self._loop.run_until_complete(_run())
+
     def test_guest_messages_limited(self):
         async def _run() -> None:
             async with self._factory() as session:

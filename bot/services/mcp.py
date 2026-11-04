@@ -278,6 +278,18 @@ def _format_tool_result(result: Any) -> str:
     return text
 
 
+def _json_object(text: str) -> dict[str, Any] | None:
+    """Extract one JSON object from a tool result (FastMCP may wrap it in text)."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(text[start : end + 1])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _note_error_reason(result: Any) -> str:
     """Диагностика записи без вывода недоверенного текста, путей и секретов."""
     if not isinstance(result, dict):
@@ -384,6 +396,11 @@ def mcp_write_available(telegram_id: int | None) -> bool:
 
 
 READ_TOOLS = frozenset({"search_notes", "get_chunk", "get_note", "list_notes"})
+
+# Внутренний инструмент отчёта о статусе. Он не входит в READ_TOOLS и никогда
+# не предлагается модели: бот вызывает его сам, без аргументов, и получает
+# только числовые счётчики (без путей и текста заметок).
+STATUS_TOOL = "brain_status"
 
 
 def apply_mcp_hint(messages: list[dict[str, Any]]) -> None:
@@ -559,6 +576,26 @@ class MCPClient:
             {"name": name, "arguments": arguments},
         )
         return _format_tool_result(result)
+
+    async def call_status_tool(self) -> str:
+        """Read the second-brain counters for the status report.
+
+        This intentionally bypasses ``MCP_ALLOWED_TOOLS``: the name is fixed
+        (no user/model input reaches it), the call has no arguments and the
+        server-side tool returns only counts. It is never added to the model's
+        tool catalog, so this does not widen what the chat model may call.
+        """
+        await self.start()
+        result = await self._request(
+            "tools/call",
+            {"name": STATUS_TOOL, "arguments": {}},
+            timeout=min(self.timeout, 30.0),
+        )
+        if not isinstance(result, dict) or result.get("isError"):
+            raise MCPError("brain status tool failed")
+        # The real tool returns a tiny JSON object; cap a misbehaving server
+        # before it can allocate a large string in the status path.
+        return _format_tool_result(result)[:64_000]
 
     async def create_note(
         self, content: str, request_id: str, *, title: str = "", tags: list[str] | None = None,
@@ -789,6 +826,9 @@ class MCPManager:
         self._loaded = False
         self._retry_at = 0.0
         self._lock = asyncio.Lock()
+        # Counts change slowly; caching also stops repeated status requests
+        # from rebuilding the candidate graph on every message.
+        self._brain_status_cache: tuple[float, dict[str, Any]] | None = None
 
     def _client(self, name: str) -> MCPClient:
         client = self._clients.get(name)
@@ -922,6 +962,48 @@ class MCPManager:
             content, request_id, title=metadata.title, tags=metadata.tags,
         )
 
+    async def brain_status(self) -> dict[str, Any] | None:
+        """Counts from the second-brain server for the status report.
+
+        Returns ``None`` when no write/second-brain server is configured and a
+        dict with ``error`` when it is unavailable. Only known numeric fields
+        are passed through: note paths, summaries and raw MCP errors never
+        reach the user-facing report.
+        """
+        name = config.mcp_write_server
+        if name not in config.mcp_servers:
+            return None
+        cached = self._brain_status_cache
+        if cached is not None:
+            age = time.monotonic() - cached[0]
+            ttl = 30.0 if cached[1].get("error") else 60.0
+            if age < ttl:
+                return cached[1]
+        try:
+            text = await self._client(name).call_status_tool()
+        except Exception as exc:  # noqa: BLE001 - status must never break a reply
+            logger.warning("MCP status %r failed: %s", name, type(exc).__name__)
+            result: dict[str, Any] = {"error": "unavailable"}
+        else:
+            data = _json_object(text)
+            if data is None:
+                result = {"error": "invalid_response"}
+            else:
+                allowed = {
+                    "notes",
+                    "chunks",
+                    "tags",
+                    "links",
+                    "strong_links",
+                    "pending_links",
+                    "failed_links",
+                    "links_enabled",
+                    "links_min_score",
+                }
+                result = {key: data[key] for key in allowed if key in data}
+        self._brain_status_cache = (time.monotonic(), result)
+        return result
+
     async def status(self) -> list[dict[str, Any]]:
         """Per-server diagnostic for the admin ``/mcp`` command."""
         report: list[dict[str, Any]] = []
@@ -955,6 +1037,7 @@ class MCPManager:
         self._clients.clear()
         self._tools.clear()
         self._loaded = False
+        self._brain_status_cache = None
 
 
 mcp_manager = MCPManager()

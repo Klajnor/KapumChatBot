@@ -48,6 +48,7 @@ _TIPS = (
     "• Ask to draw something and I'll reply with a generated image\n"
     "• <code>/remind daily at 9:00 ai: …</code> — a scheduled request to the AI\n"
     "• Say «напомни завтра в 5 позвонить маме» — reminders work in plain words too, and /timezone puts their clock in your zone\n"
+    "• Say «как дела» or «статус» — bot health, remaining limits, the second brain and a live search check\n"
     "• Use /clear to start a fresh conversation\n"
     "• In groups, mention me or reply to my message to get an answer"
 )

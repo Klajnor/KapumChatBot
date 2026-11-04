@@ -23,6 +23,7 @@ from bot.bot import get_bot_id, get_bot_username
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.handlers.reminders import maybe_freeform_reminder, maybe_timezone_dialog
+from bot.handlers.status import maybe_status_request
 from bot.keyboards.inline import (
     get_answer_keyboard,
     get_enhance_choice_keyboard,
@@ -1793,6 +1794,8 @@ async def handle_text(message: Message) -> None:
         if await maybe_timezone_dialog(message, text):
             return
         if await maybe_freeform_reminder(message, text):
+            return
+        if await maybe_status_request(message, text):
             return
 
     # A question sent as a reply to a photo analyzes (or regenerates from)

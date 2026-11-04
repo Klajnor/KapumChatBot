@@ -19,6 +19,7 @@ from bot.database.models import (
     PhotoIntentUsage,
     Reminder,
     ReminderIntentUsage,
+    StatusSearchCheck,
     User,
     UserSettings,
 )
@@ -366,6 +367,44 @@ class UserRepository:
             select(User).order_by(User.created_at.desc())
         )
         return list(result.scalars().all())
+
+    # --- Status search probe ----------------------------------------------
+
+    async def try_reserve_status_search(
+        self,
+        telegram_id: int,
+        now: datetime.datetime,
+        cooldown_seconds: int,
+    ) -> datetime.datetime | None:
+        """Reserve one live search check per cooldown, atomically.
+
+        Returns ``None`` when the check was reserved (the caller may search)
+        and the previous check time otherwise. The conditional UPSERT is what
+        stops parallel status requests from all passing the cooldown check:
+        the row is updated only while it is older than the cutoff.
+        """
+        if telegram_id <= 0:
+            return now
+        cutoff = now - datetime.timedelta(seconds=max(0, cooldown_seconds))
+        insert_fn = (
+            sqlite_insert
+            if self.session.get_bind().dialect.name == "sqlite"
+            else pg_insert
+        )
+        statement = (
+            insert_fn(StatusSearchCheck)
+            .values(telegram_id=telegram_id, last_checked_at=now)
+            .on_conflict_do_update(
+                index_elements=[StatusSearchCheck.telegram_id],
+                set_={"last_checked_at": now},
+                where=StatusSearchCheck.last_checked_at <= cutoff,
+            )
+        )
+        result = await self.session.execute(statement)
+        if result.rowcount:
+            return None
+        row = await self.session.get(StatusSearchCheck, telegram_id)
+        return row.last_checked_at if row is not None else now
 
     # --- Daily usage tracking ---------------------------------------------
 
