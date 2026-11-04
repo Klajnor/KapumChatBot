@@ -689,6 +689,51 @@ class TestDefaultPromptMigration(DBTest):
 class TestPersonaPromptMigration(DBTest):
     """Pre-name prompts are upgraded to their named built-in versions."""
 
+    def test_translator_rename_migration_is_idempotent(self):
+        from unittest.mock import patch
+
+        from sqlalchemy import text as sql_text
+
+        from bot.config import DEFAULT_PERSONAS, _parse_personas
+        from bot.database.session import _run_data_migrations
+
+        current = DEFAULT_PERSONAS["translator"]["prompt"]
+        body = current.split("\n\n", 1)[1]
+        legacy = (
+            "Твоё имя — Переводчик. Ты можешь по желанию упоминать себя в третьем лице "
+            "(например: «Переводчик считает, что…»).\n\n" + body
+        )
+        custom = legacy + " Дополнительное правило пользователя."
+        unknown_name = legacy.replace("Переводчик", "Другое имя")
+        prompts = {7300: legacy, 7301: body, 7302: current, 7303: custom, 7304: unknown_name}
+        expected = {**prompts, 7300: current, 7301: current}
+
+        async def _run() -> None:
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                for user_id, value in prompts.items():
+                    await repo.get_or_create_user(user_id)
+                    await session.execute(
+                        sql_text(
+                            "UPDATE user_settings SET system_prompt = :p "
+                            "WHERE user_id = :user_id"
+                        ),
+                        {"p": value, "user_id": user_id},
+                    )
+                await session.commit()
+
+            with patch.object(config, "personas", _parse_personas("")):
+                for _ in range(2):
+                    async with self._engine.begin() as conn:
+                        await _run_data_migrations(conn)
+                    async with self._factory() as session:
+                        repo = UserRepository(session)
+                        for user_id, value in expected.items():
+                            settings = await repo.get_user_settings(user_id)
+                            self.assertEqual(settings.system_prompt, value)
+
+        self._loop.run_until_complete(_run())
+
     def test_previous_default_prompt_gets_name(self):
         from sqlalchemy import text as sql_text
 

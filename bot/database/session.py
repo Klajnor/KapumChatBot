@@ -65,12 +65,11 @@ async def init_db() -> None:
 
 
 async def _run_data_migrations(conn: Any) -> None:
-    """Dialect-agnostic data fixes (they run on SQLite too).
+    """Обновить старые промпты по точному совпадению текста (включая SQLite).
 
-    Exact-text upgrades only: the legacy English default and the pre-name
-    Russian default become the current default, and built-in persona prompts
-    saved before names were added gain the name/third-person header. Custom
-    prompts never match these exact strings and are left untouched.
+    Прежние английский и русский default заменяются текущим. Встроенные роли
+    без имени получают заголовок, с известным прежним именем — новое имя.
+    Отличающиеся от встроенных пользовательские промпты не меняются.
     """
     from bot.config import (
         LEGACY_DEFAULT_SYSTEM_PROMPT,

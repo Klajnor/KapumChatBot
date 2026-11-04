@@ -1310,6 +1310,39 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(persona_matches(legacy, persona))
         self.assertFalse(persona_matches("Мой собственный промпт", persona))
 
+    def test_translator_name_and_previous_prompt(self):
+        persona = DEFAULT_PERSONAS["translator"]
+        self.assertEqual(persona["self_name"], "Вавилоныч")
+        self.assertIn("Твоё имя — Вавилоныч.", persona["prompt"])
+        self.assertIn("«Вавилоныч считает, что…»", persona["prompt"])
+        self.assertLessEqual(len(persona["prompt"]), config.max_system_prompt_length)
+        body = persona["prompt"].split("\n\n", 1)[1]
+        legacy = (
+            "Твоё имя — Переводчик. Ты можешь по желанию упоминать себя в третьем лице "
+            "(например: «Переводчик считает, что…»).\n\n" + body
+        )
+        self.assertTrue(persona_matches(legacy, persona))
+        self.assertEqual(legacy_persona_prompts()[legacy], persona["prompt"])
+        self.assertFalse(persona_matches(legacy + " Дополнительное правило.", persona))
+        with patch.object(config, "personas", _parse_personas("")):
+            self.assertEqual(prompt._active_persona_name(legacy), "🌐 Переводчик")
+        markup = get_persona_keyboard(_parse_personas(""), legacy)
+        active = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.text.endswith("✓")
+        ]
+        self.assertEqual(active, ["persona:translator"])
+
+    def test_translator_override_is_not_migrated(self):
+        personas = _parse_personas('{"translator": "Мой собственный переводчик"}')
+        for old, new in legacy_persona_prompts().items():
+            if new == DEFAULT_PERSONAS["translator"]["prompt"]:
+                self.assertNotIn(old, legacy_persona_prompts(personas))
+                self.assertFalse(persona_matches(old, personas["translator"]))
+        self.assertEqual(personas["translator"]["prompt"], "Мой собственный переводчик")
+
     def test_assistant_persona_matches_default_system_prompt(self):
         # So a fresh user (default prompt) shows the "assistant" persona active.
         self.assertEqual(

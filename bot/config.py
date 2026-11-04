@@ -390,11 +390,16 @@ _PERSONA_SELF_NAMES: dict[str, str] = {
     "writer": "Эдгар",
     "scientist": "Эйнштейн",
     "teacher": "Сократ",
-    "translator": "Переводчик",
+    "translator": "Вавилоныч",
     "critic": "Белинский",
     "friend": "Сэмуайз Гэмджи",
     "terminator": "Арни",
     "marvin": "Марвин",
+}
+
+# Прежние имена встроенных ролей: нужны для точной миграции сохранённых промптов.
+_PREVIOUS_PERSONA_SELF_NAMES: dict[str, tuple[str, ...]] = {
+    "translator": ("Переводчик",),
 }
 
 DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
@@ -416,15 +421,17 @@ def _strip_persona_self_reference(prompt: str, self_name: str) -> str:
 
 
 def persona_matches(prompt: str, persona: dict[str, str]) -> bool:
-    """Whether ``prompt`` is this persona, with or without its name header.
+    """Распознать промпт роли с текущим/прежним именем или без заголовка.
 
-    Presets saved before names were added must keep the ✓ in /persona and the
-    name in /settings instead of turning into "Custom".
+    Старые встроенные пресеты сохраняют ✓ в /persona и название в /settings,
+    а не превращаются в "Custom" после добавления или смены имени.
     """
     self_name = str(persona.get("self_name") or "").strip()
     stored = str(persona.get("prompt") or "")
     if not self_name:
         return prompt == stored
+    if legacy_persona_prompts().get(prompt) == stored:
+        return True
     return _strip_persona_self_reference(
         prompt, self_name
     ) == _strip_persona_self_reference(stored, self_name)
@@ -433,10 +440,10 @@ def persona_matches(prompt: str, persona: dict[str, str]) -> bool:
 def legacy_persona_prompts(
     personas: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, str]:
-    """Map pre-name built-in prompts to their current named versions."""
+    """Сопоставить старые встроенные промпты (без имени или с прежним) с текущими."""
     source = DEFAULT_PERSONAS if personas is None else personas
     result: dict[str, str] = {}
-    for persona in source.values():
+    for key, persona in source.items():
         self_name = str(persona.get("self_name") or "").strip()
         current = str(persona.get("prompt") or "")
         if not self_name or not current:
@@ -444,6 +451,10 @@ def legacy_persona_prompts(
         legacy = _strip_persona_self_reference(current, self_name)
         if legacy != current:
             result[legacy] = current
+            # Не переносим прежние встроенные промпты на пользовательскую замену роли.
+            if current == DEFAULT_PERSONAS.get(key, {}).get("prompt"):
+                for previous_name in _PREVIOUS_PERSONA_SELF_NAMES.get(key, ()):
+                    result[_persona_prompt(previous_name, legacy)] = current
     return result
 
 
