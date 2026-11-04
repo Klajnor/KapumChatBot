@@ -14,6 +14,9 @@ class TerminatorPersonaTests(unittest.TestCase):
         persona = personas["terminator"]
         self.assertEqual(persona, DEFAULT_PERSONAS["terminator"])
         self.assertEqual(persona["name"], "🦾 Терминатор")
+        self.assertEqual(persona["self_name"], "Арни")
+        self.assertIn("Твоё имя — Арни", persona["prompt"])
+        self.assertIn("третьем лице", persona["prompt"])
         self.assertLessEqual(len(persona["prompt"]), config.max_system_prompt_length)
         markup = get_persona_keyboard(personas, persona["prompt"])
         button = next(

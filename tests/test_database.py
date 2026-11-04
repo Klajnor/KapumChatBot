@@ -684,3 +684,96 @@ class TestDefaultPromptMigration(DBTest):
                 self.assertEqual(custom.system_prompt, "Мой собственный промпт")
 
         self._loop.run_until_complete(_run())
+
+
+class TestPersonaPromptMigration(DBTest):
+    """Pre-name prompts are upgraded to their named built-in versions."""
+
+    def test_previous_default_prompt_gets_name(self):
+        from sqlalchemy import text as sql_text
+
+        from bot.config import PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT
+        from bot.database.session import _run_data_migrations
+
+        self.assertNotEqual(
+            PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT, config.default_system_prompt
+        )
+
+        async def _run() -> None:
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                await repo.get_or_create_user(7100)
+                await repo.get_or_create_user(7101)
+                await session.execute(
+                    sql_text(
+                        "UPDATE user_settings SET system_prompt = :p "
+                        "WHERE user_id = 7100"
+                    ),
+                    {"p": PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT},
+                )
+                await session.execute(
+                    sql_text(
+                        "UPDATE user_settings SET system_prompt = :p "
+                        "WHERE user_id = 7101"
+                    ),
+                    {"p": "Мой собственный промпт"},
+                )
+                await session.commit()
+
+            async with self._engine.begin() as conn:
+                await _run_data_migrations(conn)
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                migrated = await repo.get_user_settings(7100)
+                custom = await repo.get_user_settings(7101)
+                self.assertEqual(migrated.system_prompt, config.default_system_prompt)
+                self.assertEqual(custom.system_prompt, "Мой собственный промпт")
+
+        self._loop.run_until_complete(_run())
+
+    def test_old_builtin_persona_prompt_gets_name(self):
+        from sqlalchemy import text as sql_text
+
+        from bot.config import DEFAULT_PERSONAS, legacy_persona_prompts
+        from bot.database.session import _run_data_migrations
+
+        persona = DEFAULT_PERSONAS["programmer"]
+        legacy = next(
+            old
+            for old, new in legacy_persona_prompts().items()
+            if new == persona["prompt"]
+        )
+
+        async def _run() -> None:
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                await repo.get_or_create_user(7200)
+                await repo.get_or_create_user(7201)
+                await session.execute(
+                    sql_text(
+                        "UPDATE user_settings SET system_prompt = :p "
+                        "WHERE user_id = 7200"
+                    ),
+                    {"p": legacy},
+                )
+                await session.execute(
+                    sql_text(
+                        "UPDATE user_settings SET system_prompt = :p "
+                        "WHERE user_id = 7201"
+                    ),
+                    {"p": "Мой собственный промпт"},
+                )
+                await session.commit()
+
+            async with self._engine.begin() as conn:
+                await _run_data_migrations(conn)
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                migrated = await repo.get_user_settings(7200)
+                custom = await repo.get_user_settings(7201)
+                self.assertEqual(migrated.system_prompt, persona["prompt"])
+                self.assertEqual(custom.system_prompt, "Мой собственный промпт")
+
+        self._loop.run_until_complete(_run())

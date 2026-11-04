@@ -3,6 +3,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.config import persona_matches
 from bot.services.ai_client import ai_client
 
 
@@ -111,7 +112,7 @@ def get_persona_keyboard(
     """Persona picker for /persona; the active preset is marked with ✓."""
     builder = InlineKeyboardBuilder()
     for key, persona in personas.items():
-        marker = " ✓" if persona.get("prompt") == current_prompt else ""
+        marker = " ✓" if persona_matches(current_prompt, persona) else ""
         builder.button(
             text=f"{persona.get('name', key)}{marker}",
             callback_data=f"persona:{key}",

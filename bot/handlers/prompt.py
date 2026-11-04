@@ -6,7 +6,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot.config import config
+from bot.config import config, persona_matches
 from bot.keyboards.inline import get_persona_keyboard
 from bot.services.telegram_utils import (
     require_private_chat,
@@ -69,7 +69,7 @@ async def cmd_prompt(message: Message) -> None:
 def _active_persona_name(current_prompt: str) -> str:
     """Display name of the persona whose prompt matches, else "Custom"."""
     for persona in config.personas.values():
-        if persona.get("prompt") == current_prompt:
+        if persona_matches(current_prompt, persona):
             return persona.get("name", "Custom")
     return "Custom"
 

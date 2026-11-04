@@ -67,33 +67,45 @@ async def init_db() -> None:
 async def _run_data_migrations(conn: Any) -> None:
     """Dialect-agnostic data fixes (they run on SQLite too).
 
-    Currently one fix: rows whose ``system_prompt`` still holds the *exact*
-    legacy English default are switched to the current Russian default, so
-    existing installations start answering in Russian after the update.
-    Custom prompts and chosen personas differ from the legacy string and are
-    therefore never touched.
+    Exact-text upgrades only: the legacy English default and the pre-name
+    Russian default become the current default, and built-in persona prompts
+    saved before names were added gain the name/third-person header. Custom
+    prompts never match these exact strings and are left untouched.
     """
-    from bot.config import LEGACY_DEFAULT_SYSTEM_PROMPT
+    from bot.config import (
+        LEGACY_DEFAULT_SYSTEM_PROMPT,
+        PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT,
+        legacy_persona_prompts,
+    )
 
-    if config.default_system_prompt == LEGACY_DEFAULT_SYSTEM_PROMPT:
-        return  # the deployment intentionally kept the English default
-    try:
-        await conn.execute(
-            text(
-                "UPDATE user_settings SET system_prompt = :new "
-                "WHERE system_prompt = :legacy"
-            ),
-            {
-                "new": config.default_system_prompt,
-                "legacy": LEGACY_DEFAULT_SYSTEM_PROMPT,
-            },
+    # Persona mappings first: the pre-name assistant body is also the old
+    # default prompt, and an explicitly customized deployment default must win
+    # over the built-in assistant target.
+    replacements = legacy_persona_prompts(config.personas)
+    if config.default_system_prompt != LEGACY_DEFAULT_SYSTEM_PROMPT:
+        replacements[LEGACY_DEFAULT_SYSTEM_PROMPT] = config.default_system_prompt
+    if config.default_system_prompt != PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT:
+        replacements[PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT] = (
+            config.default_system_prompt
         )
-    except Exception as exc:  # noqa: BLE001 - a data fix must never abort startup
-        import logging
+    replacements = {
+        old: new for old, new in replacements.items() if old and old != new
+    }
+    for old, new in replacements.items():
+        try:
+            await conn.execute(
+                text(
+                    "UPDATE user_settings SET system_prompt = :new "
+                    "WHERE system_prompt = :legacy"
+                ),
+                {"new": new, "legacy": old},
+            )
+        except Exception as exc:  # noqa: BLE001 - a data fix must never abort startup
+            import logging
 
-        logging.getLogger(__name__).warning(
-            "Default-prompt data migration skipped: %s", exc
-        )
+            logging.getLogger(__name__).warning(
+                "Prompt data migration skipped: %s", exc
+            )
 
 
 async def _add_missing_allowed_user_columns_sqlite(conn: Any) -> None:

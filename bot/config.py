@@ -212,14 +212,20 @@ FORMULA_STYLE_HINT = (
 )
 
 
-# The canonical default system prompt (Russian, with an explicit instruction
-# to answer in Russian). Used by the Config field default, the "assistant"
-# persona and the UserSettings column default, so all three stay in sync.
-DEFAULT_SYSTEM_PROMPT_TEXT = (
+# The default before built-in personas learned their names. A deployment that
+# still carries this exact DEFAULT_SYSTEM_PROMPT is upgraded to the current
+# default; a genuinely custom prompt is kept.
+PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT = (
     "Ты — полезный AI-ассистент. Отвечай кратко и точно. Всегда отвечай на "
     "русском языке, если пользователь явно не попросит ответить на другом "
     "языке."
 )
+
+# Body of the canonical default system prompt (Russian, with an explicit
+# instruction to answer in Russian). The name/third-person header is added
+# below, so DEFAULT_SYSTEM_PROMPT_TEXT remains one source of truth for the
+# Config field default, the "assistant" persona and the UserSettings default.
+DEFAULT_SYSTEM_PROMPT_BODY = PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT
 
 # The pre-Russian default; a startup data migration replaces rows that still
 # hold exactly this text (custom prompts are never touched).
@@ -227,15 +233,36 @@ LEGACY_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant. Answer questions concisely and accurately."
 )
 
-# Built-in AI personalities for the /persona menu. Each persona is a ready-made
-# system prompt with a display name. The "assistant" prompt intentionally
-# matches DEFAULT_SYSTEM_PROMPT so a fresh user shows that persona as active.
-# Override or extend the whole set with the PERSONAS env variable (JSON object:
-# key -> "prompt" or key -> {"name": ..., "prompt": ...}).
-DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
+# Built-in personas know their own name and may speak about themselves in the
+# third person. The header is part of the stored system prompt (a persona is
+# just a prompt), so the model keeps both after the preset is applied.
+PERSONA_SELF_REFERENCE_TEMPLATE = (
+    "Твоё имя — {name}. Ты можешь по желанию упоминать себя в третьем лице "
+    "(например: «{name} считает, что…»)."
+)
+
+
+def _persona_self_reference(name: str) -> str:
+    """The name and third-person permission sentence for a built-in persona."""
+    return PERSONA_SELF_REFERENCE_TEMPLATE.format(name=name)
+
+
+def _persona_prompt(name: str, body: str) -> str:
+    """Prefix a built-in persona body with its name and third-person rule."""
+    return f"{_persona_self_reference(name)}\n\n{body}"
+
+
+# Built-in AI personalities for the /persona menu: the body of each role's
+# system prompt plus its menu display name. The final DEFAULT_PERSONAS below
+# adds the role's self-name and the third-person permission. The "assistant"
+# body intentionally matches the default system prompt so a fresh user shows
+# that persona as active. Override or extend the whole set with the PERSONAS
+# env variable (JSON object: key -> "prompt" or key ->
+# {"name": ..., "prompt": ...}).
+_BUILTIN_PERSONA_BODIES: dict[str, dict[str, str]] = {
     "assistant": {
         "name": "🤖 Ассистент",
-        "prompt": DEFAULT_SYSTEM_PROMPT_TEXT,
+        "prompt": DEFAULT_SYSTEM_PROMPT_BODY,
     },
     "programmer": {
         "name": "👨‍💻 Программист",
@@ -356,6 +383,69 @@ DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
     },
 }
 
+# The name each built-in role uses for itself (without the menu emoji).
+_PERSONA_SELF_NAMES: dict[str, str] = {
+    "assistant": "Джарвис",
+    "programmer": "Джон Кармак",
+    "writer": "Эдгар",
+    "scientist": "Эйнштейн",
+    "teacher": "Сократ",
+    "translator": "Переводчик",
+    "critic": "Белинский",
+    "friend": "Сэмуайз Гэмджи",
+    "terminator": "Арни",
+    "marvin": "Марвин",
+}
+
+DEFAULT_PERSONAS: dict[str, dict[str, str]] = {
+    key: {
+        "name": persona["name"],
+        "self_name": _PERSONA_SELF_NAMES[key],
+        "prompt": _persona_prompt(_PERSONA_SELF_NAMES[key], persona["prompt"]),
+    }
+    for key, persona in _BUILTIN_PERSONA_BODIES.items()
+}
+
+DEFAULT_SYSTEM_PROMPT_TEXT = DEFAULT_PERSONAS["assistant"]["prompt"]
+
+
+def _strip_persona_self_reference(prompt: str, self_name: str) -> str:
+    """Remove the standard name/third-person header, if it is present."""
+    header = f"{_persona_self_reference(self_name)}\n\n"
+    return prompt.removeprefix(header)
+
+
+def persona_matches(prompt: str, persona: dict[str, str]) -> bool:
+    """Whether ``prompt`` is this persona, with or without its name header.
+
+    Presets saved before names were added must keep the ✓ in /persona and the
+    name in /settings instead of turning into "Custom".
+    """
+    self_name = str(persona.get("self_name") or "").strip()
+    stored = str(persona.get("prompt") or "")
+    if not self_name:
+        return prompt == stored
+    return _strip_persona_self_reference(
+        prompt, self_name
+    ) == _strip_persona_self_reference(stored, self_name)
+
+
+def legacy_persona_prompts(
+    personas: dict[str, dict[str, str]] | None = None,
+) -> dict[str, str]:
+    """Map pre-name built-in prompts to their current named versions."""
+    source = DEFAULT_PERSONAS if personas is None else personas
+    result: dict[str, str] = {}
+    for persona in source.values():
+        self_name = str(persona.get("self_name") or "").strip()
+        current = str(persona.get("prompt") or "")
+        if not self_name or not current:
+            continue
+        legacy = _strip_persona_self_reference(current, self_name)
+        if legacy != current:
+            result[legacy] = current
+    return result
+
 
 def _persona_display_name(key: str) -> str:
     """Human-readable fallback name from a persona key ("cool_guy" -> "Cool Guy")."""
@@ -368,7 +458,8 @@ def _parse_personas(raw: str) -> dict[str, dict[str, str]]:
     ``raw`` is a JSON object where each value is either a prompt string
     (``"pirate": "Talk like a pirate"``) or an object with ``name``/``prompt``
     (``"pirate": {"name": "🏴‍☠️ Pirate", "prompt": "..."}``). Invalid JSON or
-    malformed entries are skipped with a warning; the built-ins always remain.
+    malformed entries are skipped with a warning; the built-ins always remain,
+    including their ``self_name`` and the name/third-person header in ``prompt``.
     """
     log = logging.getLogger(__name__)
     personas = {key: dict(value) for key, value in DEFAULT_PERSONAS.items()}
@@ -1440,6 +1531,12 @@ class Config:
             spec["api_key"] = spec.get("api_key") or self.ai_api_key
         if not self.default_model:
             self.default_model = self.ai_models[0]["id"]
+
+        # A deployment that never customized DEFAULT_SYSTEM_PROMPT still has
+        # the old, nameless default: upgrade it so fresh users get the named
+        # assistant prompt too. Custom values are left untouched.
+        if self.default_system_prompt == PREVIOUS_DEFAULT_SYSTEM_PROMPT_TEXT:
+            self.default_system_prompt = DEFAULT_SYSTEM_PROMPT_TEXT
 
         self.personas = _parse_personas(os.getenv("PERSONAS", ""))
 

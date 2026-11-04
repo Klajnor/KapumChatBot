@@ -22,6 +22,8 @@ from bot.config import (
     _parse_personas,
     _search_api_key,
     config,
+    legacy_persona_prompts,
+    persona_matches,
 )
 from bot.database.repository import UserRepository
 from bot.database.session import _run_migrations
@@ -1284,11 +1286,29 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
     """AI personality presets: parsing, active detection and the keyboard."""
 
     def test_builtin_personas_are_present(self):
-        for key in ("assistant", "programmer", "writer", "scientist",
-                    "teacher", "translator", "critic", "friend"):
-            self.assertIn(key, DEFAULT_PERSONAS)
-            self.assertTrue(DEFAULT_PERSONAS[key]["name"])
-            self.assertTrue(DEFAULT_PERSONAS[key]["prompt"])
+        expected = {
+            "assistant", "programmer", "writer", "scientist", "teacher",
+            "translator", "critic", "friend", "terminator", "marvin",
+        }
+        self.assertEqual(set(DEFAULT_PERSONAS), expected)
+        for persona in DEFAULT_PERSONAS.values():
+            self.assertTrue(persona["name"])
+            self.assertTrue(persona["prompt"])
+            self_name = persona["self_name"]
+            self.assertTrue(self_name)
+            self.assertIn(f"Твоё имя — {self_name}", persona["prompt"])
+            self.assertIn("третьем лице", persona["prompt"])
+
+    def test_persona_matches_pre_name_prompt(self):
+        persona = DEFAULT_PERSONAS["programmer"]
+        legacy = next(
+            old
+            for old, new in legacy_persona_prompts().items()
+            if new == persona["prompt"]
+        )
+        self.assertTrue(persona_matches(persona["prompt"], persona))
+        self.assertTrue(persona_matches(legacy, persona))
+        self.assertFalse(persona_matches("Мой собственный промпт", persona))
 
     def test_assistant_persona_matches_default_system_prompt(self):
         # So a fresh user (default prompt) shows the "assistant" persona active.
@@ -1332,9 +1352,20 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("good", result)
 
     def test_active_persona_name_matches_and_custom(self):
+        persona = DEFAULT_PERSONAS["programmer"]
+        legacy = next(
+            old
+            for old, new in legacy_persona_prompts().items()
+            if new == persona["prompt"]
+        )
         with patch.object(config, "personas", _parse_personas("")):
             self.assertEqual(
-                prompt._active_persona_name(DEFAULT_PERSONAS["programmer"]["prompt"]),
+                prompt._active_persona_name(persona["prompt"]),
+                "👨‍💻 Программист",
+            )
+            # Prompts saved before names were added still resolve to the preset.
+            self.assertEqual(
+                prompt._active_persona_name(legacy),
                 "👨‍💻 Программист",
             )
             self.assertEqual(prompt._active_persona_name("my own prompt"), "Custom")
