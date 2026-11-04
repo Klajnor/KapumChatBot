@@ -26,10 +26,9 @@ class RestartHardeningTests(unittest.TestCase):
     def test_mutable_data_belongs_to_the_service(self):
         script = (ROOT / "restart.sh").read_text(encoding="utf-8")
         self.assertIn('OWNER="brain:brain"', script)
-        self.assertIn('chown -R "$OWNER" "$STATE_DIR"', script)
-        self.assertIn('chmod 700 "$STATE_DIR"', script)
-        self.assertIn('chown "$OWNER" -- "$f"', script)
-        self.assertIn('chmod 600 -- "$f"', script)
+        self.assertIn('secure_data_permissions.py', script)
+        self.assertIn('--user brain "$STATE_DIR" "${DATA_GLOBS[@]}"', script)
+        self.assertNotIn('chown "$OWNER" -- "$f"', script)
 
     def test_restart_removes_stale_root_owned_pycache(self):
         script = (ROOT / "restart.sh").read_text(encoding="utf-8")

@@ -34,8 +34,6 @@ CONFIG_FILES=(
 DATA_GLOBS=(
     "$APP_DIR"/*.db "$APP_DIR"/*.db-wal "$APP_DIR"/*.db-shm
     "$APP_DIR/telegraph_account.json"
-    "$STATE_DIR"/*.db "$STATE_DIR"/*.db-wal "$STATE_DIR"/*.db-shm
-    "$STATE_DIR/telegraph_account.json"
 )
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -59,20 +57,11 @@ for f in "${CONFIG_FILES[@]}"; do
     fi
 done
 
-if [ -d "$STATE_DIR" ]; then
-    echo "Данные $STATE_DIR: $OWNER 700..."
-    chown -R "$OWNER" "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-fi
-
-echo "Данные в $APP_DIR: $OWNER 600..."
-for f in "${DATA_GLOBS[@]}"; do
-    if [ -f "$f" ]; then
-        chown "$OWNER" -- "$f"
-        chmod 600 -- "$f"
-        echo "  600 $f"
-    fi
-done
+echo "Данные: $OWNER, каталоги 700, файлы 600 (без перехода по ссылкам)..."
+# Каталог данных доступен сервису на запись: проверки -f/-L перед chown/chmod
+# не защищают от подмены между проверкой и операцией. Используем дескрипторы.
+/usr/bin/python3 "$APP_DIR/scripts/secure_data_permissions.py" \
+    --user brain "$STATE_DIR" "${DATA_GLOBS[@]}"
 
 echo "Перезапуск $SERVICE..."
 systemctl daemon-reload
