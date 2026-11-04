@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.update_support import (
+    check_error_summary,
     check_mcp,
     check_syntax,
     check_target,
@@ -135,8 +136,19 @@ class UpdateSupportTests(unittest.TestCase):
             check_syntax([root])
             self.assertFalse((root / "__pycache__").exists())
             (root / "module.py").write_text("broken = (", encoding="utf-8")
-            with self.assertRaises(SyntaxError):
+            with self.assertRaisesRegex(ValueError, r"module.py.*line 1"):
                 check_syntax([root])
+
+    def test_diagnostics_do_not_include_source_or_arbitrary_exception_text(self):
+        self.assertNotIn("SECRET", check_error_summary(RuntimeError("SECRET")))
+        self.assertNotIn("SECRET", check_error_summary(PermissionError(13, "SECRET", "/opt/brain/.env")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "broken.py").write_text("SECRET = (\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as error:
+                check_syntax([root])
+            self.assertIn("broken.py", str(error.exception))
+            self.assertNotIn("SECRET", str(error.exception))
 
     def test_target_preserves_ignored_files_and_protected_paths(self):
         for name in (".env", "data/brain.db", ".venv/new.py", ".mcp.json", "local.py"):
@@ -178,6 +190,25 @@ class UpdateSupportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 asyncio.run(check_mcp(Path(sys.executable), root))
 
+    def test_mcp_failure_reports_missing_module_without_raw_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mcp_server.py").write_text(
+                "import sys\n"
+                "sys.stderr.write(\"ModuleNotFoundError: No module named 'Stemmer'\\n\")\n"
+                "sys.stderr.write('PRIVATE_NOTE SECRET_TOKEN\\n')\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as error:
+                asyncio.run(check_mcp(Path(sys.executable), root))
+            detail = str(error.exception)
+            self.assertIn("MCP initialize", detail)
+            self.assertIn("Stemmer", detail)
+            self.assertIn("server exit=1", detail)
+            self.assertNotIn("SECRET_TOKEN", detail)
+            self.assertNotIn("PRIVATE_NOTE", detail)
+
 
 @unittest.skipUnless(BASH and shutil.which("git"), "Нужны Bash и Git")
 class UpdateShellTests(unittest.TestCase):
@@ -205,6 +236,8 @@ APP_DIR={bash_path(self.bot)}
 BRAIN_DIR={bash_path(self.brain)}
 STATE_DIR={bash_path(self.root / 'state')}
 RUN_DIR={bash_path(self.root / 'run')}
+BACKUP_DIR={bash_path(self.root / 'backups')}
+mkdir -p "$RUN_DIR" "$BACKUP_DIR"
 SUPPORT={bash_path(ROOT / 'scripts/update_support.py')}
 BOT_PY={bash_path(sys.executable)}
 BRAIN_PY="$BOT_PY"
@@ -339,6 +372,7 @@ _failed_update
 test "$TRANSACTION" = 0
 test "$(_state bot)" = failed:{bot_new}
 test "$(_state brain)" = failed:{brain_new}
+_notify_result
 ''')
         for repo, old in ((self.bot, self.bot_old), (self.brain, self.brain_old)):
             self.assertEqual(git(repo, "rev-parse", "HEAD"), old)
@@ -370,6 +404,7 @@ timeout() {{ [ "$(_git "$BRAIN_DIR" rev-parse HEAD)" = "$BRAIN_OLD" ]; }}
 if _apply_update; then exit 9; fi
 _failed_update
 test "$KEEP_BACKUP" = 0
+_notify_result
 ''')
         self.assertEqual(git(self.brain, "rev-parse", "HEAD"), self.brain_old)
         self.assertIn("Previous code and environments restored", (self.root / "calls").read_text(encoding="utf-8"))
@@ -407,27 +442,158 @@ if _wait_healthy; then exit 9; fi
 
     def test_running_pull_is_deferred_without_killing_indexer(self):
         self.run_bash('''
-UPD_BRAIN=1
+UPD_BRAIN=1 UPD_BOT=1
 _active() { [ "$1" = "$PULL_TIMER" ]; }
 systemctl() {
     if [ "$1" = show ]; then echo activating; else echo "$*" >> "$CALLS"; fi
 }
 _pause_indexer
 test "$UPD_BRAIN" = 0
+test "$UPD_BOT" = 1
+test -z "$FAILURE_STAGE"
 _resume_timer
 ''')
-        self.assertEqual((self.root / "calls").read_text(encoding="utf-8"), "stop brain-pull.timer\nstart brain-pull.timer\n")
+        self.assertFalse((self.root / "calls").exists())
+        self.assertFalse((self.root / "state/brain.state").exists())
 
     def test_incomplete_rollback_is_reported_and_backups_retained(self):
         self.run_bash('''
 UPD_BRAIN=1 BRAIN_TOUCHED=1 BRAIN_NEW=new BRAIN_OLD=old
+FAILURE_STAGE=brain.mcp FAILURE_CODE=124 FAILURE_DETAIL=timeout
 _git() { return 1; }
 _restore_venv() { return 0; }
 _restart_services() { return 0; }
 _failed_update
 test "$KEEP_BACKUP" = 1
+_notify_result
 ''')
-        self.assertIn("rollback is incomplete", (self.root / "calls").read_text(encoding="utf-8"))
+        detail = (self.root / "calls").read_text(encoding="utf-8")
+        self.assertIn("rollback is incomplete", detail)
+        self.assertIn("brain.mcp (exit 124)", detail)
+        self.assertIn("rollback.brain.checkout (exit 1)", detail)
+
+    def test_exit_always_restores_timer_after_success_failure_or_incomplete_rollback(self):
+        for outcome, keep, status in (("success", 0, 0), ("failed", 0, 1), ("failed", 1, 1)):
+            with self.subTest(outcome=outcome, keep_backup=keep):
+                self.run_bash(f'''
+: > "$CALLS"
+echo snapshot > "$BACKUP_DIR/snapshot"
+OUTCOME={outcome} KEEP_BACKUP={keep} TIMER_WAS_ACTIVE=1
+ROLLBACK_REPORT="complete"
+timer_on=0
+_active() {{ [ "$timer_on" = 1 ]; }}
+systemctl() {{
+    if [ "$1" = start ]; then
+        timer_on=1
+        echo "$*" >> "$CALLS"
+    else
+        echo "ActiveState=active"
+    fi
+}}
+set +e
+(exit {status})
+_on_exit
+''', expected=status)
+                detail = (self.root / "calls").read_text(encoding="utf-8")
+                self.assertIn("start brain-pull.timer", detail)
+                self.assertIn("active (schedule restored)", detail)
+                self.assertEqual((self.root / "backups/snapshot").exists(), bool(keep))
+
+    def test_interrupt_rolls_back_and_restores_timer_preserving_exit_status(self):
+        self.run_bash('''
+TRANSACTION=1 TIMER_WAS_ACTIVE=1 UPD_BRAIN=1 BRAIN_NEW=new
+CURRENT_STAGE=brain.dependencies
+timer_on=0
+_rollback() { echo rollback >> "$CALLS"; return 0; }
+_active() { [ "$timer_on" = 1 ]; }
+systemctl() {
+    if [ "$1" = start ]; then timer_on=1; echo "$*" >> "$CALLS"; fi
+}
+set +e
+(exit 143)
+_on_exit
+''', expected=143)
+        detail = (self.root / "calls").read_text(encoding="utf-8")
+        self.assertIn("rollback\nstart brain-pull.timer", detail)
+        self.assertIn("brain.dependencies (exit 143)", detail)
+        self.assertIn("interrupted", detail)
+
+    def test_timer_restore_failure_has_diagnostics_and_nonzero_exit(self):
+        self.run_bash('''
+OUTCOME=success TIMER_WAS_ACTIVE=1
+ROLLBACK_REPORT="not needed (new code and service checks OK)"
+_active() { return 1; }
+systemctl() {
+    if [ "$1" = start ]; then return 5; fi
+    echo "LoadState=masked ActiveState=inactive"
+}
+_on_exit
+''', expected=1)
+        detail = (self.root / "calls").read_text(encoding="utf-8")
+        self.assertIn("timer.resume (exit 5)", detail)
+        self.assertIn("FAILED to resume", detail)
+        self.assertIn("LoadState=masked", detail)
+        self.assertIn("journalctl -u kapum-update", detail)
+
+    def test_enabled_inactive_timer_is_recovered_but_disabled_timer_stays_off(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.run_bash(f'''
+: > "$CALLS"
+timer_on=0
+_active() {{ [ "$timer_on" = 1 ]; }}
+systemctl() {{
+    if [ "$1" = is-enabled ]; then
+        echo {"enabled" if enabled else "disabled"}
+    elif [ "$1" = start ]; then
+        timer_on=1
+        echo "$*" >> "$CALLS"
+    fi
+}}
+_remember_timer
+_on_exit
+''')
+                detail = (self.root / "calls").read_text(encoding="utf-8")
+                self.assertEqual("start brain-pull.timer" in detail, enabled)
+                self.assertNotIn("enable brain-pull.timer", detail)
+
+    def test_pull_starting_during_timer_pause_is_deferred_and_schedule_restored(self):
+        self.run_bash('''
+UPD_BRAIN=1
+timer_on=1
+_active() { [ "$timer_on" = 1 ]; }
+systemctl() {
+    if [ "$1" = show ]; then
+        if [ -f "$STATE_DIR/pull-checked" ]; then
+            echo activating
+        else
+            touch "$STATE_DIR/pull-checked"
+            echo inactive
+        fi
+    elif [ "$1" = stop ]; then
+        timer_on=0
+        echo "$*" >> "$CALLS"
+    elif [ "$1" = start ]; then
+        timer_on=1
+        echo "$*" >> "$CALLS"
+    fi
+}
+_pause_indexer
+test "$UPD_BRAIN" = 0
+_on_exit
+''')
+        self.assertEqual((self.root / "calls").read_text(encoding="utf-8"), "stop brain-pull.timer\nstart brain-pull.timer\n")
+        self.assertFalse((self.root / "state/brain.state").exists())
+
+    def test_raw_command_output_is_not_sent_in_failure_notification(self):
+        self.run_bash('''
+if _step brain.mcp _checked_command bash -c 'echo PRIVATE_NOTE_SECRET >&2; exit 13'; then exit 9; fi
+OUTCOME=failed
+_notify_result
+''')
+        detail = (self.root / "calls").read_text(encoding="utf-8")
+        self.assertIn("brain.mcp (exit 13)", detail)
+        self.assertNotIn("PRIVATE_NOTE_SECRET", detail)
 
 
 if __name__ == "__main__":
