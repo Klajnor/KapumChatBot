@@ -24,6 +24,7 @@ from bot.config import (
     config,
 )
 from bot.services import thinking
+from bot.services.ai_errors import AIRequestError, provider_error, request_error
 from bot.services.http_body import read_bounded
 from bot.services.image_tools import canonical_operations
 from bot.services.science import normalize_formulas
@@ -56,11 +57,17 @@ class AIStreamError(RuntimeError):
     regular single-shot request. ``status`` carries the HTTP code when the
     failure came from the API, so the caller can tell a model-specific problem
     from one no other model could survive (see ``_chain_fatal``).
+    ``errors`` сохраняет безопасные причины всех неудачных попыток цепочки.
     """
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, status: int | None = None,
+        code: str = "STREAM_ERROR", errors: list[AIRequestError] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.errors = list(errors or [])
 
 
 async def _sse_lines(chunks: Any) -> AsyncIterator[str]:
@@ -458,6 +465,7 @@ class ChatResult:
     ``elapsed`` is the wall time of the API call in seconds (0.0 when unknown,
     e.g. for a result built by a test double); ``usage`` is the raw ``usage``
     object returned by the API.
+    ``errors`` содержит безопасную диагностику только текущего вызова.
     """
 
     content: str | None = None
@@ -467,6 +475,8 @@ class ChatResult:
     # Model that actually produced the answer (may differ from the requested
     # one when the fallback chain was used).
     model: str | None = None
+    # Только ошибки этого вызова; общего last_error у клиента нет.
+    errors: list[AIRequestError] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int | None:
@@ -673,6 +683,20 @@ class AIClient:
         base = (spec.get("base_url") or self.base_url).rstrip("/")
         return f"{base}/chat/completions", self._auth_headers(spec.get("api_key"))
 
+    def _error_secrets(self) -> tuple[str, ...]:
+        return (
+            self.api_key, config.ai_api_key, config.bot_token,
+            *(spec.get("api_key", "") for spec in (*config.ai_models, *config.ai_fallback_models)),
+        )
+
+    def _stream_errors(
+        self, payload: dict[str, Any], exc: AIStreamError,
+    ) -> list[AIRequestError]:
+        return exc.errors or [request_error(
+            str(payload["model"]), str(exc.status) if exc.status else exc.code,
+            str(exc), secrets=self._error_secrets(),
+        )]
+
     async def refresh_available_models(self) -> list[dict[str, Any]]:
         """Fetch every provider's live model list and cache the usable subset."""
         providers = {
@@ -772,6 +796,7 @@ class AIClient:
         thinking settings (see :mod:`bot.services.thinking`).
         """
         started = time.monotonic()
+        errors: list[AIRequestError] = []
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages,
@@ -781,7 +806,7 @@ class AIClient:
                 public=public and attempt_model not in self._thinking_unsupported,
             )
             status, data, _elapsed = await self._post_chat(
-                payload, retries=2, model_id=attempt_model
+                payload, retries=2, model_id=attempt_model, errors=errors
             )
             if status in {400, 422} and _has_thinking(payload):
                 self._thinking_unsupported.add(attempt_model)
@@ -791,7 +816,7 @@ class AIClient:
                 )
                 payload = _without_thinking(payload)
                 status, data, _elapsed = await self._post_chat(
-                    payload, retries=2, model_id=attempt_model
+                    payload, retries=2, model_id=attempt_model, errors=errors
                 )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
@@ -801,7 +826,12 @@ class AIClient:
                         elapsed=time.monotonic() - started,
                         usage=_extract_usage(data),
                         model=attempt_model,
+                        errors=errors,
                     )
+                errors.append(request_error(
+                    str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
+                    secrets=self._error_secrets(),
+                ))
             logger.warning(
                 "Model %s did not answer (status %s); trying the next model",
                 attempt_model,
@@ -813,7 +843,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
 
     async def chat_with_tools(
         self,
@@ -832,6 +862,7 @@ class AIClient:
         global thinking settings (user-visible answers only).
         """
         started = time.monotonic()
+        errors: list[AIRequestError] = []
         for attempt_model in self.model_chain(model):
             offered = tools if tools is not None else [IMAGE_TOOL]
             payload = self._chat_payload(
@@ -845,7 +876,7 @@ class AIClient:
             payload["tools"] = offered
 
             status, data, _elapsed = await self._post_chat(
-                payload, retries=2, model_id=attempt_model
+                payload, retries=2, model_id=attempt_model, errors=errors
             )
             # Some models do not support the tools parameter -> retry the
             # same model without it, but only for a tool-shaped rejection.
@@ -857,7 +888,7 @@ class AIClient:
                     payload["messages"], TOOL_CALLS_HINT
                 )
                 status, data, _elapsed = await self._post_chat(
-                    payload, retries=2, model_id=attempt_model
+                    payload, retries=2, model_id=attempt_model, errors=errors
                 )
             if status in {400, 422} and _has_thinking(payload):
                 self._thinking_unsupported.add(attempt_model)
@@ -867,7 +898,7 @@ class AIClient:
                 )
                 payload = _without_thinking(payload)
                 status, data, _elapsed = await self._post_chat(
-                    payload, retries=2, model_id=attempt_model
+                    payload, retries=2, model_id=attempt_model, errors=errors
                 )
 
             if status == 200 and data is not None:
@@ -877,7 +908,12 @@ class AIClient:
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
+                    result.errors = errors
                     return result
+                errors.append(request_error(
+                    str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
+                    secrets=self._error_secrets(),
+                ))
 
             logger.warning(
                 "Model %s did not answer with tools (status %s); "
@@ -891,7 +927,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
 
     async def chat_completion_with_image(
         self,
@@ -928,6 +964,7 @@ class AIClient:
         settings when the analysis itself is shown to the user.
         """
         started = time.monotonic()
+        errors: list[AIRequestError] = []
         for attempt_model in self.model_chain(model, require_vision=True):
             payload = self._chat_payload(
                 self.vision_messages(messages, text, image_bytes),
@@ -937,7 +974,7 @@ class AIClient:
                 public=public and attempt_model not in self._thinking_unsupported,
             )
             status, data, _elapsed = await self._post_chat(
-                payload, retries=2, model_id=attempt_model
+                payload, retries=2, model_id=attempt_model, errors=errors
             )
             if status in {400, 422} and _has_thinking(payload):
                 self._thinking_unsupported.add(attempt_model)
@@ -948,7 +985,7 @@ class AIClient:
                 )
                 payload = _without_thinking(payload)
                 status, data, _elapsed = await self._post_chat(
-                    payload, retries=2, model_id=attempt_model
+                    payload, retries=2, model_id=attempt_model, errors=errors
                 )
             if status == 200 and data is not None:
                 content = self._finalize(self._extract_content(data))
@@ -958,7 +995,12 @@ class AIClient:
                         elapsed=time.monotonic() - started,
                         usage=_extract_usage(data),
                         model=attempt_model,
+                        errors=errors,
                     )
+                errors.append(request_error(
+                    str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
+                    secrets=self._error_secrets(),
+                ))
             logger.warning(
                 "Vision model %s did not answer (status %s); "
                 "trying the next model",
@@ -971,7 +1013,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
 
     @staticmethod
     def vision_messages(
@@ -1020,6 +1062,7 @@ class AIClient:
         """
         started = time.monotonic()
         last_error: AIStreamError | None = None
+        errors: list[AIRequestError] = []
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages,
@@ -1041,6 +1084,7 @@ class AIClient:
                     allow_retry=not tools,
                 )
             except AIStreamError as exc:
+                errors.extend(self._stream_errors(payload, exc))
                 last_error = exc
                 logger.warning(
                     "Model %s streaming failed (%s); trying the next model",
@@ -1055,7 +1099,9 @@ class AIClient:
                     break
                 continue
             if not result.content and not result.tool_calls:
-                last_error = AIStreamError("empty answer")
+                errors.extend(result.errors)
+                last_error = AIStreamError("HTTP 200: no usable answer", code="EMPTY_RESPONSE")
+                errors.extend(self._stream_errors(payload, last_error))
                 logger.warning(
                     "Model %s returned an empty streamed answer; "
                     "trying the next model",
@@ -1064,9 +1110,12 @@ class AIClient:
                 continue
             result.elapsed = time.monotonic() - started
             result.model = attempt_model
+            result.errors = [*errors, *result.errors]
             return result
 
-        raise last_error or AIStreamError("no model produced an answer")
+        last_error = last_error or AIStreamError("no model produced an answer")
+        last_error.errors = errors
+        raise last_error
 
     async def _stream_attempt_with_thinking_fallback(
         self,
@@ -1097,9 +1146,16 @@ class AIClient:
                 "retrying without them",
                 model_id,
             )
-            return await self._stream_attempt(
-                _without_thinking(payload), on_delta, model_id
-            )
+            errors = self._stream_errors(payload, exc)
+            try:
+                result = await self._stream_attempt(
+                    _without_thinking(payload), on_delta, model_id
+                )
+            except AIStreamError as retry_error:
+                retry_error.errors = [*errors, *self._stream_errors(payload, retry_error)]
+                raise
+            result.errors = [*errors, *result.errors]
+            return result
 
     async def _stream_attempt(
         self,
@@ -1135,7 +1191,9 @@ class AIClient:
             if not isinstance(event, dict):
                 continue
             if event.get("error"):
-                raise AIStreamError(f"API stream error: {str(event['error'])[:200]}")
+                raise AIStreamError("API stream error", errors=[provider_error(
+                    str(payload["model"]), 200, data, secrets=self._error_secrets(),
+                )])
             if isinstance(event.get("usage"), dict):
                 usage = event["usage"]
             for choice in event.get("choices") or []:
@@ -1219,13 +1277,17 @@ class AIClient:
                     logger.error(
                         "AI stream error (status %s): %s", resp.status, body[:500]
                     )
-                    raise AIStreamError(f"HTTP {resp.status}", status=resp.status)
+                    raise AIStreamError(f"HTTP {resp.status}", status=resp.status, errors=[
+                        provider_error(str(payload["model"]), resp.status, body, secrets=self._error_secrets()),
+                    ])
                 async for line in _sse_lines(resp.content):
                     yield line
         except AIStreamError:
             raise
-        except (TimeoutError, aiohttp.ClientError) as exc:
-            raise AIStreamError(str(exc)) from exc
+        except TimeoutError as exc:
+            raise AIStreamError("Request timed out", code="TIMEOUT") from exc
+        except aiohttp.ClientError as exc:
+            raise AIStreamError("Network request failed", code="NETWORK_ERROR") from exc
 
     # --- Speech recognition ------------------------------------------------
 
@@ -1840,6 +1902,7 @@ class AIClient:
         retries: int = 3,
         fail_fast_on_quota: bool = True,
         model_id: str | None = None,
+        errors: list[AIRequestError] | None = None,
     ) -> tuple[int | None, dict[str, Any] | None, float]:
         """POST a JSON payload with retry on transient errors.
 
@@ -1848,6 +1911,7 @@ class AIClient:
         ``fail_fast_on_quota`` returns a quota/rate-limit answer immediately so
         the chat fallback chain can switch models; set it to ``False`` for
         requests without an alternative model (e.g. image generation).
+        ``errors``, если передан, пополняется причиной каждой неудачной попытки.
         """
         if url:
             target, headers = url, None
@@ -1886,10 +1950,31 @@ class AIClient:
 
                     if resp.status == 200:
                         try:
-                            return 200, json.loads(body), _elapsed()
+                            data = json.loads(body)
                         except json.JSONDecodeError:
                             logger.error("AI API returned invalid JSON: %s", body[:300])
+                            if errors is not None:
+                                errors.append(request_error(
+                                    str(payload["model"]), "INVALID_RESPONSE", "HTTP 200: invalid JSON",
+                                    secrets=self._error_secrets(),
+                                ))
                             return resp.status, None, _elapsed()
+                        if not isinstance(data, dict) or data.get("error"):
+                            if errors is not None:
+                                errors.append(
+                                    provider_error(str(payload["model"]), 200, body, secrets=self._error_secrets())
+                                    if isinstance(data, dict) else request_error(
+                                        str(payload["model"]), "INVALID_RESPONSE", "HTTP 200: expected a JSON object",
+                                        secrets=self._error_secrets(),
+                                    )
+                                )
+                            return resp.status, None, _elapsed()
+                        return 200, data, _elapsed()
+
+                    if errors is not None:
+                        errors.append(provider_error(
+                            str(payload["model"]), resp.status, body, secrets=self._error_secrets(),
+                        ))
 
                     if fail_fast_on_quota and (
                         resp.status == 429 or _QUOTA_ERROR_RE.search(body)
@@ -1930,6 +2015,11 @@ class AIClient:
                     return resp.status, None, _elapsed()
 
             except TimeoutError:
+                if errors is not None:
+                    errors.append(request_error(
+                        str(payload["model"]), "TIMEOUT", "Request timed out",
+                        secrets=self._error_secrets(),
+                    ))
                 logger.warning(
                     "AI API request timed out id=%s (attempt %s/%s)",
                     request_id, attempt, retries,
@@ -1938,6 +2028,11 @@ class AIClient:
                     return None, None, _elapsed()
                 await asyncio.sleep(min(2**attempt, 8))
             except aiohttp.ClientError as exc:
+                if errors is not None:
+                    errors.append(request_error(
+                        str(payload["model"]), "NETWORK_ERROR", "Network request failed",
+                        secrets=self._error_secrets(),
+                    ))
                 logger.error("AI API request failed id=%s: %s", request_id, exc)
                 if attempt >= retries:
                     return None, None, _elapsed()

@@ -42,6 +42,7 @@ from bot.services.ai_client import (
     ai_client,
     is_vision_model,
 )
+from bot.services.ai_errors import AIRequestError, format_request_errors
 from bot.services.documents import (
     DocumentParseTimeout,
     FetchedPage,
@@ -57,6 +58,7 @@ from bot.services.intent import (
     detect_intent,
     generation_prompt,
 )
+from bot.services.markdown import split_chunks
 from bot.services.mcp import (
     apply_mcp_hint,
     mcp_available,
@@ -1532,6 +1534,7 @@ async def _answer_with_ai(
     # ask for many searches or MCP reads.
     budget = ToolBudget()
     result: ChatResult
+    request_errors: list[AIRequestError] = []
 
     async with waiting(message) as notifier:
         while True:
@@ -1570,6 +1573,7 @@ async def _answer_with_ai(
                         public=True,
                     )
                 except AIStreamError as exc:
+                    request_errors.extend(exc.errors)
                     logger.warning(
                         "Streaming failed (%s); retrying as a single request", exc
                     )
@@ -1580,6 +1584,7 @@ async def _answer_with_ai(
                 result = await _single_shot(messages, model, settings, tools_arg)
 
             total_elapsed += result.elapsed
+            request_errors.extend(result.errors)
 
             # Ответ модели — недоверенный ввод. Отсутствие инструмента в
             # каталоге само по себе не запрещает модели вернуть его имя.
@@ -1680,6 +1685,7 @@ async def _answer_with_ai(
                 # an answer from the results already gathered.
                 logger.info("Tool round limit reached; forcing a final answer")
                 result = await _single_shot(messages, model, settings, None)
+                request_errors.extend(result.errors)
                 result.tool_calls = []
                 total_elapsed += result.elapsed
             break
@@ -1750,12 +1756,17 @@ async def _answer_with_ai(
             await refund_access(service, user.id, access)
     elif not result.content:
         await refund_access(service, user.id, access)
-        await safe_answer(
-            message,
-            "❌ <b>Error communicating with the AI.</b>\n\n"
+        error_text = (
+            "❌ Error communicating with the AI.\n\n"
             "Please try again later. If the problem persists, check the "
-            "API key and balance of the configured Qwen account.",
+            "API keys and balances of the configured providers."
         )
+        details = format_request_errors(request_errors)
+        if details:
+            error_text += f"\n\nModel errors: {details}"
+        # Не интерпретируем разметку провайдера. Запас ×2 — для UTF-16/эмодзи.
+        for chunk in split_chunks(error_text, "plain", MAX_MESSAGE_LENGTH // 2):
+            await safe_answer(message, chunk, parse_mode=None)
         return
 
     hint = guest_hint(access)
