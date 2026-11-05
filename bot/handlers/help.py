@@ -75,9 +75,12 @@ async def cmd_help(message: Message) -> None:
     is_admin = config.is_admin(user.id)
 
     is_allowed = False
+    daily_limit = None
     if not is_admin:
         async with user_service() as service:
             is_allowed = await service.is_allowed_user(user.id)
+            if is_allowed:
+                daily_limit = await service.get_daily_limit(user.id)
 
     if is_admin:
         help_text = (
@@ -103,7 +106,7 @@ async def cmd_help(message: Message) -> None:
         help_text = (
             "<b>🤖 Available Commands</b>\n\n"
             f"{_CHAT_SECTION}\n\n"
-            f"⚠️ <b>Daily limit:</b> {config.daily_limit} questions per day"
+            f"⚠️ <b>Daily limit:</b> {daily_limit} questions per day"
             f"{_guest_mode_tip()}\n\n"
             f"{_TIPS}"
         )

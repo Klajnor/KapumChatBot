@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from bot.config import config
 from bot.handlers.admin_panel import _can_manage, _render_card, _render_list
+from bot.handlers.help import cmd_help
+from bot.handlers.start import cmd_start
 from bot.services.access import check_access
 from bot.services.user_service import user_service
 from tests.test_database import DBTest
 
 OWNER, ADMIN, USER, GUEST = 1, 2, 3, 4
+
+
+def _message(user_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        from_user=SimpleNamespace(
+            id=user_id, username="bob", first_name="Bob", last_name=None,
+        ),
+        chat=SimpleNamespace(type="private"),
+        answer=AsyncMock(),
+    )
 
 
 class TestAccessLevels(DBTest):
@@ -48,6 +61,53 @@ class TestAccessLevels(DBTest):
             async with user_service() as s:
                 await s.set_daily_limit(USER, None)
                 self.assertEqual(await s.get_daily_limit(USER), 3)
+
+        self._run(go)
+
+    def test_help_and_start_show_effective_daily_limit(self):
+        async def go() -> None:
+            async with user_service() as s:
+                await s.register_user(USER)
+                await s.add_allowed_user(USER)
+
+            for override, expected in ((None, 3), (1, 1), (8, 8), (0, 0), (None, 3)):
+                async with user_service() as s:
+                    await s.set_daily_limit(USER, override)
+                for command in (cmd_help, cmd_start):
+                    with self.subTest(command=command.__name__, override=override):
+                        message = _message(USER)
+                        await command(message)
+                        message.answer.assert_awaited_once()
+                        self.assertIn(
+                            f"<b>Daily limit:</b> {expected} questions per day",
+                            message.answer.await_args.args[0],
+                        )
+
+            async with user_service() as s:
+                self.assertEqual(await s.get_daily_usage_used(USER), 0)
+
+        self._run(go)
+
+    def test_help_and_start_keep_admin_and_guest_limits(self):
+        async def go() -> None:
+            async with user_service() as s:
+                await s.register_user(ADMIN)
+                await s.add_allowed_user(ADMIN)
+                await s.set_daily_limit(ADMIN, 0)
+                await s.set_admin(ADMIN, True)
+
+            for user_id in (OWNER, ADMIN, GUEST):
+                for command in (cmd_help, cmd_start):
+                    with self.subTest(command=command.__name__, user_id=user_id):
+                        message = _message(user_id)
+                        await command(message)
+                        message.answer.assert_awaited_once()
+                        text = message.answer.await_args.args[0]
+                        self.assertNotIn("Daily limit:", text)
+                        if user_id == GUEST:
+                            self.assertIn("up to 5 questions", text)
+                        else:
+                            self.assertIn("Admin", text)
 
         self._run(go)
 

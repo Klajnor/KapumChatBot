@@ -73,6 +73,7 @@ async def cmd_start(message: Message) -> None:
             last_name=user.last_name,
         )
         is_allowed = await service.is_allowed_user(user.id)
+        daily_limit = await service.get_daily_limit(user.id) if is_allowed else None
 
     safe_name = html.escape(user.first_name or "there")
     # Persistent button menu: private chats of admins / whitelisted users only.
@@ -107,7 +108,7 @@ async def cmd_start(message: Message) -> None:
             f"You have been granted access to use this AI bot.\n\n"
             f"<b>Available commands:</b>\n"
             f"{_BASE_COMMANDS}\n\n"
-            f"⚠️ <b>Daily limit:</b> {config.daily_limit} questions per day"
+            f"⚠️ <b>Daily limit:</b> {daily_limit} questions per day"
             f"{_guest_mode_hint()}\n\n"
             f"<i>Happy chatting! 🚀</i>",
             reply_markup=menu,
