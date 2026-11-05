@@ -22,11 +22,18 @@ from bot.handlers.chat import (
     DEFAULT_LINK_PROMPT,
     DEFAULT_VIDEO_PROMPT,
     _compose_document_context,
+    _without_mcp_tools,
+    _without_untrusted_side_effects,
     read_links,
 )
 from bot.services import limits
 from bot.services.access import AccessResult, check_access, refund_access
-from bot.services.ai_client import ChatResult, ai_client, is_vision_model
+from bot.services.ai_client import (
+    IMAGE_TOOL,
+    ChatResult,
+    ai_client,
+    is_vision_model,
+)
 from bot.services.documents import (
     DocumentParseTimeout,
     detect_file_type,
@@ -38,10 +45,17 @@ from bot.services.intent import (
     generation_prompt,
 )
 from bot.services.markdown import render, split_chunks
+from bot.services.mcp import (
+    apply_mcp_hint,
+    mcp_available,
+    mcp_manager,
+    remove_mcp_hint,
+)
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
+from bot.services.search import build_assistant_tool_message, build_tool_response
 from bot.services.telegram_utils import (
     PARSE_MODES,
     format_timing,
@@ -52,6 +66,7 @@ from bot.services.telegram_utils import (
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
+from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import (
     apply_untrusted_hint,
     messages_have_untrusted_content,
@@ -579,31 +594,112 @@ async def _build_reply(
             return telegraph_reply
         return GuestReply(text=with_timing(response + _guest_hint(access), footer))
 
-    # Text request -> the model may answer with a generated image. With external
-    # content in the request the image tool is withheld: third-party text must
-    # not steer a paid generation call.
+    # Text request -> the model may read the "second brain" (read-only MCP
+    # tools) and answer with a generated image. With external content in the
+    # request both are withheld: third-party text must not steer a paid
+    # generation call or reach the private notes.
     messages = [*base_messages, {"role": "user", "content": text}]
+    tools: list[dict[str, Any]] = []
     if config.enable_image_generation and not external:
-        result: ChatResult = await ai_client.chat_with_tools(
-            messages=messages,
-            model=settings["model"],
-            temperature=settings["temperature"],
-            max_tokens=settings["max_tokens"],
-            public=True,
-        ) or ChatResult()
-    else:
-        result = await ai_client.chat_completion_result(
-            messages=messages,
-            model=settings["model"],
-            temperature=settings["temperature"],
-            max_tokens=settings["max_tokens"],
-            public=True,
-        )
-        result = result or ChatResult()
+        tools.append(IMAGE_TOOL)
+    mcp_ready = not external and mcp_available(caller_id)
+    if mcp_ready:
+        mcp_tools = await mcp_manager.openai_tools()
+        if mcp_tools:
+            tools.extend(mcp_tools)
+        else:
+            mcp_ready = False
 
-    image_call = next(
-        (call for call in result.tool_calls if call.name == "generate_image"), None
-    )
+    budget = ToolBudget()
+    mcp_rounds = 0
+    result = ChatResult()
+    while True:
+        # Note text returned by MCP is framed as untrusted; once it is in the
+        # context, neither the notes tools nor the paid image tool may stay
+        # offered (a note must not steer them). Only the final answer is
+        # delivered: a guest query cannot send progress notices.
+        untrusted = messages_have_untrusted_content(messages)
+        if untrusted:
+            apply_untrusted_hint(messages)
+            if mcp_ready:
+                mcp_ready = False
+                remove_mcp_hint(messages)
+        if mcp_ready:
+            apply_mcp_hint(messages)
+        offered_tools = tools
+        if untrusted:
+            offered_tools = _without_untrusted_side_effects(offered_tools)
+        if not mcp_ready:
+            offered_tools = _without_mcp_tools(offered_tools)
+
+        if offered_tools:
+            result = await ai_client.chat_with_tools(
+                messages=messages,
+                tools=offered_tools,
+                model=settings["model"],
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+                public=True,
+            ) or ChatResult()
+        else:
+            result = await ai_client.chat_completion_result(
+                messages=messages,
+                model=settings["model"],
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+                public=True,
+            ) or ChatResult()
+
+        # The model's turn is untrusted input: only tools it was actually
+        # offered may run.
+        offered_names = {tool["function"]["name"] for tool in offered_tools}
+        result.tool_calls = [
+            call for call in result.tool_calls if call.name in offered_names
+        ]
+
+        image_call = next(
+            (call for call in result.tool_calls if call.name == "generate_image"),
+            None,
+        )
+        mcp_calls = (
+            [
+                call for call in result.tool_calls
+                if mcp_manager.is_mcp_tool(call.name)
+            ]
+            if mcp_ready
+            else []
+        )
+        can_mcp = (
+            bool(mcp_calls)
+            and mcp_rounds < config.mcp_max_rounds
+            and budget.mcp_left
+        )
+        if mcp_calls and image_call is None and can_mcp:
+            mcp_rounds += 1
+            messages.append(build_assistant_tool_message(result.content, mcp_calls))
+            for call in mcp_calls:
+                if not budget.take_mcp():
+                    messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
+                    continue
+                output = await mcp_manager.call_tool(
+                    call.name, call.arguments, max_chars=budget.context_chars
+                )
+                messages.append(build_tool_response(call.id, budget.clip(output)))
+            continue
+        if mcp_calls and not result.content and image_call is None:
+            # Budget spent and the model only asked for notes: one final
+            # tools-less request so the guest still gets an answer.
+            logger.info("Guest MCP round limit reached; forcing a final answer")
+            result = await ai_client.chat_completion_result(
+                messages=messages,
+                model=settings["model"],
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+                public=True,
+            ) or ChatResult()
+            result.tool_calls = []
+            image_call = None
+        break
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
         image = await ai_client.generate_image_result(prompt, download=False)
