@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from aiogram.types import (
     ErrorEvent,
@@ -45,6 +46,8 @@ from bot.handlers import (
 )
 from bot.handlers.chat import _album_cleanup
 from bot.logging_setup import setup_file_logging
+from bot.samo_helper import attach_samo_helper, load_samo_config
+from bot.samo_helper.storage import Storage as SamoStorage
 from bot.services import telegraph, thinking
 from bot.services.ai_client import ai_client, ffmpeg_available
 from bot.services.digest import digest_scheduler_loop
@@ -53,6 +56,37 @@ from bot.services.mcp import mcp_manager
 from bot.services.reminders import cancel_pending_fires, reminder_scheduler_loop
 from bot.services.telegram_utils import safe_answer_guest
 from bot.services.user_service import user_service
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_samo_helper():
+    """Подключить рабочий модуль; при ошибке Kapum продолжает работать."""
+    if not config.owner_ids:
+        logger.warning("samo_helper: OWNER_IDS пуст — рабочий модуль отключён")
+        return None, None
+    db_path = os.getenv(
+        "SAMO_HELPER_DB_PATH", "/var/lib/kapum-chatbot/samo_helper.db",
+    ).strip()
+    storage = None
+    try:
+        settings = load_samo_config(config.owner_ids[0], db_path)
+        if settings is None:
+            logger.info("samo_helper отключён (SAMO_HELPER_ENABLED не задан)")
+            return None, None
+        storage = SamoStorage(settings.db_path)
+        extension = attach_samo_helper(dp, bot, settings, storage)
+        logger.info(
+            "samo_helper включён: владелец %s, группа %s, БД %s",
+            settings.owner_id, settings.notification_chat_id, settings.db_path,
+        )
+        return extension, storage
+    except Exception as error:  # noqa: BLE001 - чат Kapum важнее рабочего модуля
+        logger.error("samo_helper отключён из-за ошибки: %s", error)
+        if storage is not None:
+            storage.close()
+        return None, None
+
 
 # Order matters: command routers are registered before the catch-all chat router.
 # The digest router only observes channel/group posts and passes them on.
@@ -74,6 +108,8 @@ dp.include_router(stats.router)
 dp.include_router(menu.router)
 dp.include_router(admin.router)
 dp.include_router(tasks.router)
+# Рабочий модуль — до admin_panel/guest/catch-all chat. При ошибке не мешает чату.
+samo_extension, samo_storage = _setup_samo_helper()
 dp.include_router(admin_panel.router)
 if config.enable_guest_mode:
     dp.include_router(guest.router)
@@ -83,8 +119,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
-
 # Full prompts are an explicit DEBUG-level opt-in: raise the client logger only,
 # so aiohttp/Telegram libraries do not flood the journal at DEBUG.
 if config.log_prompts:
@@ -278,6 +312,13 @@ async def main() -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
+        # Остановить samo_helper до закрытия Bot-сессии и его SQLite.
+        try:
+            if samo_extension is not None:
+                await samo_extension.stop()
+        finally:
+            if samo_storage is not None:
+                samo_storage.close()
         # Stop in-flight reminder deliveries before the engine goes away:
         # they still touch the database (disable/reschedule on failure).
         await cancel_pending_fires()

@@ -56,6 +56,9 @@ _COMMANDS = [
     BotCommand(command="clear", description="Clear conversation history"),
     BotCommand(command="stats", description="Your usage statistics"),
     BotCommand(command="settings", description="Your current settings"),
+    BotCommand(command="samo_help", description="samo_helper: Redmine and YouGile"),
+    BotCommand(command="samo_add", description="samo_helper: add a YouGile card"),
+    BotCommand(command="samo_find", description="samo_helper: search work summaries"),
 ]
 
 

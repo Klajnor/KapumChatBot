@@ -38,7 +38,10 @@ _CHAT_SECTION = (
     "• /prompt &lt;text&gt; — set a new system prompt (private chat only)\n"
     "• /clear — clear the history of this chat\n"
     "• /stats — your usage statistics (private chat only)\n"
-    "• /settings — your current settings (private chat only)"
+    "• /settings — your current settings (private chat only)\n"
+    "• /samo_help — Redmine/YouGile helper commands (owner)\n"
+    "• /samo_add &lt;text&gt; — create or update a YouGile card (owner)\n"
+    "• /samo_find &lt;query&gt; — search work summaries and sources (owner)"
 )
 
 _TIPS = (
