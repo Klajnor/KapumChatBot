@@ -72,7 +72,7 @@ async def _show(
     return None
 
 
-async def probe(api: str) -> int:
+async def probe(api: str, *, show_token: bool = False) -> int:
     timeout = aiohttp.ClientTimeout(total=20)
     # trust_env honours HTTPS_PROXY if you exported one
     async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -110,7 +110,10 @@ async def probe(api: str) -> int:
         if token:
             print("createAccount works. Ready for .env (secret — keep private):")
             print(f"TELEGRAPH_SHORT_NAME={short}")
-            print(f"TELEGRAPH_ACCESS_TOKEN={token}")
+            if show_token:
+                print(f"TELEGRAPH_ACCESS_TOKEN={token}")
+            else:
+                print("TELEGRAPH_ACCESS_TOKEN=<hidden: pass --show-token to reveal>")
             return 0
         print("No usable token. Reading the raw responses above:")
         print(" * TLS/CONNECT/TIMEOUT  -> telegra.ph is blocked from this host:")
@@ -127,8 +130,14 @@ def main() -> int:
     parser.add_argument(
         "--api", default="https://api.telegra.ph", help="Telegraph API base URL"
     )
+    parser.add_argument(
+        "--show-token",
+        action="store_true",
+        help="Print the access token in the final ready-to-paste lines "
+             "(default: print only the short_name and a placeholder)",
+    )
     args = parser.parse_args()
-    return asyncio.run(probe(args.api.rstrip("/")))
+    return asyncio.run(probe(args.api.rstrip("/"), show_token=args.show_token))
 
 
 if __name__ == "__main__":

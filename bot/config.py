@@ -1423,6 +1423,11 @@ class Config:
         elif self.stream_edit_interval > 30.0:
             self.stream_edit_interval = 30.0
         self.stream_stall_timeout = max(self.stream_stall_timeout, 10)
+        # Network timeouts: 0 means "no timeout" in aiohttp; negative values are
+        # undefined. Clamp to a sane range so a typo cannot hang requests forever.
+        self.request_timeout = max(5, min(self.request_timeout, 900))
+        self.image_timeout = max(10, min(self.image_timeout, 900))
+        self.guest_timeout = max(15, min(self.guest_timeout, 900))
         # Base64 must fit the ASR API's 10 MB input limit.
         self.voice_max_bytes = min(max(1, self.voice_max_bytes), 7_500_000)
         # System prompt length: at least 16, at most 32768 characters.

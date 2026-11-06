@@ -14,9 +14,24 @@ from bot.config import config
 logger = logging.getLogger(__name__)
 STICKER_SIZE = 512
 STICKER_MAX_BYTES = 512 * 1024
+# Decompression-bomb guard: a small file can declare a huge image.
+_MAX_INPUT_PIXELS = 60_000_000
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stickers")
 _pending: asyncio.Future[StickerResult] | None = None
 _session: Any = None
+
+
+def _check_image_size(image: Any) -> bool:
+    """Reject images whose declared pixel count exceeds the safe budget."""
+    try:
+        if image.width * image.height > _MAX_INPUT_PIXELS:
+            logger.error(
+                "Sticker input too large: %dx%d pixels", image.width, image.height
+            )
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -82,6 +97,8 @@ def to_sticker_webp_result(image_bytes: bytes, size: int = STICKER_SIZE) -> Stic
         from PIL import Image, ImageOps
 
         with Image.open(io.BytesIO(image_bytes)) as source:
+            if not _check_image_size(source):
+                return StickerResult(error="invalid_image")
             image = ImageOps.exif_transpose(source).convert("RGBA")
         stage = "encoding_failed"
         bounds = image.getchannel("A").getbbox()
@@ -136,6 +153,8 @@ def _prepare_sticker_result(image_bytes: bytes) -> StickerResult:
 
         stage = "invalid_image"
         with Image.open(io.BytesIO(image_bytes)) as source:
+            if not _check_image_size(source):
+                return StickerResult(error="invalid_image")
             image = ImageOps.exif_transpose(source).convert("RGBA")
         # Сохраняем нативный вырезанный фон; одной общей полупрозрачности недостаточно.
         if image.getchannel("A").getextrema()[0] != 0:

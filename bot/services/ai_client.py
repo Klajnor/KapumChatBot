@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
-from xml.etree import ElementTree
 
 import aiohttp
+from defusedxml import ElementTree
 
 from bot.config import (
     DEFAULT_RICH_STYLE_HINT,

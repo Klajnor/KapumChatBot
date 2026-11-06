@@ -3,6 +3,8 @@
 aiogram>=3.29
 sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
+# Hardened XML parsing for untrusted model output (DSML recovery).
+defusedxml>=0.7
 # Reserved for a possible future PostgreSQL backend; the supported database is
 # SQLite (aiosqlite) only. Nothing in the bot uses asyncpg today.
 asyncpg>=0.30
