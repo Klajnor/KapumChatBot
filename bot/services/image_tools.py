@@ -14,6 +14,8 @@ import io
 import logging
 from collections.abc import Sequence
 
+from bot.services.pillow_limits import MAX_IMAGE_PIXELS, configure_pillow_limits
+
 logger = logging.getLogger(__name__)
 
 # Longest side of the enhanced result; keeps the upload Telegram-friendly.
@@ -22,7 +24,7 @@ MAX_ENHANCED_SIDE = 4096
 # carry enough detail, and 2x more of them is slow, heavy and invisible.
 UPSCALE_TRIGGER_SIDE = 1600
 # Decompression-bomb guard for decoded pixel counts.
-MAX_INPUT_PIXELS = 60_000_000
+MAX_INPUT_PIXELS = MAX_IMAGE_PIXELS
 
 # Operations the classifier may request (single source of truth for the
 # intent prompt in bot/handlers/chat.py — keep the two lists in sync).
@@ -118,6 +120,8 @@ def _apply_sync(
     """Run the enhancement pipeline on raw bytes (blocking, worker thread)."""
     try:
         from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+        configure_pillow_limits()
     except ImportError:  # pragma: no cover - Pillow is a declared dependency
         logger.error("Pillow is not installed; image enhancement is unavailable")
         return None, []

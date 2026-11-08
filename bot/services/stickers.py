@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from bot.config import config
+from bot.services.pillow_limits import MAX_IMAGE_PIXELS, configure_pillow_limits
 
 logger = logging.getLogger(__name__)
 STICKER_SIZE = 512
 STICKER_MAX_BYTES = 512 * 1024
 # Decompression-bomb guard: a small file can declare a huge image.
-_MAX_INPUT_PIXELS = 60_000_000
+_MAX_INPUT_PIXELS = MAX_IMAGE_PIXELS
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stickers")
 _pending: asyncio.Future[StickerResult] | None = None
 _session: Any = None
@@ -96,6 +97,7 @@ def to_sticker_webp_result(image_bytes: bytes, size: int = STICKER_SIZE) -> Stic
     try:
         from PIL import Image, ImageOps
 
+        configure_pillow_limits()
         with Image.open(io.BytesIO(image_bytes)) as source:
             if not _check_image_size(source):
                 return StickerResult(error="invalid_image")
@@ -151,6 +153,7 @@ def _prepare_sticker_result(image_bytes: bytes) -> StickerResult:
     try:
         from PIL import Image, ImageOps
 
+        configure_pillow_limits()
         stage = "invalid_image"
         with Image.open(io.BytesIO(image_bytes)) as source:
             if not _check_image_size(source):
