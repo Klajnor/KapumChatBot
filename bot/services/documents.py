@@ -441,8 +441,16 @@ def _ip_is_public(ip: Any) -> bool:
     ``is_global`` (not a denylist of private ranges) also refuses CGNAT
     100.64.0.0/10 — home of the Alibaba Cloud metadata service
     100.100.100.200 and of Tailscale — as well as 192.0.0.0/24, 198.18.0.0/15
-    and documentation ranges.
+    and documentation ranges. IPv6 forms that embed an attacker-chosen IPv4
+    (mapped, 6to4, Teredo) are refused outright: their routing semantics
+    differ from ``ipaddress``'s classification on some Python versions.
     """
+    if getattr(ip, "version", 4) == 6 and (
+        getattr(ip, "ipv4_mapped", None) is not None
+        or getattr(ip, "sixtofour", None) is not None
+        or getattr(ip, "teredo", None) is not None
+    ):
+        return False
     return ip.is_global and not (
         ip.is_private
         or ip.is_loopback

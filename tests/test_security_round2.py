@@ -50,6 +50,17 @@ class SsrfTests(unittest.TestCase):
                 documents._ip_is_public(ipaddress.ip_address(address)), address
             )
 
+    def test_embedded_ipv4_forms_are_not_public(self):
+        for address in (
+            "::ffff:169.254.169.254",  # IPv4-mapped metadata
+            "::ffff:8.8.8.8",
+            "2002:0808:0808::",  # 6to4 embedding 8.8.8.8
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",  # Teredo
+        ):
+            self.assertFalse(
+                documents._ip_is_public(ipaddress.ip_address(address)), address
+            )
+
     def test_metadata_url_is_refused(self):
         self.assertFalse(
             documents.is_safe_public_url(
