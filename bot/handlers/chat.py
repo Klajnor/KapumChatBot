@@ -309,17 +309,30 @@ def _is_addressed(message: Message) -> bool:
 # A quoted message is included in the AI request verbatim; keep it bounded so
 # one huge forward cannot crowd out the conversation history.
 _MAX_QUOTED_CHARS = 4000
+_MAX_DISPLAY_NAME_CHARS = 64
+# Имена Telegram вводит пользователь и они вставляются в текст запроса вне
+# untrusted-рамки: переносы строк и угловые скобки могли бы ломать её разметку.
+_UNSAFE_DISPLAY_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029<>]")
+
+
+def _safe_display_name(value: str | None, fallback: str) -> str:
+    """Sanitise a Telegram display name before it enters the model prompt."""
+    name = _UNSAFE_DISPLAY_NAME_CHARS.sub("", value or "")
+    name = re.sub(r"\s+", " ", name).strip()
+    if not name:
+        return fallback
+    return name[:_MAX_DISPLAY_NAME_CHARS].rstrip() or fallback
 
 
 def _sender_name(message: Message) -> str:
     """Human-readable sender of a message (for quoted/forwarded context)."""
     sender_chat = getattr(message, "sender_chat", None)
     if sender_chat is not None:
-        return sender_chat.title or "channel"
+        return _safe_display_name(sender_chat.title, "channel")
     user = message.from_user
     if user is None:
         return "unknown"
-    return user.first_name or user.username or "user"
+    return _safe_display_name(user.first_name or user.username, "user")
 
 
 def _describe_quoted(reply: Message | None) -> str | None:
@@ -367,10 +380,12 @@ def _forward_source_name(message: Message) -> str | None:
         return None
     sender = getattr(origin, "sender_user", None)
     if sender is not None:
-        return sender.first_name or getattr(sender, "username", None) or "user"
+        return _safe_display_name(
+            sender.first_name or getattr(sender, "username", None), "user"
+        )
     chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
     if chat is not None:
-        return getattr(chat, "title", None) or "chat"
+        return _safe_display_name(getattr(chat, "title", None), "chat")
     return None
 
 
