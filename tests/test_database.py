@@ -135,6 +135,46 @@ class TestAtomicQuotas(DBTest):
 
         self._loop.run_until_complete(_run())
 
+    def test_status_intent_hourly_and_daily_limits_are_atomic(self):
+        async def _run() -> None:
+            start = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+            for offset in range(5):
+                async with self._factory() as session:
+                    repo = UserRepository(session)
+                    self.assertTrue(
+                        await repo.try_consume_status_intent(
+                            800, start + datetime.timedelta(minutes=offset), 5, 24
+                        )
+                    )
+                    await session.commit()
+
+            async with self._factory() as session:
+                repo = UserRepository(session)
+                self.assertFalse(
+                    await repo.try_consume_status_intent(
+                        800, start + datetime.timedelta(minutes=5), 5, 24
+                    )
+                )
+                await session.commit()
+
+            # Новый час открывает новый слот, но суточный бюджет продолжает
+            # считаться; пять следующих попыток разрешены.
+            for offset in range(5):
+                async with self._factory() as session:
+                    repo = UserRepository(session)
+                    self.assertTrue(
+                        await repo.try_consume_status_intent(
+                            800,
+                            start
+                            + datetime.timedelta(hours=1, minutes=offset),
+                            5,
+                            24,
+                        )
+                    )
+                    await session.commit()
+
+        self._loop.run_until_complete(_run())
+
     def test_guest_messages_limited(self):
         async def _run() -> None:
             async with self._factory() as session:

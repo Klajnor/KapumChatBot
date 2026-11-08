@@ -1021,6 +1021,14 @@ class Config:
     status_search_interval: int = field(
         default_factory=lambda: _env_int("STATUS_SEARCH_INTERVAL", 3600)
     )
+    # Сколько AI-подтверждений «статуса» обычный пользователь может сделать за
+    # час и за UTC-сутки. Админы/владельцы не ограничены, guest закрыт.
+    status_intent_hourly_limit: int = field(
+        default_factory=lambda: _env_int("STATUS_INTENT_HOURLY_LIMIT", 5)
+    )
+    status_intent_daily_limit: int = field(
+        default_factory=lambda: _env_int("STATUS_INTENT_DAILY_LIMIT", 24)
+    )
     # Total characters of search/MCP output added to the model context for one
     # question. Trimming keeps the untrusted frame intact.
     tool_max_context_chars: int = field(
@@ -1493,6 +1501,12 @@ class Config:
         self.search_max_calls = max(1, min(self.search_max_calls, 20))
         self.status_search_interval = max(
             60, min(self.status_search_interval, 86_400)
+        )
+        self.status_intent_hourly_limit = max(
+            1, min(self.status_intent_hourly_limit, 60)
+        )
+        self.status_intent_daily_limit = max(
+            1, min(self.status_intent_daily_limit, 240)
         )
         self.tool_max_context_chars = max(
             1_000, min(self.tool_max_context_chars, 200_000)

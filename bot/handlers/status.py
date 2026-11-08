@@ -50,6 +50,20 @@ async def maybe_status_request(message: Message, text: str) -> bool:
         )
         if not access.allowed:
             return False
+        # Guest mode has no free AI intent calls: an exhausted guest must not
+        # keep classifying "статус" for free.
+        if access.role == "guest":
+            return False
+        # Ordinary users have a persistent anti-spam budget for the paid intent
+        # check; admins and owners are unlimited.
+        if not config.is_admin(user.id) and not await service.consume_status_intent_budget(
+            user.id
+        ):
+            await safe_answer(
+                message,
+                "⚠️ Status checks are limited right now. Try again later.",
+            )
+            return True
 
         settings = await service.get_user_settings(user.id)
         try:

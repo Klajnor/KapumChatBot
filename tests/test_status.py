@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import datetime
 import unittest
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot.config import config
+from bot.services.access import AccessResult
 from bot.services.mcp import mcp_manager
+from bot.services.request_intent import Intent
 from bot.services.search import SearchResult, SearchResults
 from bot.services.status import render_status
 
@@ -160,6 +164,139 @@ class StatusReportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("❌", report)
         self.assertIn("http_401", report)
+
+
+class StatusIntentLimitTests(unittest.IsolatedAsyncioTestCase):
+    """AI-подтверждение «статуса»: guest закрыт, обычные пользователи лимитированы."""
+
+    def _message(self, user_id: int = 7):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=user_id),
+            chat=SimpleNamespace(type="private"),
+            forward_date=None,
+        )
+
+    async def test_guest_cannot_use_status_intent(self) -> None:
+        from bot.handlers.status import maybe_status_request
+
+        service = SimpleNamespace(
+            consume_status_intent_budget=AsyncMock(return_value=True),
+            get_user_settings=AsyncMock(return_value={"model": "m"}),
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch("bot.handlers.status.user_service", fake_user_service),
+            patch(
+                "bot.handlers.status.check_access",
+                AsyncMock(return_value=AccessResult(allowed=True, role="guest")),
+            ),
+            patch(
+                "bot.handlers.status.classify_request",
+                AsyncMock(return_value=Intent.STATUS),
+            ),
+        ):
+            handled = await maybe_status_request(self._message(), "статус")
+
+        self.assertFalse(handled)
+        service.consume_status_intent_budget.assert_not_awaited()
+
+    async def test_admin_bypasses_status_intent_budget(self) -> None:
+        from bot.handlers.status import maybe_status_request
+
+        service = SimpleNamespace(
+            consume_status_intent_budget=AsyncMock(return_value=False),
+            get_user_settings=AsyncMock(return_value={"model": "m"}),
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch("bot.handlers.status.user_service", fake_user_service),
+            patch(
+                "bot.handlers.status.check_access",
+                AsyncMock(return_value=AccessResult(allowed=True, role="admin")),
+            ),
+            patch.object(config, "is_admin", return_value=True),
+            patch(
+                "bot.handlers.status.classify_request",
+                AsyncMock(return_value=Intent.CHAT),
+            ),
+        ):
+            handled = await maybe_status_request(self._message(42), "статус")
+
+        self.assertFalse(handled)
+        service.consume_status_intent_budget.assert_not_awaited()
+
+    async def test_regular_user_hits_status_intent_budget(self) -> None:
+        from bot.handlers.status import maybe_status_request
+
+        service = SimpleNamespace(
+            consume_status_intent_budget=AsyncMock(return_value=False),
+            get_user_settings=AsyncMock(return_value={"model": "m"}),
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch("bot.handlers.status.user_service", fake_user_service),
+            patch(
+                "bot.handlers.status.check_access",
+                AsyncMock(return_value=AccessResult(allowed=True, role="allowed")),
+            ),
+            patch.object(config, "is_admin", return_value=False),
+            patch(
+                "bot.handlers.status.classify_request",
+                AsyncMock(return_value=Intent.STATUS),
+            ) as classify,
+            patch(
+                "bot.handlers.status.safe_answer", AsyncMock()
+            ) as answer,
+        ):
+            handled = await maybe_status_request(self._message(), "статус")
+
+        self.assertTrue(handled)
+        service.consume_status_intent_budget.assert_awaited_once()
+        classify.assert_not_awaited()
+        answer.assert_awaited_once()
+        self.assertIn("limited", answer.call_args.args[1])
+
+    async def test_regular_user_consumes_status_intent_budget(self) -> None:
+        from bot.handlers.status import maybe_status_request
+
+        service = SimpleNamespace(
+            consume_status_intent_budget=AsyncMock(return_value=True),
+            get_user_settings=AsyncMock(return_value={"model": "m"}),
+        )
+
+        @asynccontextmanager
+        async def fake_user_service():
+            yield service
+
+        with (
+            patch("bot.handlers.status.user_service", fake_user_service),
+            patch(
+                "bot.handlers.status.check_access",
+                AsyncMock(return_value=AccessResult(allowed=True, role="allowed")),
+            ),
+            patch.object(config, "is_admin", return_value=False),
+            patch(
+                "bot.handlers.status.classify_request",
+                AsyncMock(return_value=Intent.CHAT),
+            ) as classify,
+        ):
+            handled = await maybe_status_request(self._message(), "статус")
+
+        self.assertFalse(handled)
+        service.consume_status_intent_budget.assert_awaited_once()
+        classify.assert_awaited_once()
 
 
 if __name__ == "__main__":

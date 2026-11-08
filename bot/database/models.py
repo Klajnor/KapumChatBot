@@ -152,6 +152,32 @@ class ReminderIntentUsage(Base):
     call_count: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class StatusIntentHourUsage(Base):
+    """Часовые попытки AI-подтверждения запроса статуса (анти-спам)."""
+
+    __tablename__ = "status_intent_hour_usage"
+
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    hour_start: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    call_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class StatusIntentDayUsage(Base):
+    """Суточные попытки AI-подтверждения запроса статуса (анти-спам)."""
+
+    __tablename__ = "status_intent_day_usage"
+
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    call_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class StatusSearchCheck(Base):
     """Последняя живая проверка поиска в отчёте о статусе.
 

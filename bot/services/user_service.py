@@ -420,6 +420,19 @@ class UserService:
         await self.session.commit()
         return reserved
 
+    async def consume_status_intent_budget(
+        self, telegram_id: int, *, now: datetime.datetime | None = None
+    ) -> bool:
+        """Списать AI-подтверждение запроса статуса (часовой и суточный лимит)."""
+        reserved = await self.user_repo.try_consume_status_intent(
+            telegram_id,
+            now or datetime.datetime.now(datetime.UTC),
+            config.status_intent_hourly_limit,
+            config.status_intent_daily_limit,
+        )
+        await self.session.commit()
+        return reserved
+
     async def release_daily_usage(self, telegram_id: int) -> None:
         """Return a query after a failed request."""
         await self.user_repo.release_daily_usage(telegram_id, datetime.date.today())

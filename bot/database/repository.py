@@ -19,6 +19,8 @@ from bot.database.models import (
     PhotoIntentUsage,
     Reminder,
     ReminderIntentUsage,
+    StatusIntentDayUsage,
+    StatusIntentHourUsage,
     StatusSearchCheck,
     User,
     UserSettings,
@@ -520,6 +522,56 @@ class UserRepository:
                     .values(date=date, scope_id=scope_id, call_count=1)
                     .on_conflict_do_update(
                         index_elements=["date", "scope_id"],
+                        set_={"call_count": model.call_count + 1},
+                        where=model.call_count < limit,
+                    )
+                    .returning(model.call_count)
+                )
+                result = await self.session.execute(statement)
+                if result.scalar_one_or_none() is None:
+                    await reservation.rollback()
+                    return False
+        return True
+
+    async def try_consume_status_intent(
+        self,
+        telegram_id: int,
+        now: datetime.datetime,
+        hourly_limit: int,
+        daily_limit: int,
+    ) -> bool:
+        """Атомарно резервировать часовой и суточный бюджет запроса статуса.
+
+        Оба лимита должны пройти вместе: при отказе второго счётчик первого
+        откатывается, поэтому частичная попытка не тратит бюджет.
+        """
+        if telegram_id <= 0 or hourly_limit <= 0 or daily_limit <= 0:
+            return False
+        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        day = now.date()
+        insert_fn = (
+            sqlite_insert if self.session.get_bind().dialect.name == "sqlite" else pg_insert
+        )
+        async with self.session.begin_nested() as reservation:
+            for model, values, keys, limit in (
+                (
+                    StatusIntentHourUsage,
+                    {"telegram_id": telegram_id, "hour_start": hour_start, "call_count": 1},
+                    ["telegram_id", "hour_start"],
+                    hourly_limit,
+                ),
+                (
+                    StatusIntentDayUsage,
+                    {"telegram_id": telegram_id, "date": day, "call_count": 1},
+                    ["telegram_id", "date"],
+                    daily_limit,
+                ),
+            ):
+                statement = (
+                    insert_fn(model)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=keys,
                         set_={"call_count": model.call_count + 1},
                         where=model.call_count < limit,
                     )
