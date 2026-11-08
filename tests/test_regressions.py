@@ -117,6 +117,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 "model": "test", "messages": [{"role": "user", "content": "test prompt"}]
             })
         self.assertEqual(status, 200)
+        self.assertFalse(session.post.call_args.kwargs["allow_redirects"])
         logged = "\n".join(logs.output)
         self.assertIn("payload=", logged)
         self.assertNotIn("test prompt", logged)

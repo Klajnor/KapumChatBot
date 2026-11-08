@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.services import telegraph
 
@@ -39,6 +40,25 @@ class TelegraphAccountFileTests(unittest.TestCase):
             self.assertFalse(link.is_symlink())
             self.assertEqual(target.read_text(encoding="utf-8"), "original")
             self.assertIn("access_token", link.read_text(encoding="utf-8"))
+
+
+class TelegraphHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_does_not_follow_redirects(self):
+        response = MagicMock()
+        response.status = 200
+        response.text = AsyncMock(return_value='{"ok": true, "result": {}}')
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = context
+        with patch.object(
+            telegraph, "_get_session", AsyncMock(return_value=session)
+        ):
+            result = await telegraph._post("createAccount", {"short_name": "x"})
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(session.post.call_args.kwargs["allow_redirects"])
 
 
 if __name__ == "__main__":

@@ -650,7 +650,9 @@ class AIClient:
         logger.info("AI API request: method=GET path=/models")
         try:
             session = await self._get_session()
-            async with session.get(url, headers=self._auth_headers(api_key)) as resp:
+            async with session.get(
+                url, headers=self._auth_headers(api_key), allow_redirects=False
+            ) as resp:
                 body = await _read_response_text(resp, _MAX_PROVIDER_BODY)
                 if resp.status != 200:
                     logger.warning(
@@ -1268,7 +1270,11 @@ class AIClient:
         try:
             session = await self._get_session()
             async with session.post(
-                target, json=payload, timeout=timeout, headers=headers
+                target,
+                json=payload,
+                timeout=timeout,
+                headers=headers,
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     body = await _read_response_text(
@@ -1935,7 +1941,11 @@ class AIClient:
                 logger.info("AI API send id=%s attempt=%s/%s", request_id, attempt, retries)
                 session = await self._get_session()
                 async with session.post(
-                    target, json=payload, timeout=request_timeout, headers=headers
+                    target,
+                    json=payload,
+                    timeout=request_timeout,
+                    headers=headers,
+                    allow_redirects=False,
                 ) as resp:
                     body = await _read_response_text(
                         resp,

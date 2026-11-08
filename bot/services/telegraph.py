@@ -371,7 +371,9 @@ async def _post(endpoint: str, data: dict[str, str]) -> dict[str, Any]:
     url = f"{config.telegraph_api_url}/{endpoint}"
     try:
         session = await _get_session()
-        async with session.post(url, data=data) as resp:
+        async with session.post(
+            url, data=data, allow_redirects=False
+        ) as resp:
             body = await resp.text()
             if resp.status != 200:
                 return {"ok": False, "error": f"HTTP {resp.status}: {body[:200]}"}
