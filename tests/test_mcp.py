@@ -397,6 +397,24 @@ class MCPEnvironmentTests(unittest.TestCase):
             self.assertLogs("bot.services.mcp", level="WARNING"),
         ):
             self.assertEqual(_expand_env("${EXA_API_KEY}"), "")
+        # Helper-module and generic secret names are refused by suffix too.
+        with patch.dict(
+            os.environ,
+            {
+                "SAMO_HELPER_REDMINE_API_KEY": "redmine-secret",
+                "SAMO_HELPER_LLM_API_KEY": "llm-secret",
+                "SAMO_HELPER_KNOWLEDGE_API_KEY": "knowledge-secret",
+                "CUSTOM_ACCESS_TOKEN": "token-secret",
+            },
+        ):
+            for name in (
+                "SAMO_HELPER_REDMINE_API_KEY",
+                "SAMO_HELPER_LLM_API_KEY",
+                "SAMO_HELPER_KNOWLEDGE_API_KEY",
+                "CUSTOM_ACCESS_TOKEN",
+            ):
+                with self.assertLogs("bot.services.mcp", level="WARNING"):
+                    self.assertEqual(_expand_env(f"${{{name}}}"), "")
         # Non-secret variables keep expanding as before.
         with patch.dict(os.environ, {"MCP_TEST_PATH": "/vault"}):
             self.assertEqual(_expand_env("${MCP_TEST_PATH}/notes"), "/vault/notes")

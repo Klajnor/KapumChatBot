@@ -131,13 +131,25 @@ class MCPTool:
 
 
 # Bot credentials that must never reach an MCP server, explicitly or by
-# inheritance (see ``_expand_env`` and ``_child_environment``).
+# inheritance (see ``_expand_env`` and ``_child_environment``). The suffix rule
+# also covers helper modules (``SAMO_HELPER_*_API_KEY``) and future token names.
 _SECRET_ENV_NAMES = frozenset({
     "BOT_TOKEN", "AI_API_KEY", "QWEN_API_KEY", "DASHSCOPE_API_KEY",
     "SEARCH_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY",
     "TELEGRAPH_ACCESS_TOKEN",
     "DATABASE_URL",
 })
+_SECRET_ENV_SUFFIX_RE = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_KEY|DATABASE_URL)$")
+
+
+def _is_secret_env_name(name: str) -> bool:
+    """True when this environment variable must never be expanded for MCP."""
+    upper = name.upper()
+    return (
+        upper in _SECRET_ENV_NAMES
+        or bool(_SECRET_ENV_SUFFIX_RE.search(upper))
+        or bool(re.fullmatch(r"(?:MODEL_\d+|FALLBACK_MODEL)_API_KEY", upper))
+    )
 
 
 def _expand_env(value: str) -> str:
@@ -145,15 +157,14 @@ def _expand_env(value: str) -> str:
 
     References to the bot's own credentials are refused (with a warning): the
     ``.mcp.json`` can live in a synced directory, so a tampered entry must not
-    be able to pull ``BOT_TOKEN`` or an API key into a server's environment or
-    command line. Server-specific secrets belong in the server's ``env`` block.
+    be able to pull ``BOT_TOKEN``, ``SAMO_HELPER_*`` or any other API key into
+    a server's environment or command line. Server-specific secrets belong in
+    the server's ``env`` block.
     """
 
     def replace(match: re.Match[str]) -> str:
         name, default = match.group(1), match.group(2)
-        if name.upper() in _SECRET_ENV_NAMES or re.fullmatch(
-            r"(?:MODEL_\d+|FALLBACK_MODEL)_API_KEY", name.upper()
-        ):
+        if _is_secret_env_name(name):
             logger.warning(
                 "MCP config references the bot secret %r; expansion refused", name
             )
