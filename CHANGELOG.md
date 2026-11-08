@@ -3,6 +3,9 @@
 ## История по коммитам
 
 ### 2026-11-08
+- **Автообновление: уведомления Telegram без прокси из окружения.** `notify()` в `scripts/update_support.py` теперь использует тот же opener без прокси, что и health-check, поэтому `BOT_TOKEN`, встроенный в URL `sendMessage`, не уходит через `https_proxy`/`all_proxy` из окружения root-сервиса.
+
+### 2026-11-08
 - **MCP: блокировка секретов по суффиксу.** Подстановка `${VAR}` в `.mcp.json` теперь отказывается для любого имени, оканчивающегося на `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` или `DATABASE_URL`, поэтому ключи `SAMO_HELPER_REDMINE_API_KEY`, `SAMO_HELPER_LLM_API_KEY`, `SAMO_HELPER_KNOWLEDGE_API_KEY` и будущие helper-токены не могут быть утянуты в окружение или команду MCP-сервера.
 
 ### 2026-11-08

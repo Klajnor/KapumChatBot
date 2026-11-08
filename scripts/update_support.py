@@ -128,9 +128,14 @@ def health_url(config: dict[str, str]) -> str:
     return f"http://{host}:{port}/health"
 
 
+def _no_proxy_opener() -> urllib.request.OpenerDirector:
+    """Opener that ignores proxy settings from the environment."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def http_check(url: str) -> None:
     """Проверить JSON health-ответа без прокси из окружения."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = _no_proxy_opener()
     with opener.open(url, timeout=3) as response:
         if json.loads(response.read(8192)).get("status") != "ok":
             raise UpdateCheckError("Health JSON does not contain status=ok.")
@@ -144,11 +149,13 @@ def notify(config: dict[str, str], text: str) -> bool:
     if not token or not ids:
         return False
     success = True
+    # BOT_TOKEN встроен в URL запроса: прокси из окружения не должен видеть его.
+    opener = _no_proxy_opener()
     for owner in sorted(ids):
         data = urllib.parse.urlencode({"chat_id": owner, "text": text[:4000]}).encode()
         request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with opener.open(request, timeout=10) as response:
                 success = bool(json.loads(response.read(65536)).get("ok")) and success
         except Exception:  # noqa: BLE001 — токен/URL и тело ошибки нельзя печатать
             success = False

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -118,12 +119,21 @@ class UpdateSupportTests(unittest.TestCase):
         config = {"BOT_TOKEN": "SECRET", "OWNER_IDS": "-100,invalid,123,123,456"}
         response = unittest.mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"ok":true}'
-        with patch("urllib.request.urlopen", return_value=response) as send:
+        opener = unittest.mock.MagicMock()
+        opener.open.return_value = response
+        with patch("urllib.request.build_opener", return_value=opener) as build:
             self.assertTrue(notify(config, "updated"))
-            self.assertEqual(send.call_count, 2)
-            self.assertIn(b"chat_id=123", send.call_args_list[0].args[0].data)
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertIn(b"chat_id=123", opener.open.call_args_list[0].args[0].data)
+            proxy_handler = build.call_args.args[0]
+            self.assertIsInstance(proxy_handler, urllib.request.ProxyHandler)
+            self.assertEqual(proxy_handler.proxies, {})
         output = io.StringIO()
-        with patch("urllib.request.urlopen", side_effect=OSError("SECRET")), patch("sys.stderr", output):
+        with (
+            patch("urllib.request.build_opener", return_value=opener),
+            patch.object(opener, "open", side_effect=OSError("SECRET")),
+            patch("sys.stderr", output),
+        ):
             self.assertFalse(notify(config, "failure"))
         self.assertNotIn("SECRET", output.getvalue())
 
