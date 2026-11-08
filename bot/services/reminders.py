@@ -546,6 +546,13 @@ async def _run_ai_prompt(
     while True:
         if messages_have_untrusted_content(messages):
             apply_untrusted_hint(messages)
+        # External untrusted content (document/page/forward/history) must not
+        # steer the paid search call; search results themselves may be refined.
+        if tools and messages_have_untrusted_content(
+            messages, ignore_sources={"search"}
+        ):
+            tools = None
+            remove_search_hint(messages)
         if tools:
             result = await ai_client.chat_with_tools(
                 messages=messages,

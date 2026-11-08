@@ -17,6 +17,8 @@ import re
 from typing import Any
 
 TAG = "<untrusted_content"
+_OPEN_TAG_RE = re.compile(r"<untrusted_content\b([^>]*)>", re.IGNORECASE)
+_SOURCE_RE = re.compile(r'source="([^"]*)"', re.IGNORECASE)
 
 _FRAME_TAG_RE = re.compile(r"<(\s*/?\s*untrusted_content)", re.IGNORECASE)
 
@@ -46,12 +48,31 @@ def wrap_untrusted(kind: str, body: str) -> str:
     return f'<untrusted_content source="{kind}">\n{body}\n</untrusted_content>'
 
 
-def has_untrusted_content(text: str | None) -> bool:
-    """True when the text carries an untrusted-content block."""
-    return bool(text) and TAG in text
+def has_untrusted_content(
+    text: str | None, *, ignore_sources: set[str] | None = None
+) -> bool:
+    """True when the text carries an untrusted-content block.
+
+    ``ignore_sources`` treats blocks wrapped with one of those ``source``
+    labels as already known/expected output (for example ``search`` results
+    after a search round) and does not count them as taint.
+    """
+    if not text or TAG not in text:
+        return False
+    if not ignore_sources:
+        return True
+    ignored = {source.lower() for source in ignore_sources}
+    for tag in _OPEN_TAG_RE.finditer(text):
+        source = _SOURCE_RE.search(tag.group(1))
+        if source and source.group(1).lower() in ignored:
+            continue
+        return True
+    return False
 
 
-def messages_have_untrusted_content(messages: list[dict[str, Any]]) -> bool:
+def messages_have_untrusted_content(
+    messages: list[dict[str, Any]], *, ignore_sources: set[str] | None = None
+) -> bool:
     """True when a user/tool message carries an untrusted-content block.
 
     The system prompt is skipped: it holds our own instruction text (which
@@ -61,13 +82,15 @@ def messages_have_untrusted_content(messages: list[dict[str, Any]]) -> bool:
         if message.get("role") == "system":
             continue
         content = message.get("content")
-        if isinstance(content, str) and TAG in content:
+        if isinstance(content, str) and has_untrusted_content(
+            content, ignore_sources=ignore_sources
+        ):
             return True
         for part in content if isinstance(content, list) else []:
             if (
                 isinstance(part, dict)
                 and isinstance(part.get("text"), str)
-                and TAG in part["text"]
+                and has_untrusted_content(part["text"], ignore_sources=ignore_sources)
             ):
                 return True
     return False

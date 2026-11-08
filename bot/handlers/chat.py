@@ -1567,6 +1567,19 @@ async def _answer_with_ai(
                     logger.info(
                         "MCP tools withheld: the request contains untrusted content"
                     )
+                # A document/page/forward must not be able to steer web search
+                # either: the query would be a paid call and an exfiltration
+                # channel. Search results themselves are allowed so a search
+                # round can still refine its own query.
+                if search_ready and messages_have_untrusted_content(
+                    messages, ignore_sources={"search"}
+                ):
+                    search_ready = False
+                    remove_search_hint(messages)
+                    logger.info(
+                        "Search tool withheld: the request contains external "
+                        "untrusted content"
+                    )
             if mcp_ready:
                 apply_mcp_hint(messages)
             available_tools = tools
@@ -1574,6 +1587,8 @@ async def _answer_with_ai(
                 available_tools = _without_untrusted_side_effects(available_tools)
             if not mcp_ready:
                 available_tools = _without_mcp_tools(available_tools)
+            if not search_ready:
+                available_tools = _without_search_tool(available_tools)
             tools_arg = available_tools or None
             if config.stream_responses:
                 printer = _StreamPrinter(message, notifier)
