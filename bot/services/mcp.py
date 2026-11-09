@@ -43,6 +43,7 @@ from typing import Any
 
 from bot.config import config
 from bot.services.note_metadata import generate_note_metadata
+from bot.services.request_scope import NOTES_TARGET_RE, is_fresh_request
 from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 from bot.services.user_service import user_service
 
@@ -417,19 +418,6 @@ READ_TOOLS = frozenset({"search_notes", "get_chunk", "get_note", "list_notes"})
 STATUS_TOOL = "brain_status"
 
 
-_MCP_ACTION_RE = re.compile(
-    r"\b(?:найди(?:те)?|найти|поищи(?:те)?|ищи(?:те)?|поиск\w*|"
-    r"посмотри(?:те)?|проверь(?:те)?|покажи(?:те)?|прочитай(?:те)?|открой(?:те)?|"
-    r"search|find|look\s+up|check|show|read|list)\b", re.IGNORECASE,
-)
-_MCP_TARGET_RE = re.compile(
-    r"\b(?:во?\s+(?:(?:мо[её]м|тво[её]м|сво[её]м)\s+)?втором\s+мозге|"
-    r"(?:в|из)\s+(?:(?:моих|твоих|своих|сохран[её]нных|личных)\s+)?замет(?:ках|ок)|"
-    r"по\s+(?:(?:моим|твоим|своим|сохран[её]нным|личным)\s+)?заметкам|"
-    r"в\s+obsidian|(?:in|from|through)\s+(?:(?:my|your|the|our|saved)\s+)?"
-    r"(?:second\s+brain|notes|obsidian|vault)|"
-    r"(?:my|your|our|saved)\s+(?:second\s+brain|notes|vault))\b", re.IGNORECASE,
-)
 _ISOLATED_MCP_HINT = (
     "Для этого нового запроса ко второму мозгу вся история диалога исключена "
     "из контекста ради безопасности ранее загруженных материалов. Выполни "
@@ -446,6 +434,8 @@ def isolate_mcp_history(messages: list[dict[str, Any]]) -> bool:
     БД. Вызывающий код обязан оставить только read-only MCP, без веб-поиска,
     генерации и отправки файлов. Внешний контент в текущем запросе и обычные
     уточнения не обходят защиту; результаты MCP снова включают общий гейт.
+    Достаточно явного указания на заметки и самостоятельности запроса: отдельный
+    глагол действия больше не требуется («что там по проекту X в заметках?»).
     """
     if not messages or messages[-1].get("role") != "user":
         return False
@@ -454,8 +444,8 @@ def isolate_mcp_history(messages: list[dict[str, Any]]) -> bool:
     if (
         not isinstance(text, str)
         or messages_have_untrusted_content([current])
-        or not _MCP_ACTION_RE.search(text)
-        or not _MCP_TARGET_RE.search(text)
+        or not is_fresh_request(text)
+        or not NOTES_TARGET_RE.search(text)
         or not messages_have_untrusted_content(messages[:-1])
     ):
         return False

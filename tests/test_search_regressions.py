@@ -297,11 +297,15 @@ class CurrentDateTests(unittest.TestCase):
 
 
 class SearchIsolationSafetyTests(unittest.TestCase):
+    def _messages(self, text):
+        history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE")}]
+        return [{"role": "system", "content": "sys"}, *history,
+                {"role": "user", "content": text}]
+
     def test_current_external_content_and_ordinary_followups_keep_the_gate(self):
         for text in ("объясни второй пункт", QUESTION + "\n" + wrap_untrusted("quoted", "data")):
             with self.subTest(text=text):
-                history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE")}]
-                messages = [{"role": "system", "content": "sys"}, *history, {"role": "user", "content": text}]
+                messages = self._messages(text)
                 self.assertFalse(isolate_search_history(messages))
                 self.assertEqual(len(messages), 3)
 
@@ -309,5 +313,30 @@ class SearchIsolationSafetyTests(unittest.TestCase):
         messages = [{"role": "system", "content": "sys"},
                     {"role": "user", "content": "Earlier question"},
                     {"role": "user", "content": QUESTION}]
+        self.assertFalse(isolate_search_history(messages))
+        self.assertEqual(len(messages), 3)
+
+    def test_new_topic_after_document_is_isolated_without_an_online_keyword(self):
+        for text in (
+            "Какая сейчас погода в Москве?",
+            "Актуальный курс доллара на сегодня",
+            "Проверь последние новости",
+            "What is the current exchange rate?",
+        ):
+            with self.subTest(text=text):
+                messages = self._messages(text)
+                self.assertTrue(isolate_search_history(messages))
+                self.assertEqual(len(messages), 2)
+                self.assertNotIn("PRIVATE", str(messages))
+
+    def test_note_requests_are_left_to_mcp_isolation(self):
+        for text in ("Поищи во втором мозге про Python", "Search my notes for Rust"):
+            with self.subTest(text=text):
+                messages = self._messages(text)
+                self.assertFalse(isolate_search_history(messages))
+                self.assertEqual(len(messages), 3)
+
+    def test_short_acknowledgements_do_not_drop_the_history(self):
+        messages = self._messages("спасибо")
         self.assertFalse(isolate_search_history(messages))
         self.assertEqual(len(messages), 3)

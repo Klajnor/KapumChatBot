@@ -112,6 +112,20 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(names, {"search_web"})
 
+    async def test_new_question_after_document_keeps_search_available(self):
+        """Новая тема после документа не должна терять веб-поиск."""
+        names, _deliver = await self._run(
+            "Какая сейчас погода в Москве?",
+            search=True,
+            history=[
+                {
+                    "role": "user",
+                    "content": wrap_untrusted("document", "PRIVATE MATERIAL"),
+                }
+            ],
+        )
+        self.assertEqual(names, {"search_web"})
+
     async def test_clean_request_still_offers_media_and_files(self):
         names, _deliver = await self._run(
             "draw a cat and send it as a file", search=False

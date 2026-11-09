@@ -46,6 +46,7 @@ from bot.services.ai_client import ToolCall
 from bot.services.documents import fetch_url_text
 from bot.services.http_body import read_bounded
 from bot.services.operations import current_operation, stage
+from bot.services.request_scope import has_notes_target, is_fresh_request
 from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -192,15 +193,8 @@ SEARCH_SYSTEM_HINT = (
     "страницу; сообщи о неполном охвате, если часть страниц недоступна."
 )
 
-_SEARCH_ACTION_RE = re.compile(
-    r"\b(?:найди(?:те)?|найти|поищи(?:те)?|ищи(?:те)?|поиск\w*|"
-    r"search|find|look\s+up)\b", re.IGNORECASE,
-)
-_SEARCH_ONLINE_RE = re.compile(
-    r"\b(?:интернет\w*|сети|онлайн|гугл\w*|online|internet|web)\b", re.IGNORECASE,
-)
 _ISOLATED_SEARCH_HINT = (
-    "Для этого нового веб-поиска история диалога исключена из контекста ради "
+    "Для этого нового запроса история диалога исключена из контекста ради "
     "приватности ранее загруженных материалов. Выполни только текущий запрос; "
     "если он требует сведений из прежнего диалога, попроси пользователя "
     "уточнить их, не выдумывай недостающий контекст."
@@ -208,12 +202,17 @@ _ISOLATED_SEARCH_HINT = (
 
 
 def isolate_search_history(messages: list[dict[str, Any]]) -> bool:
-    """Изолировать явный чистый веб-запрос от недоверенной истории.
+    """Изолировать новый чистый запрос от недоверенной истории для веб-поиска.
 
     Убирается вся история, включая ответы-пересказы внешних материалов, но не
     из БД. Вызывающий код должен оставить только поиск, без MCP/генерации/файлов:
     удаление маркера не даёт права повторно открыть приватные инструменты.
-    Запрос с вложением, цитатой или страницей никогда не обходит обычный гейт.
+
+    Триггер — любой новый самостоятельный запрос, а не только «найди в
+    интернете»: иначе один документ в старой истории навсегда отключал бы поиск
+    для последующих вопросов на новые темы. Уточнения, текущие вложения,
+    цитаты и страницы защитный гейт не обходят; явные запросы к заметкам
+    изолируются ``mcp.isolate_mcp_history``, а не здесь.
     """
     if not messages or messages[-1].get("role") != "user":
         return False
@@ -222,8 +221,8 @@ def isolate_search_history(messages: list[dict[str, Any]]) -> bool:
     if (
         not isinstance(text, str)
         or messages_have_untrusted_content([current])
-        or not _SEARCH_ACTION_RE.search(text)
-        or not _SEARCH_ONLINE_RE.search(text)
+        or not is_fresh_request(text)
+        or has_notes_target(text)
         or not messages_have_untrusted_content(messages[:-1], ignore_sources={"search"})
     ):
         return False
@@ -233,7 +232,7 @@ def isolate_search_history(messages: list[dict[str, Any]]) -> bool:
     for entry in system:
         entry["content"] = f"{entry.get('content') or ''}\n\n{_ISOLATED_SEARCH_HINT}".strip()
     messages[:] = [*system, current]
-    logger.info("Explicit web search isolated from external untrusted history")
+    logger.info("New request isolated from external untrusted history for web search")
     return True
 
 

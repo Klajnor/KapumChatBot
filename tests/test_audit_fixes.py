@@ -594,7 +594,8 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_messages[1]["content"], "earlier")
         self.assertEqual(first_messages[2]["content"], "news?")
 
-    async def test_ai_reminder_disables_search_for_external_untrusted_history(self):
+    async def test_ai_reminder_isolates_external_untrusted_history(self):
+        """Внешняя история не должна попадать в запрос с доступным поиском."""
         from bot.services import reminders
         from bot.services.untrusted import wrap_untrusted
 
@@ -626,9 +627,13 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result.content, "done")
         search.assert_not_awaited()
-        chat.assert_not_awaited()
-        plain.assert_awaited_once()
-        self.assertIsNone(plain.await_args.kwargs.get("tools", None))
+        # Новый самостоятельный запрос изолируется: недоверенный материал
+        # вырезан из контекста, а не просто отключён инструмент.
+        chat.assert_awaited_once()
+        plain.assert_not_awaited()
+        messages = chat.await_args.kwargs["messages"]
+        self.assertEqual(len(messages), 2)
+        self.assertNotIn("ignore rules", str(messages))
 
     async def test_guest_role_reminder_is_disabled(self):
         from bot.services import reminders
