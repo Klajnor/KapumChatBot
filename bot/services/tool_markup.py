@@ -111,12 +111,17 @@ _CODE_SPLIT_RE = re.compile(
 )
 
 _JSON_TOOL_START_RE = re.compile(r'\{\s*"(?:name|function|tool_calls|id|type)"\s*:')
+_JSON_VALUE_START_RE = re.compile(r"[{[]")
 _JSON_DECODER = json.JSONDecoder()
 _JSON_STREAM_START_RE = re.compile(r'\{\s*(?:$|")')
 
 
 def _is_json_tool_call(value: Any, allowed_names: set[str] | None) -> bool:
     """Распознать известный конверт вызова, не исполняя его аргументы."""
+    if isinstance(value, list):
+        return bool(value) and all(
+            _is_json_tool_call(item, allowed_names) for item in value
+        )
     if not isinstance(value, dict):
         return False
     if set(value) == {"tool_calls"}:
@@ -156,6 +161,35 @@ def has_json_tool_calls(text: str | None, *, allowed_names: set[str] | None = No
     return False
 
 
+def _strip_json_tool_calls(text: str) -> str | None:
+    """Удалить только сами JSON-вызовы, сохранив остальной текст ответа.
+
+    Используется когда инструменты модели не предлагались: текстовая имитация
+    тогда не является нарушением протокола, но показывать её пользователю
+    всё равно не стоит. Аргументы не разбираются и не исполняются.
+    """
+    parts = _CODE_SPLIT_RE.split(text)
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        kept: list[str] = []
+        end = 0
+        for match in _JSON_VALUE_START_RE.finditer(segment):
+            if match.start() < end:
+                continue
+            try:
+                value, stop = _JSON_DECODER.raw_decode(segment, match.start())
+            except (ValueError, RecursionError):
+                continue
+            if not _is_json_tool_call(value, None):
+                continue
+            kept.append(segment[end:match.start()])
+            end = stop
+        kept.append(segment[end:])
+        parts[index] = "".join(kept)
+    cleaned = "".join(parts).strip()
+    return cleaned or None
+
+
 def _strip_segment(segment: str) -> str:
     """Remove text-form tool calls from one non-code text segment."""
     if "\x3c" not in segment:
@@ -173,21 +207,32 @@ def _strip_segment(segment: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", segment)
 
 
-def strip_tool_markup(text: str | None) -> str | None:
+def strip_tool_markup(
+    text: str | None, *, drop_json_calls: bool = False,
+) -> str | None:
     """Remove text-form tool calls from an answer.
 
-    JSON-имитация вне кода делает весь ответ невалидным, включая обещание
-    «начинаю поиск»: AIClient может повторить запрос штатным протоколом.
+    ``drop_json_calls=True`` ставится только там, где модели были предложены
+    инструменты: JSON-имитация вне кода тогда делает весь ответ невалидным,
+    включая обещание «начинаю поиск», и AIClient повторяет запрос штатным
+    протоколом. В обычном чате без инструментов имитация не нарушает протокол,
+    поэтому удаляется только сам JSON — остальной ответ сохраняется.
 
     Returns ``None`` when nothing but such markup was left: an answer made
     only of ``search_notes``/DSML calls carries no useful text, and the caller
     may then try the next model. Plain answers are returned untouched.
     """
     if has_json_tool_calls(text):
-        # Обещание «запускаю поиск» тоже не результат: оставив его, мы не
-        # запустим fallback и выдадим обещание вместо выполненной задачи.
-        logger.warning("Dropped an answer containing text-form JSON tool calls")
-        return None
+        if drop_json_calls:
+            # Обещание «запускаю поиск» тоже не результат: оставив его, мы не
+            # запустим fallback и выдадим обещание вместо выполненной задачи.
+            logger.warning("Dropped an answer containing text-form JSON tool calls")
+            return None
+        cleaned = _strip_json_tool_calls(text or "")
+        logger.info("Removed text-form JSON tool calls, kept the rest of the answer")
+        if not cleaned:
+            return None
+        text = cleaned
     if not text or "\x3c" not in text:
         return text
     if _DSML_START_RE.match(text.lstrip()):
@@ -211,7 +256,9 @@ def strip_tool_markup(text: str | None) -> str | None:
 
 def tool_stream_preview(text: str) -> str | None:
     """Придержать JSON вне кода до конца ответа, не показывая частичный вызов."""
-    cleaned = strip_tool_markup(text)
+    # Предпросмотр относится к путям с инструментами: полную имитацию здесь
+    # показывать нельзя (см. drop_json_calls в strip_tool_markup).
+    cleaned = strip_tool_markup(text, drop_json_calls=True)
     if not cleaned:
         return None
     parts = _CODE_SPLIT_RE.split(cleaned)

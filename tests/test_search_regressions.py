@@ -72,13 +72,14 @@ class TextSearchRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.content)
 
     async def test_disabled_search_does_not_retry_or_recover_json(self):
+        """Без предложенных инструментов JSON-имитация не съедает весь ответ."""
         client = AIClient(api_key="test")
         with (
             patch.object(client, "model_chain", return_value=["m"]),
             patch.object(client, "_post_chat", AsyncMock(return_value=(200, _response(LEAK), 0))) as post,
         ):
             result = await client.chat_completion_result([])
-        self.assertIsNone(result.content)
+        self.assertEqual(result.content, "Запускаю поиск.")
         self.assertFalse(result.tool_calls)
         post.assert_awaited_once()
 

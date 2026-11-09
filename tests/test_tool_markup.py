@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from bot.config import config
 from bot.services.ai_client import AIClient
@@ -25,16 +25,23 @@ def tag(name: str, body: str = "", *, attrs: str = "") -> str:
 
 
 class StripToolMarkupTests(unittest.TestCase):
-    def test_json_search_calls_with_preamble_are_not_an_answer(self):
+    def test_json_search_calls_with_preamble_are_not_an_answer_when_tools_offered(self):
         call = json.dumps({"name": "web_search", "arguments": {"query": "AI news"}})
-        self.assertIsNone(strip_tool_markup("Запускаю поиск.\n" + call + " " + call))
+        text = "Запускаю поиск.\n" + call + " " + call
+        self.assertIsNone(strip_tool_markup(text, drop_json_calls=True))
+        # Без предложенных инструментов это обычный ответ: убираем только XML
+        # вызовы, но не выбрасываем весь текст.
+        self.assertEqual(strip_tool_markup(text), "Запускаю поиск.")
 
-    def test_json_native_envelope_and_call_list_are_dropped(self):
+    def test_json_native_envelope_and_call_list_are_dropped_when_tools_offered(self):
         call = {"id": "c1", "type": "function", "function": {
             "name": "search_web", "arguments": '{"query": "news"}',
         }}
         for value in (call, [call], {"tool_calls": [call]}):
             with self.subTest(value=value):
+                self.assertIsNone(
+                    strip_tool_markup(json.dumps(value), drop_json_calls=True)
+                )
                 self.assertIsNone(strip_tool_markup(json.dumps(value)))
 
     def test_json_code_examples_and_unrelated_data_are_preserved(self):
@@ -118,6 +125,34 @@ class StripToolMarkupTests(unittest.TestCase):
         text = "Ответ\n\n" + tag("search_notes", "q")
         with patch.object(config, "rich_messages", True):
             self.assertEqual(AIClient._finalize(text), "Ответ")
+
+
+class PlainChatJsonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_chat_keeps_answer_with_a_json_tool_example(self):
+        """Ответ без инструментов не должен проваливать всю fallback-цепочку."""
+        text = 'Пример вызова: {"name": "get_note", "arguments": {"path": "x"}}'
+        client = AIClient(api_key="test")
+        with (
+            patch.object(client, "model_chain", return_value=["m1", "m2"]),
+            patch.object(client, "_post_chat", AsyncMock(return_value=(
+                200, {"choices": [{"message": {"content": text}}]}, 0,
+            ))) as post,
+        ):
+            result = await client.chat_completion_result([])
+        self.assertEqual(result.content, "Пример вызова:")
+        post.assert_awaited_once()
+
+    async def test_vision_answer_with_json_is_not_dropped(self):
+        client = AIClient(api_key="test")
+        text = 'Объект: {"name": "search_web", "arguments": {}}'
+        with (
+            patch.object(client, "model_chain", return_value=["m"]),
+            patch.object(client, "_post_chat", AsyncMock(return_value=(
+                200, {"choices": [{"message": {"content": text}}]}, 0,
+            ))),
+        ):
+            result = await client.chat_completion_result([])
+        self.assertEqual(result.content, "Объект:")
 
 
 class ToolCallsHintTests(unittest.IsolatedAsyncioTestCase):

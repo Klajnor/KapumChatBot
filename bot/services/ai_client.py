@@ -927,7 +927,9 @@ class AIClient:
                         if status == 200 and data is not None else ChatResult()
                     )
                     self._recover_search_dsml(result, payload.get("tools") or [])
-                result.content = self._finalize(result.content)
+                result.content = self._finalize(
+                    result.content, tools_offered=bool(payload.get("tools"))
+                )
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
@@ -1120,7 +1122,9 @@ class AIClient:
                         payload, on_delta, attempt_model, allow_retry=False,
                     )
                     self._recover_search_dsml(result, payload.get("tools") or [])
-                result.content = self._finalize(result.content)
+                result.content = self._finalize(
+                    result.content, tools_offered=bool(tools)
+                )
             except AIStreamError as exc:
                 errors.extend(self._stream_errors(payload, exc))
                 last_error = exc
@@ -1942,16 +1946,21 @@ class AIClient:
         return AIClient._with_hint(messages, hint)
 
     @staticmethod
-    def _finalize(content: str | None) -> str | None:
+    def _finalize(
+        content: str | None, *, tools_offered: bool = False,
+    ) -> str | None:
         """Clean the answer and normalize scientific notation for Telegram.
 
         Text-form tool calls (search_notes, DSML, …) are removed first: the
         bot executes only structured tool calls, so such markup must never
-        reach the user. With rich messages the raw LaTeX survives for
-        Telegram's native renderer, so the Unicode rewrite only matters on the
-        legacy path.
+        reach the user. ``tools_offered`` включает строгое удаление всего
+        ответа при JSON-имитации вызова: это нарушение протокола только когда
+        модель должна была вызвать инструмент штатно. В обычном чате, vision,
+        OCR и прочих путях без инструментов удаляется лишь сам JSON.
+        With rich messages the raw LaTeX survives for Telegram's native
+        renderer, so the Unicode rewrite only matters on the legacy path.
         """
-        content = strip_tool_markup(content)
+        content = strip_tool_markup(content, drop_json_calls=tools_offered)
         if (
             not content
             or config.rich_messages
