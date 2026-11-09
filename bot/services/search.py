@@ -46,7 +46,7 @@ from bot.services.ai_client import ToolCall
 from bot.services.documents import fetch_url_text
 from bot.services.http_body import read_bounded
 from bot.services.operations import current_operation, stage
-from bot.services.request_scope import has_notes_target, is_fresh_request
+from bot.services.request_scope import route
 from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -211,8 +211,9 @@ def isolate_search_history(messages: list[dict[str, Any]]) -> bool:
     Триггер — любой новый самостоятельный запрос, а не только «найди в
     интернете»: иначе один документ в старой истории навсегда отключал бы поиск
     для последующих вопросов на новые темы. Уточнения, текущие вложения,
-    цитаты и страницы защитный гейт не обходят; явные запросы к заметкам
-    изолируются ``mcp.isolate_mcp_history``, а не здесь.
+    цитаты и страницы защитный гейт не обходят. Маршрут считается общим
+    ``request_scope.route``: запросы к заметкам уходят в MCP-изоляцию, а при
+    обоих указаниях побеждает то, что стоит раньше в тексте.
     """
     if not messages or messages[-1].get("role") != "user":
         return False
@@ -221,8 +222,7 @@ def isolate_search_history(messages: list[dict[str, Any]]) -> bool:
     if (
         not isinstance(text, str)
         or messages_have_untrusted_content([current])
-        or not is_fresh_request(text)
-        or has_notes_target(text)
+        or route(text) not in {"web", "general"}
         or not messages_have_untrusted_content(messages[:-1], ignore_sources={"search"})
     ):
         return False

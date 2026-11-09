@@ -170,12 +170,24 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         brain.call_tool.assert_not_awaited()
         self.assertIsNone(seen[0]["tools"])
         self.assertNotIn(MCP_SYSTEM_HINT, seen[0]["messages"][0]["content"])
+        # Пустой каталог не должен вырезать историю: изоляция теперь решается
+        # только после успешной загрузки инструментов.
+        self.assertIn("PRIVATE MATERIAL", str(seen[0]["messages"]))
 
     async def test_explicit_web_search_does_not_switch_to_notes(self):
         history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]
         _, brain, seen, _ = await self.run_chat("Найди в интернете плагины для Obsidian", history)
-        brain.openai_tools.assert_not_awaited()
+        brain.openai_tools.assert_awaited_once()
+        brain.call_tool.assert_not_awaited()
         self.assertEqual([tool["function"]["name"] for tool in seen[0]["tools"]], ["search_web"])
+
+    async def test_web_search_mentioning_obsidian_stays_web(self):
+        """«… в интернете … в Obsidian» не должен глушить search_web."""
+        history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]
+        _, brain, seen, _ = await self.run_chat("Найди в интернете плагины в Obsidian", history)
+        brain.call_tool.assert_not_awaited()
+        self.assertEqual([tool["function"]["name"] for tool in seen[0]["tools"]], ["search_web"])
+        self.assertNotIn("PRIVATE", str(seen[0]["messages"]))
 
 
 class GuestMCPHistoryTests(unittest.IsolatedAsyncioTestCase):

@@ -1521,6 +1521,12 @@ async def _answer_with_ai(
     )
 
     mcp_ready = mcp_available(user.id)
+    # Каталог MCP проверяем ДО изоляции: пустой каталог или упавший сервер не
+    # должны вырезать историю и заодно запрещать веб-поиск.
+    mcp_tools: list[dict[str, Any]] = []
+    if mcp_ready:
+        mcp_tools = await mcp_manager.openai_tools()
+        mcp_ready = bool(mcp_tools)
     mcp_only = mcp_ready and isolate_mcp_history(messages)
     search_ready = not mcp_only and search_configured()
     search_only = search_ready and isolate_search_history(messages)
@@ -1542,11 +1548,7 @@ async def _answer_with_ai(
     # веб-поиск не получает MCP. Сбой запуска сервера не ломает обычный ответ.
     mcp_ready = mcp_ready and not search_only
     if mcp_ready:
-        mcp_tools = await mcp_manager.openai_tools()
-        if mcp_tools:
-            tools.extend(mcp_tools)
-        else:
-            mcp_ready = False
+        tools.extend(mcp_tools)
     tools_arg: list[dict[str, Any]] | None
     printer: _StreamPrinter | None = None
     total_elapsed = 0.0

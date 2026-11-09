@@ -43,7 +43,7 @@ from typing import Any
 
 from bot.config import config
 from bot.services.note_metadata import generate_note_metadata
-from bot.services.request_scope import NOTES_TARGET_RE, is_fresh_request
+from bot.services.request_scope import route
 from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 from bot.services.user_service import user_service
 
@@ -434,8 +434,10 @@ def isolate_mcp_history(messages: list[dict[str, Any]]) -> bool:
     БД. Вызывающий код обязан оставить только read-only MCP, без веб-поиска,
     генерации и отправки файлов. Внешний контент в текущем запросе и обычные
     уточнения не обходят защиту; результаты MCP снова включают общий гейт.
-    Достаточно явного указания на заметки и самостоятельности запроса: отдельный
-    глагол действия больше не требуется («что там по проекту X в заметках?»).
+    Достаточно свежего запроса и явного указания на заметки: отдельный глагол
+    действия больше не требуется («что там по проекту X в заметках?»).
+    Маршрут считает общий ``request_scope.route``: явный веб-запрос, даже
+    упоминающий Obsidian, остаётся веб-поиском и не перехватывается здесь.
     """
     if not messages or messages[-1].get("role") != "user":
         return False
@@ -444,8 +446,7 @@ def isolate_mcp_history(messages: list[dict[str, Any]]) -> bool:
     if (
         not isinstance(text, str)
         or messages_have_untrusted_content([current])
-        or not is_fresh_request(text)
-        or not NOTES_TARGET_RE.search(text)
+        or route(text) != "notes"
         or not messages_have_untrusted_content(messages[:-1])
     ):
         return False

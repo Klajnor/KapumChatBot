@@ -604,17 +604,18 @@ async def _build_reply(
     # generation call or reach the private notes.
     messages = [*base_messages, {"role": "user", "content": text}]
     mcp_ready = mcp_available(caller_id)
+    # Каталог проверяем до изоляции: сбой сервера не должен вырезать историю.
+    mcp_tools: list[dict[str, Any]] = []
+    if mcp_ready and not current_external:
+        mcp_tools = await mcp_manager.openai_tools()
+        mcp_ready = bool(mcp_tools)
     mcp_only = mcp_ready and not current_external and isolate_mcp_history(messages)
     tools: list[dict[str, Any]] = []
     if config.enable_image_generation and not external and not mcp_only:
         tools.append(IMAGE_TOOL)
     mcp_ready = mcp_ready and (not external or mcp_only)
     if mcp_ready:
-        mcp_tools = await mcp_manager.openai_tools()
-        if mcp_tools:
-            tools.extend(mcp_tools)
-        else:
-            mcp_ready = False
+        tools.extend(mcp_tools)
 
     budget = ToolBudget()
     mcp_rounds = 0

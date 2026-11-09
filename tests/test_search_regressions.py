@@ -248,7 +248,9 @@ class IsolatedSearchTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await chat._answer_with_ai(message, service, QUESTION, AccessResult(True, "admin"))
                 search.assert_awaited_once_with("AI news November 8 2026", None)
-                mcp.assert_not_awaited()
+                # Каталог теперь загружается до изоляции, но MCP в поисковом
+                # режиме не предлагается: изолированный search-only контекст.
+                mcp.assert_awaited_once()
                 deliver.assert_awaited_once()
                 self.assertEqual(deliver.await_args.args[2], "Обзор [1]")
                 self.assertEqual(len(sent), 3)
