@@ -11,7 +11,11 @@ from bot.config import config
 from bot.handlers import chat
 from bot.services.access import AccessResult
 from bot.services.ai_client import ChatResult
-from bot.services.untrusted import wrap_untrusted
+from bot.services.untrusted import (
+    has_untrusted_content,
+    messages_have_untrusted_content,
+    wrap_untrusted,
+)
 
 
 @asynccontextmanager
@@ -46,6 +50,46 @@ class UntrustedSideEffectFilterTests(unittest.TestCase):
     def test_filter_is_noop_for_trusted_tools(self):
         tools = [{"function": {"name": "search_web"}}]
         self.assertEqual(chat._without_untrusted_side_effects(tools), tools)
+
+
+class IgnoreSourcesTests(unittest.TestCase):
+    def test_search_results_are_ignored_only_when_the_tag_is_well_formed(self):
+        search = wrap_untrusted("search", "web results")
+        self.assertTrue(has_untrusted_content(search))
+        self.assertFalse(
+            has_untrusted_content(search, ignore_sources={"search"})
+        )
+
+    def test_malformed_marker_stays_tainted_for_both_checks(self):
+        """Обрыв маркера не должен снимать гейт только для search_web."""
+        for text in (
+            "<untrusted_content",
+            '<untrusted_content source="doc',
+            "просто текст <untrusted_content и ещё слова",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(has_untrusted_content(text))
+                self.assertTrue(
+                    has_untrusted_content(text, ignore_sources={"search"})
+                )
+                self.assertTrue(
+                    messages_have_untrusted_content(
+                        [{"role": "user", "content": text}],
+                        ignore_sources={"search"},
+                    )
+                )
+
+    def test_unknown_source_is_not_ignored(self):
+        text = wrap_untrusted("document", "PRIVATE")
+        self.assertTrue(
+            has_untrusted_content(text, ignore_sources={"search"})
+        )
+
+    def test_mixed_sources_stay_tainted(self):
+        text = wrap_untrusted("search", "web") + "\n" + wrap_untrusted("web", "page")
+        self.assertTrue(
+            has_untrusted_content(text, ignore_sources={"search"})
+        )
 
 
 class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):

@@ -56,18 +56,28 @@ def has_untrusted_content(
     ``ignore_sources`` treats blocks wrapped with one of those ``source``
     labels as already known/expected output (for example ``search`` results
     after a search round) and does not count them as taint.
+
+    Если маркер есть, но корректный открывающий тег разобрать не удалось
+    (оборванная запись, только закрывающий тег, подделанная строка), результат
+    считается грязным: иначе вариант с ``ignore_sources`` расходился бы с
+    обычной проверкой и оставлял ``search_web`` включённым там, где MCP уже
+    отключён.
     """
     if not text or TAG not in text:
         return False
     if not ignore_sources:
         return True
     ignored = {source.lower() for source in ignore_sources}
-    for tag in _OPEN_TAG_RE.finditer(text):
+    open_tags = list(_OPEN_TAG_RE.finditer(text))
+    if not open_tags:
+        return True
+    for tag in open_tags:
         source = _SOURCE_RE.search(tag.group(1))
         if source and source.group(1).lower() in ignored:
             continue
         return True
-    return False
+    # Вхождения маркера, не превратившиеся в открывающий тег, тоже грязь.
+    return text.lower().count(TAG) > len(open_tags)
 
 
 def messages_have_untrusted_content(
