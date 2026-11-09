@@ -87,6 +87,14 @@ class AutomaticNoteReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(injection, result)
         self.assertEqual(client.call_tool.await_count, 2)
 
+    async def test_note_about_errors_is_not_mistaken_for_tool_failure(self):
+        result, _manager, client, _budget = await self.read(
+            [{"path": "Vault/Plan.md"}], note="Ошибка подключения возникает при старом сертификате.",
+        )
+        self.assertIn("Полный текст заметки:", result)
+        self.assertIn("старом сертификате", result)
+        self.assertEqual(client.call_tool.await_count, 2)
+
     async def test_get_note_error_falls_back_to_card_chunk(self):
         for error in ("ошибка: заметка слишком большая", RuntimeError("offline")):
             with self.subTest(error=error):

@@ -62,6 +62,19 @@ class RouteTests(unittest.TestCase):
     def test_followups_have_no_route(self):
         self.assertIsNone(route("Найди ещё по этой теме"))
 
+    def test_explicit_comparison_or_both_sources_use_combined_route(self):
+        for text in (
+            "Найди в моих заметках и в интернете сведения о Rust",
+            "Сравни в интернете актуальные данные с тем, что в моих заметках о Rust",
+            "Сопоставь во втором мозге план с документацией в интернете",
+            "Search my notes and the web for Rust and combine the results",
+            "Compare the web documentation with my notes about Rust",
+            "Сравни мои заметки про Rust с актуальными данными в интернете",
+            "Найди в MCP и в интернете сведения о Rust",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(route(text), "combined")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -158,10 +158,12 @@ class NoteAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(guest, "mcp_manager", manager),
             patch.object(guest.ai_client, "chat_with_tools", side_effect=answer),
             patch.object(guest.ai_client, "chat_completion_result", side_effect=answer),
-            patch.object(guest, "_maybe_telegraph_reply", AsyncMock(return_value=None)),
+            patch.object(guest, "_maybe_telegraph_reply", AsyncMock(return_value=None)) as telegraph,
         ):
             reply = await guest._build_reply(message, service, message.from_user, 42)
         self.assertEqual(backend.call_tool.await_count, 2)
         self.assertIn(NOTE, str(seen[1]))
         self.assertNotIn(PROMISE, reply.text)
         self.assertIn("риск", reply.text)
+        # Даже без внешней истории MCP-текст нельзя публиковать в Telegraph.
+        self.assertFalse(telegraph.await_args.kwargs["allow"])

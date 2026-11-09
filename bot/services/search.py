@@ -752,7 +752,7 @@ async def search_web(query: str, max_results: int | None = None) -> SearchResult
 
 
 def format_search_results(
-    query: str, results: list[SearchResult], *, failed: bool = False
+    query: str, results: list[SearchResult], *, failed: bool = False, start_index: int = 1,
 ) -> str:
     """Tool-message body: numbered results the model cites as [n].
 
@@ -775,7 +775,7 @@ def format_search_results(
             "нашёл."
         )
     blocks = [f"Результаты веб-поиска по запросу {query!r}:"]
-    for index, item in enumerate(results, start=1):
+    for index, item in enumerate(results, start=start_index):
         if item.page_text:
             content = f"Прочитанный текст страницы:\n{item.page_text}"
         else:

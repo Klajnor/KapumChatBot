@@ -162,7 +162,8 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         history = [{"role": "user", "content": "Ранее обсуждали Python"}]
         _, _, seen, _ = await self.run_chat("Поищи во втором мозге про Python", history)
         self.assertIn(history[0], seen[0]["messages"])
-        self.assertIn("search_web", {tool["function"]["name"] for tool in seen[0]["tools"]})
+        # Явная просьба только к заметкам не должна случайно отправляться в веб.
+        self.assertNotIn("search_web", {tool["function"]["name"] for tool in seen[0]["tools"]})
 
     async def test_empty_catalog_does_not_open_web_search_or_media_tools(self):
         history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]

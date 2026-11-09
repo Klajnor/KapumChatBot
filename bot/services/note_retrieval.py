@@ -92,7 +92,7 @@ def read_failed(text: str) -> bool:
     stripped = text.strip()
     if not stripped or stripped == "(empty result)":
         return True
-    if stripped.casefold().startswith(("ошибка", "error:")):
+    if stripped.casefold().startswith(("ошибка:", "ошибка инструмента mcp:", "error:")):
         return True
     try:
         value = json.loads(stripped)

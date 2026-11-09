@@ -54,12 +54,14 @@ from bot.services.mcp import (
 )
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
+from bot.services.request_scope import route
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
     is_retrieval_promise,
     retrieval_fallback,
 )
+from bot.services.retrieval_plan import apply_combined_hint, isolate_combined_history
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.search import build_assistant_tool_message, build_tool_response
@@ -616,7 +618,8 @@ async def _build_reply(
     if mcp_ready and not current_external:
         mcp_tools = await mcp_manager.openai_tools()
         mcp_ready = bool(mcp_tools)
-    mcp_only = mcp_ready and not current_external and isolate_mcp_history(messages)
+    combined = mcp_ready and not current_external and isolate_combined_history(messages)
+    mcp_only = combined or (mcp_ready and not current_external and isolate_mcp_history(messages))
     if mcp_only and not messages_have_untrusted_content(messages):
         # Подсказка вешалась на base_messages до изоляции (она нужна и для
         # vision-пути выше). После вырезания истории тегов больше нет.
@@ -627,6 +630,10 @@ async def _build_reply(
     mcp_ready = mcp_ready and (not external or mcp_only)
     if mcp_ready:
         tools.extend(mcp_tools)
+    if combined:
+        # Guest API по-прежнему не выполняет веб-поиск. Не изображаем наличие
+        # веб-источников, но разрешаем безопасно прочитать часть из заметок.
+        apply_combined_hint(messages, web_available=False, notes_available=mcp_ready)
 
     budget = ToolBudget()
     mcp_rounds = 0
@@ -719,7 +726,9 @@ async def _build_reply(
             ) or ChatResult()
             result.tool_calls = []
             image_call = None
-        if is_retrieval_promise(result.content) and mcp_rounds:
+        if is_retrieval_promise(result.content) and (
+            mcp_rounds or route(text) in {"notes", "combined"}
+        ):
             previous_elapsed = result.elapsed
             result = await ai_client.chat_completion_result(
                 messages=final_answer_messages(messages),
@@ -767,7 +776,8 @@ async def _build_reply(
         output_tokens=result.output_tokens,
     )
     telegraph_reply = await _maybe_telegraph_reply(
-        text, result.content, footer, allow=not external
+        text, result.content, footer,
+        allow=not external and not messages_have_untrusted_content(messages),
     )
     if telegraph_reply is not None:
         return telegraph_reply

@@ -45,7 +45,7 @@ def ensure_note_lookup(
     Резервный запрос — только собственный текущий текст пользователя, без
     истории, вывода MCP и аргументов текстовой имитации вызова.
     """
-    if route(text) != "notes" or messages_have_untrusted_content([
+    if route(text) not in {"notes", "combined"} or messages_have_untrusted_content([
         {"role": "user", "content": text},
     ]):
         return

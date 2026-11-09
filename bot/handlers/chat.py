@@ -74,11 +74,17 @@ from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
+from bot.services.request_scope import route
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
     is_retrieval_promise,
     retrieval_fallback,
+)
+from bot.services.retrieval_plan import (
+    apply_combined_hint,
+    complete_combined_plan,
+    isolate_combined_history,
 )
 from bot.services.rich import (
     RICH_LIMIT,
@@ -118,7 +124,12 @@ from bot.services.telegram_utils import (
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.time_context import current_time_hint
-from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
+from bot.services.tool_budget import (
+    CALL_LIMIT_NOTICE,
+    CONTEXT_LIMIT_NOTICE,
+    ToolBudget,
+    clip_tool_text,
+)
 from bot.services.untrusted import (
     apply_untrusted_hint,
     messages_have_untrusted_content,
@@ -1379,6 +1390,12 @@ async def _resolve_tool_round(
         if call.name == "search_web" and search_ready
     ]
     mcp_calls = [call for call in calls if mcp_manager.is_mcp_tool(call.name)]
+    # Ни один источник не должен вытеснить другой из смешанного ответа.
+    # План уже зафиксирован до выполнения: результаты заметок не меняют веб-запрос.
+    source_context = (
+        {"web": budget.context_chars // 2, "notes": budget.context_chars - budget.context_chars // 2}
+        if search_calls and mcp_calls else None
+    )
 
     notices: list[str] = []
     queries = [
@@ -1394,7 +1411,16 @@ async def _resolve_tool_round(
     if notices:
         await safe_answer(message, "\n".join(notices))
 
+    search_index = 1
     for call in calls:
+        family = "web" if call.name == "search_web" else "notes"
+        available_chars = min(
+            budget.context_chars,
+            source_context[family] if source_context is not None else budget.context_chars,
+        )
+        if source_context is not None and available_chars <= 0:
+            messages.append(build_tool_response(call.id, CONTEXT_LIMIT_NOTICE))
+            continue
         if call.name == "search_web" and search_ready:
             if not search_allowed or not budget.take_search():
                 messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
@@ -1407,25 +1433,26 @@ async def _resolve_tool_round(
             error = str(getattr(results, "error", "") or "")
             if error:
                 search_failed = True
-            messages.append(
-                build_tool_response(
-                    call.id,
-                    budget.clip(
-                        format_search_results(
-                            query, results, failed=bool(error)
-                        )
-                    ),
-                )
-            )
+            output = budget.clip(clip_tool_text(
+                format_search_results(query, results, failed=bool(error), start_index=search_index),
+                available_chars,
+            ))
+            search_index += len(results)
+            messages.append(build_tool_response(call.id, output))
+            if source_context is not None:
+                source_context["web"] -= len(output)
             continue
 
         if not mcp_allowed or not budget.take_mcp():
             messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
             continue
         output = await mcp_manager.call_tool(
-            call.name, call.arguments, max_chars=budget.context_chars, read_budget=budget,
+            call.name, call.arguments, max_chars=available_chars, read_budget=budget,
         )
-        messages.append(build_tool_response(call.id, budget.clip(output)))
+        output = budget.clip(clip_tool_text(output, available_chars))
+        messages.append(build_tool_response(call.id, output))
+        if source_context is not None:
+            source_context["notes"] -= len(output)
 
     return search_failed
 
@@ -1533,10 +1560,12 @@ async def _answer_with_ai(
     if mcp_ready:
         mcp_tools = await mcp_manager.openai_tools()
         mcp_ready = bool(mcp_tools)
-    mcp_only = mcp_ready and isolate_mcp_history(messages)
-    search_ready = not mcp_only and search_configured()
-    search_only = search_ready and isolate_search_history(messages)
-    isolated = mcp_only or search_only
+    request_route = route(text) if not messages_have_untrusted_content([messages[-1]]) else None
+    combined = request_route == "combined" and isolate_combined_history(messages)
+    mcp_only = not combined and mcp_ready and isolate_mcp_history(messages)
+    search_ready = not mcp_only and request_route != "notes" and search_configured()
+    search_only = not combined and search_ready and isolate_search_history(messages)
+    isolated = combined or mcp_only or search_only or request_route == "notes"
     tools: list[dict[str, Any]] = []
     # Without an image intent (when classification ran) the model is not even
     # offered the generation tools, so it cannot draw by accident.
@@ -1555,12 +1584,15 @@ async def _answer_with_ai(
     mcp_ready = mcp_ready and not search_only
     if mcp_ready:
         tools.extend(mcp_tools)
+    if combined:
+        apply_combined_hint(messages, web_available=search_ready, notes_available=mcp_ready)
     tools_arg: list[dict[str, Any]] | None
     printer: _StreamPrinter | None = None
     total_elapsed = 0.0
     search_rounds = 0
     mcp_rounds = 0
     search_failed_once = False
+    combined_planned = False
     # Total calls/context for this question, not per round: one model turn may
     # ask for many searches or MCP reads.
     budget = ToolBudget()
@@ -1642,6 +1674,9 @@ async def _answer_with_ai(
             ]
             if mcp_rounds == 0:
                 ensure_note_lookup(result, tools_arg, text)
+            if combined and not combined_planned:
+                complete_combined_plan(result, tools_arg, text)
+                combined_planned = True
 
             image_call = next(
                 (call for call in result.tool_calls if call.name == "generate_image"),
@@ -1726,6 +1761,15 @@ async def _answer_with_ai(
                     )
                     if _is_private(message):
                         await safe_answer(message, SEARCH_UNAVAILABLE_NOTICE)
+                if combined:
+                    # Единственное разрешённое расширение MCP — автоматическое
+                    # чтение карточек внутри call_tool. После сбора обоих видов
+                    # источников остаётся только синтез без каких-либо tools.
+                    mcp_ready = search_ready = False
+                    tools = []
+                    remove_mcp_hint(messages)
+                    remove_search_hint(messages)
+                    messages[:] = final_answer_messages(messages)
                 continue
             if (handled_calls or search_failed_once) and not result.content:
                 # Budget spent / search broke and the model still only wants
@@ -1736,8 +1780,9 @@ async def _answer_with_ai(
                 request_errors.extend(result.errors)
                 result.tool_calls = []
                 total_elapsed += result.elapsed
-            if is_retrieval_promise(result.content) and any(
-                entry.get("role") == "tool" for entry in messages
+            if is_retrieval_promise(result.content) and (
+                request_route in {"notes", "combined"}
+                or any(entry.get("role") == "tool" for entry in messages)
             ):
                 if printer is not None:
                     await printer.discard()

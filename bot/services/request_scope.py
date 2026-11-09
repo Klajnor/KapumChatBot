@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-Route = Literal["web", "notes", "general"]
+Route = Literal["web", "notes", "combined", "general"]
 
 # Дейксис/анафора: сообщение явно ссылается на прежний контекст. Такие запросы
 # изолировать нельзя — им нужна история для ответа, поэтому для них остаётся
@@ -63,11 +63,33 @@ NOTES_TARGET_RE = re.compile(
     r"\b(?:во?\s+(?:(?:мо[её]м|тво[её]м|сво[её]м)\s+)?втором\s+мозге|"
     r"(?:в|из)\s+(?:(?:моих|твоих|своих|сохран[её]нных|личных)\s+)?замет(?:ках|ок)|"
     r"по\s+(?:(?:моим|твоим|своим|сохран[её]нным|личным)\s+)?заметкам|"
+    r"(?:мои|твои|наши|свои|сохран[её]нные|личные)\s+заметки|"
+    r"(?:в|из)\s+mcp|"
     r"в\s+obsidian|(?:in|from|through)\s+(?:(?:my|your|the|our|saved)\s+)?"
     r"(?:second\s+brain|notes|obsidian|vault)|"
     r"(?:my|your|our|saved)\s+(?:second\s+brain|notes|vault))\b",
     re.IGNORECASE,
 )
+
+_COMBINE_ACTION_RE = re.compile(
+    r"\b(?:сравни\w*|сопостав\w*|сверь\w*|объедин\w*|совмест\w*|дополни\w*|"
+    r"compare|combine|cross[- ]check|both)\b", re.IGNORECASE,
+)
+_SOURCE_JOIN_RE = re.compile(r"\b(?:и|а\s+также|затем|and|also|then|with)\b", re.IGNORECASE)
+
+
+def wants_combined_sources(text: str) -> bool:
+    """Явная просьба сопоставить заметки и веб, не интернет как тема заметки."""
+    web = WEB_MARKER_RE.search(text)
+    notes = NOTES_TARGET_RE.search(text)
+    if not web or not notes:
+        return False
+    first, second = sorted((web, notes), key=lambda match: match.start())
+    return bool(
+        _COMBINE_ACTION_RE.search(text)
+        or _SOURCE_JOIN_RE.search(text[first.end():second.start()])
+    )
+
 
 # Короткие реплики («привет», «спасибо», «hi») не считаем новым запросом:
 # изолировать из-за них всю переписку не нужно.
@@ -108,15 +130,17 @@ def has_notes_target(text: str) -> bool:
 
 
 def route(text: str) -> Route | None:
-    """Куда адресован новый запрос: ``web``, ``notes`` или ``general``.
+    """Куда адресован новый запрос: web, notes, combined или general.
 
     ``None`` означает, что запрос не самостоятельный (уточнение/пусто) и
-    историю изолировать нельзя. Если в тексте есть оба указания, побеждает то,
-    которое стоит раньше: «найди в интернете … в Obsidian» — веб-поиск, а
-    «найди во втором мозге … про интернет» — заметки.
+    историю изолировать нельзя. Явное сопоставление двух источников даёт
+    combined. Иначе при обоих указаниях побеждает более раннее: «найди в
+    интернете … в Obsidian» — веб, «во втором мозге … про интернет» — заметки.
     """
     if not is_fresh_request(text):
         return None
+    if wants_combined_sources(text):
+        return "combined"
     web_at, notes_at = first_web_at(text), first_notes_at(text)
     if web_at is not None and notes_at is not None:
         return "web" if web_at < notes_at else "notes"
