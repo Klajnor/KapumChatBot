@@ -115,3 +115,21 @@ def apply_untrusted_hint(messages: list[dict[str, Any]]) -> None:
         if isinstance(content, str) and UNTRUSTED_SYSTEM_HINT not in content:
             entry["content"] = f"{content}\n\n{UNTRUSTED_SYSTEM_HINT}"
         return
+
+
+def remove_untrusted_hint(messages: list[dict[str, Any]]) -> None:
+    """Drop the rule after isolation removed every untrusted block.
+
+    ``apply_untrusted_hint`` может быть вызвана до изоляции (guest-режим
+    готовит ``base_messages`` ещё и для vision-пути). Если история вырезана,
+    подсказка про теги, которых больше нет, только сбивает модель с толку.
+    """
+    for entry in messages:
+        if entry.get("role") != "system":
+            continue
+        content = entry.get("content")
+        if isinstance(content, str) and UNTRUSTED_SYSTEM_HINT in content:
+            entry["content"] = content.replace(
+                f"\n\n{UNTRUSTED_SYSTEM_HINT}", ""
+            ).replace(UNTRUSTED_SYSTEM_HINT, "")
+        return

@@ -26,6 +26,7 @@ from bot.config import (
 from bot.services import thinking
 from bot.services.ai_errors import AIRequestError, provider_error, request_error
 from bot.services.http_body import read_bounded
+from bot.services.http_redirect import warn_redirect_blocked
 from bot.services.image_tools import canonical_operations
 from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
@@ -661,6 +662,8 @@ class AIClient:
             ) as resp:
                 body = await _read_response_text(resp, _MAX_PROVIDER_BODY)
                 if resp.status != 200:
+                    if 300 <= resp.status < 400:
+                        warn_redirect_blocked("AI /models", resp.status, url)
                     logger.warning(
                         "Model list unavailable (status %s): %s",
                         resp.status,
@@ -1325,6 +1328,8 @@ class AIClient:
                     body = await _read_response_text(
                         resp, _MAX_PROVIDER_ERROR_BODY
                     )
+                    if 300 <= resp.status < 400:
+                        warn_redirect_blocked("AI stream", resp.status, target)
                     logger.error(
                         "AI stream error (status %s): %s", resp.status, body[:500]
                     )
@@ -2059,6 +2064,8 @@ class AIClient:
                         errors.append(provider_error(
                             str(payload["model"]), resp.status, body, secrets=self._error_secrets(),
                         ))
+                    if 300 <= resp.status < 400:
+                        warn_redirect_blocked("AI chat", resp.status, target)
 
                     if fail_fast_on_quota and (
                         resp.status == 429 or _QUOTA_ERROR_RE.search(body)

@@ -79,9 +79,12 @@ def _read(path: Path) -> str | None:
     if b"\0" in data:
         return None
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    # Один и тот же коммит обязан давать одинаковую статистику на Linux (LF)
+    # и Windows (CRLF): переводы строк не должны попадать в счётчик символов.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _count(paths: list[Path]) -> Counts:
@@ -167,7 +170,10 @@ def main() -> int:
     args = parser.parse_args()
     text = render(collect())
     if args.write:
-        OUTPUT.write_text(text, encoding="utf-8")
+        # Явно пишем LF: иначе на Windows write_text подставит CRLF и файл
+        # будет отличаться от вывода в stdout (проверка свежести упадёт).
+        with OUTPUT.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
     else:
         # Deterministic UTF-8 on every platform (Windows consoles default to
         # a legacy code page, which breaks piping into the freshness test).

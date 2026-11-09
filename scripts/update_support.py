@@ -157,7 +157,13 @@ def notify(config: dict[str, str], text: str) -> bool:
         try:
             with opener.open(request, timeout=10) as response:
                 success = bool(json.loads(response.read(65536)).get("ok")) and success
-        except Exception:  # noqa: BLE001 — токен/URL и тело ошибки нельзя печатать
+        except Exception as exc:  # noqa: BLE001 — токен/URL и тело ошибки нельзя печатать
+            # Прямая доставка без прокси может быть недоступна в сети сервера.
+            # Фиксируем сам факт, не печатая токен, URL и текст исключения.
+            print(
+                f"Telegram notify failed for chat {owner}: {type(exc).__name__}",
+                file=sys.stderr,
+            )
             success = False
     return success
 

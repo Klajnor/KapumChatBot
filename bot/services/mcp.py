@@ -178,8 +178,6 @@ def _expand_env(value: str) -> str:
     return _ENV_RE.sub(replace, value)
 
 
-
-
 # --- Subprocess environment --------------------------------------------------
 
 # Only these variables are inherited from the bot's own environment. An MCP

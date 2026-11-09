@@ -28,6 +28,7 @@ import aiohttp
 
 from bot.config import config
 from bot.services import markdown as _md
+from bot.services.http_redirect import warn_redirect_blocked
 from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
@@ -376,6 +377,8 @@ async def _post(endpoint: str, data: dict[str, str]) -> dict[str, Any]:
         ) as resp:
             body = await resp.text()
             if resp.status != 200:
+                if 300 <= resp.status < 400:
+                    warn_redirect_blocked("Telegraph", resp.status, url)
                 return {"ok": False, "error": f"HTTP {resp.status}: {body[:200]}"}
             parsed = json.loads(body)
     except (TimeoutError, aiohttp.ClientError) as exc:

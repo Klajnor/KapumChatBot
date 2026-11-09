@@ -14,7 +14,7 @@ pip install pytest pytest-asyncio ruff   # dev-зависимости (в requir
 cp .env.example .env.linux             # Linux; на Windows: copy .env.example .env.windows
 
 python -m bot.main                       # запуск бота (так же в chat_bot.service)
-python scripts/project_stats.py --write   # обновить PROJECT_STATS.md (то же делает pre-commit)
+python scripts/project_stats.py --write   # обновить PROJECT_STATS.md (то же делает pre-commit); CRLF/LF нормализуются
 
 ruff check bot/ tests/                   # линт (ruff.toml: target py312)
 pytest tests/ -v                         # все тесты

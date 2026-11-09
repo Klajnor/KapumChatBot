@@ -226,6 +226,8 @@ class GuestMCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([tool["function"]["name"] for tool in seen[0]["tools"]], [SEARCH_NAME])
         self.assertEqual(len(seen[0]["messages"]), 2)
         self.assertIn(MCP_SYSTEM_HINT, seen[0]["messages"][0]["content"])
+        # История вырезана: подсказка про недоверенные теги больше не нужна.
+        self.assertNotIn(UNTRUSTED_SYSTEM_HINT, seen[0]["messages"][0]["content"])
         self.assertNotIn("tools", seen[1])
         for payload in seen:
             self.assertNotIn("PRIVATE", str(payload))

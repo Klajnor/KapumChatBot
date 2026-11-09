@@ -71,6 +71,7 @@ from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import (
     apply_untrusted_hint,
     messages_have_untrusted_content,
+    remove_untrusted_hint,
     wrap_untrusted,
 )
 from bot.services.user_service import UserService
@@ -610,6 +611,10 @@ async def _build_reply(
         mcp_tools = await mcp_manager.openai_tools()
         mcp_ready = bool(mcp_tools)
     mcp_only = mcp_ready and not current_external and isolate_mcp_history(messages)
+    if mcp_only and not messages_have_untrusted_content(messages):
+        # Подсказка вешалась на base_messages до изоляции (она нужна и для
+        # vision-пути выше). После вырезания истории тегов больше нет.
+        remove_untrusted_hint(messages)
     tools: list[dict[str, Any]] = []
     if config.enable_image_generation and not external and not mcp_only:
         tools.append(IMAGE_TOOL)

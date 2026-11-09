@@ -136,6 +136,9 @@ class UpdateSupportTests(unittest.TestCase):
         ):
             self.assertFalse(notify(config, "failure"))
         self.assertNotIn("SECRET", output.getvalue())
+        # Отказ прямой доставки теперь виден, но без токена и текста ошибки.
+        self.assertIn("Telegram notify failed", output.getvalue())
+        self.assertIn("OSError", output.getvalue())
 
     def test_syntax_gate_does_not_import_modules_or_write_bytecode(self):
         with tempfile.TemporaryDirectory() as tmp:

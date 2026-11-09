@@ -12,8 +12,11 @@ from bot.handlers import chat
 from bot.services.access import AccessResult
 from bot.services.ai_client import ChatResult
 from bot.services.untrusted import (
+    UNTRUSTED_SYSTEM_HINT,
+    apply_untrusted_hint,
     has_untrusted_content,
     messages_have_untrusted_content,
+    remove_untrusted_hint,
     wrap_untrusted,
 )
 
@@ -50,6 +53,25 @@ class UntrustedSideEffectFilterTests(unittest.TestCase):
     def test_filter_is_noop_for_trusted_tools(self):
         tools = [{"function": {"name": "search_web"}}]
         self.assertEqual(chat._without_untrusted_side_effects(tools), tools)
+
+
+class UntrustedHintTests(unittest.TestCase):
+    def test_hint_is_removed_after_isolation(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": wrap_untrusted("web", "page")},
+        ]
+        apply_untrusted_hint(messages)
+        self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        messages[:] = [dict(messages[0]), {"role": "user", "content": "new question"}]
+        remove_untrusted_hint(messages)
+        self.assertEqual(messages[0]["content"], "sys")
+        self.assertFalse(messages_have_untrusted_content(messages))
+
+    def test_remove_is_idempotent_and_keeps_custom_prompt(self):
+        messages = [{"role": "system", "content": "custom prompt"}]
+        remove_untrusted_hint(messages)
+        self.assertEqual(messages[0]["content"], "custom prompt")
 
 
 class IgnoreSourcesTests(unittest.TestCase):
