@@ -127,6 +127,44 @@ class StripToolMarkupTests(unittest.TestCase):
             self.assertEqual(AIClient._finalize(text), "Ответ")
 
 
+class StreamPreviewTests(unittest.TestCase):
+    def test_benign_json_is_not_held_back(self):
+        for tools_offered in (False, True):
+            with self.subTest(tools_offered=tools_offered):
+                text = 'Ответ: {"a": 1} и ещё текст'
+                self.assertEqual(
+                    tool_stream_preview(text, tools_offered=tools_offered), text
+                )
+
+    def test_partial_tool_json_is_held_only_when_tools_are_offered(self):
+        text = 'Запускаю.\n{"na'
+        self.assertEqual(tool_stream_preview(text, tools_offered=True), "Запускаю.")
+        self.assertEqual(tool_stream_preview(text), text)
+
+    def test_complete_json_call_is_hidden_only_when_tools_are_offered(self):
+        text = 'Ищу...\n{"name": "web_search", "arguments": {"query": "x"}}'
+        self.assertIsNone(tool_stream_preview(text, tools_offered=True))
+        self.assertEqual(tool_stream_preview(text), "Ищу...")
+
+
+class PlainStreamPreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_benign_json_streams_in_full_without_tools(self):
+        client = AIClient(api_key="test")
+        text = 'Ответ: {"a": 1} и ещё текст'
+
+        async def lines(payload, model_id):
+            for piece in ('Ответ: {"a": 1}', " и ещё текст"):
+                yield "data: " + json.dumps(
+                    {"choices": [{"delta": {"content": piece}}]}
+                )
+            yield "data: [DONE]"
+
+        preview = AsyncMock()
+        with patch.object(client, "_stream_lines", lines):
+            await client._stream_attempt({"model": "m", "messages": []}, preview)
+        self.assertEqual(preview.await_args_list[-1].args[0], text)
+
+
 class PlainChatJsonTests(unittest.IsolatedAsyncioTestCase):
     async def test_plain_chat_keeps_answer_with_a_json_tool_example(self):
         """Ответ без инструментов не должен проваливать всю fallback-цепочку."""

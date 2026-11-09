@@ -113,7 +113,6 @@ _CODE_SPLIT_RE = re.compile(
 _JSON_TOOL_START_RE = re.compile(r'\{\s*"(?:name|function|tool_calls|id|type)"\s*:')
 _JSON_VALUE_START_RE = re.compile(r"[{[]")
 _JSON_DECODER = json.JSONDecoder()
-_JSON_STREAM_START_RE = re.compile(r'\{\s*(?:$|")')
 
 
 def _is_json_tool_call(value: Any, allowed_names: set[str] | None) -> bool:
@@ -254,16 +253,46 @@ def strip_tool_markup(
     return cleaned
 
 
-def tool_stream_preview(text: str) -> str | None:
-    """Придержать JSON вне кода до конца ответа, не показывая частичный вызов."""
-    # Предпросмотр относится к путям с инструментами: полную имитацию здесь
-    # показывать нельзя (см. drop_json_calls в strip_tool_markup).
+def _unclosed_json_start(segment: str) -> int | None:
+    """Позиция первой незакрытой ``{`` вне JSON-строки (начало недостроенного вызова)."""
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(segment):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            stack.pop()
+    return stack[0] if stack else None
+
+
+def tool_stream_preview(text: str, *, tools_offered: bool = False) -> str | None:
+    """Показать накопленный текст, придержав только недостроенный вызов.
+
+    Задержка нужна лишь когда модели предложены инструменты: тогда текстовый
+    JSON может оказаться имитацией вызова, которую AIClient повторит штатным
+    протоколом. В обычном чате/vision/OCR любой «{"a": 1}» — просто данные,
+    и предпросмотр должен идти дальше. Готовый сбалансированный JSON тоже не
+    задерживается даже в режиме с инструментами (он уже очищен санитайзером).
+    """
+    if not tools_offered:
+        return strip_tool_markup(text, drop_json_calls=False)
     cleaned = strip_tool_markup(text, drop_json_calls=True)
     if not cleaned:
         return None
     parts = _CODE_SPLIT_RE.split(cleaned)
     for index in range(0, len(parts), 2):
-        start = _JSON_STREAM_START_RE.search(parts[index])
-        if start:
-            return ("".join(parts[:index]) + parts[index][:start.start()]).rstrip() or None
+        start = _unclosed_json_start(parts[index])
+        if start is not None:
+            return ("".join(parts[:index]) + parts[index][:start]).rstrip() or None
     return cleaned

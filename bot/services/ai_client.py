@@ -1249,7 +1249,10 @@ class AIClient:
                     parts.append(piece)
                     if on_delta is not None:
                         try:
-                            preview = tool_stream_preview("".join(parts))
+                            preview = tool_stream_preview(
+                                "".join(parts),
+                                tools_offered=bool(payload.get("tools")),
+                            )
                             if preview:
                                 await on_delta(preview)
                         except Exception as exc:  # noqa: BLE001 - UI must not kill the stream

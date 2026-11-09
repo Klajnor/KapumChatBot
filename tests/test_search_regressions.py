@@ -168,8 +168,11 @@ class TextSearchRetryTests(unittest.IsolatedAsyncioTestCase):
             yield "data: [DONE]"
 
         preview = AsyncMock()
+        # Придержание недостроенного JSON нужно только в потоке с инструментами.
         with patch.object(client, "_stream_lines", lines):
-            await client._stream_attempt({"model": "m", "messages": []}, preview)
+            await client._stream_attempt(
+                {"model": "m", "messages": [], "tools": [SEARCH_TOOL]}, preview
+            )
         for call in preview.await_args_list:
             self.assertNotIn("{", call.args[0])
 
