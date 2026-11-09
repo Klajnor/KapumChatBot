@@ -61,6 +61,7 @@ from bot.services.intent import (
 from bot.services.markdown import split_chunks
 from bot.services.mcp import (
     apply_mcp_hint,
+    isolate_mcp_history,
     mcp_available,
     mcp_manager,
     mcp_write_available,
@@ -1519,24 +1520,27 @@ async def _answer_with_ai(
         model=model,
     )
 
-    search_ready = search_configured()
+    mcp_ready = mcp_available(user.id)
+    mcp_only = mcp_ready and isolate_mcp_history(messages)
+    search_ready = not mcp_only and search_configured()
     search_only = search_ready and isolate_search_history(messages)
+    isolated = mcp_only or search_only
     tools: list[dict[str, Any]] = []
     # Without an image intent (when classification ran) the model is not even
     # offered the generation tools, so it cannot draw by accident.
-    allow_images = not search_only and (intent is None or intent is Intent.IMAGE)
+    allow_images = not isolated and (intent is None or intent is Intent.IMAGE)
     if config.enable_image_generation and allow_images:
         tools.append(IMAGE_TOOL)
     if config.enable_sticker_generation and allow_images:
         tools.append(STICKER_TOOL)
-    if config.enable_file_replies and not search_only:
+    if config.enable_file_replies and not isolated:
         tools.append(files_tool())
     if search_ready:
         tools.append(SEARCH_TOOL)
         apply_search_hint(messages)
-    # MCP tools (the Obsidian "second brain") are exposed to owners only by
-    # default; a server that fails to start simply contributes no tools.
-    mcp_ready = not search_only and mcp_available(user.id)
+    # Чтение заметок доступно всем допущенным пользователям; изолированный
+    # веб-поиск не получает MCP. Сбой запуска сервера не ломает обычный ответ.
+    mcp_ready = mcp_ready and not search_only
     if mcp_ready:
         mcp_tools = await mcp_manager.openai_tools()
         if mcp_tools:

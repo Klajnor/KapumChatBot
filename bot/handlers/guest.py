@@ -47,6 +47,7 @@ from bot.services.intent import (
 from bot.services.markdown import render, split_chunks
 from bot.services.mcp import (
     apply_mcp_hint,
+    isolate_mcp_history,
     mcp_available,
     mcp_manager,
     remove_mcp_hint,
@@ -453,6 +454,9 @@ async def _build_reply(
         photo_source = replied
     photo_foreign = _attachment_foreign(message, photo_source, caller_id)
     external = external or photo_foreign
+    # Происхождение текущего запроса сохраняем отдельно от taint истории:
+    # изоляция разрешена только новому собственному тексту пользователя.
+    current_external = external
     # The stored history may already contain an untrusted document/page from
     # an earlier summon. Re-check it every time: a clean current message must
     # not re-enable the paid image tool for text that is still in context.
@@ -599,10 +603,12 @@ async def _build_reply(
     # request both are withheld: third-party text must not steer a paid
     # generation call or reach the private notes.
     messages = [*base_messages, {"role": "user", "content": text}]
+    mcp_ready = mcp_available(caller_id)
+    mcp_only = mcp_ready and not current_external and isolate_mcp_history(messages)
     tools: list[dict[str, Any]] = []
-    if config.enable_image_generation and not external:
+    if config.enable_image_generation and not external and not mcp_only:
         tools.append(IMAGE_TOOL)
-    mcp_ready = not external and mcp_available(caller_id)
+    mcp_ready = mcp_ready and (not external or mcp_only)
     if mcp_ready:
         mcp_tools = await mcp_manager.openai_tools()
         if mcp_tools:

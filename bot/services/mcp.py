@@ -43,7 +43,7 @@ from typing import Any
 
 from bot.config import config
 from bot.services.note_metadata import generate_note_metadata
-from bot.services.untrusted import wrap_untrusted
+from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,10 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 # Appended to the system prompt while read-only MCP tools are offered.
 MCP_SYSTEM_HINT = (
     "Тебе доступен общий «второй мозг» бота — база заметок Obsidian "
-    "(инструменты с префиксом mcp__). Если вопрос может касаться сохранённых "
+    "(инструменты с префиксом mcp__). Это реальный доступ к заметкам через MCP, "
+    "прямой доступ к локальным файлам для него не нужен. На явную просьбу "
+    "поискать в заметках вызови инструмент, а не отвечай, что доступа нет. "
+    "Если вопрос может касаться сохранённых "
     "заметок, проектов, прошлых решений, документации или сохранённых знаний, "
     "сначала найди подходящие заметки (search_notes), при необходимости "
     "прочитай фрагмент (get_chunk) или всю заметку (get_note); если get_note "
@@ -412,6 +415,56 @@ READ_TOOLS = frozenset({"search_notes", "get_chunk", "get_note", "list_notes"})
 # не предлагается модели: бот вызывает его сам, без аргументов, и получает
 # только числовые счётчики (без путей и текста заметок).
 STATUS_TOOL = "brain_status"
+
+
+_MCP_ACTION_RE = re.compile(
+    r"\b(?:найди(?:те)?|найти|поищи(?:те)?|ищи(?:те)?|поиск\w*|"
+    r"посмотри(?:те)?|проверь(?:те)?|покажи(?:те)?|прочитай(?:те)?|открой(?:те)?|"
+    r"search|find|look\s+up|check|show|read|list)\b", re.IGNORECASE,
+)
+_MCP_TARGET_RE = re.compile(
+    r"\b(?:во?\s+(?:(?:мо[её]м|тво[её]м|сво[её]м)\s+)?втором\s+мозге|"
+    r"(?:в|из)\s+(?:(?:моих|твоих|своих|сохран[её]нных|личных)\s+)?замет(?:ках|ок)|"
+    r"по\s+(?:(?:моим|твоим|своим|сохран[её]нным|личным)\s+)?заметкам|"
+    r"в\s+obsidian|(?:in|from|through)\s+(?:(?:my|your|the|our|saved)\s+)?"
+    r"(?:second\s+brain|notes|obsidian|vault)|"
+    r"(?:my|your|our|saved)\s+(?:second\s+brain|notes|vault))\b", re.IGNORECASE,
+)
+_ISOLATED_MCP_HINT = (
+    "Для этого нового запроса ко второму мозгу вся история диалога исключена "
+    "из контекста ради безопасности ранее загруженных материалов. Выполни "
+    "только текущий запрос; если нужны сведения из прежнего диалога, попроси "
+    "пользователя уточнить их. Не выдумывай недостающий контекст."
+)
+
+
+def isolate_mcp_history(messages: list[dict[str, Any]]) -> bool:
+    """Изолировать явный чистый запрос к заметкам от недоверенной истории.
+
+    Вызывается только перед первым раундом и при доступном MCP. Убирает всю
+    прежнюю переписку, включая пересказы документов, но не меняет историю в
+    БД. Вызывающий код обязан оставить только read-only MCP, без веб-поиска,
+    генерации и отправки файлов. Внешний контент в текущем запросе и обычные
+    уточнения не обходят защиту; результаты MCP снова включают общий гейт.
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return False
+    current = messages[-1]
+    text = current.get("content")
+    if (
+        not isinstance(text, str)
+        or messages_have_untrusted_content([current])
+        or not _MCP_ACTION_RE.search(text)
+        or not _MCP_TARGET_RE.search(text)
+        or not messages_have_untrusted_content(messages[:-1])
+    ):
+        return False
+    system = [dict(entry) for entry in messages if entry.get("role") == "system"]
+    for entry in system:
+        entry["content"] = f"{entry.get('content') or ''}\n\n{_ISOLATED_MCP_HINT}".strip()
+    messages[:] = [*system, current]
+    logger.info("Explicit second-brain request isolated from untrusted history")
+    return True
 
 
 def apply_mcp_hint(messages: list[dict[str, Any]]) -> None:
