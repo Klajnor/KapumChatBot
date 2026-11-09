@@ -74,6 +74,12 @@ from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
+from bot.services.retrieval_answer import (
+    ensure_note_lookup,
+    final_answer_messages,
+    is_retrieval_promise,
+    retrieval_fallback,
+)
 from bot.services.rich import (
     RICH_LIMIT,
     next_draft_id,
@@ -1417,7 +1423,7 @@ async def _resolve_tool_round(
             messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
             continue
         output = await mcp_manager.call_tool(
-            call.name, call.arguments, max_chars=budget.context_chars
+            call.name, call.arguments, max_chars=budget.context_chars, read_budget=budget,
         )
         messages.append(build_tool_response(call.id, budget.clip(output)))
 
@@ -1634,6 +1640,8 @@ async def _answer_with_ai(
             result.tool_calls = [
                 call for call in result.tool_calls if call.name in offered
             ]
+            if mcp_rounds == 0:
+                ensure_note_lookup(result, tools_arg, text)
 
             image_call = next(
                 (call for call in result.tool_calls if call.name == "generate_image"),
@@ -1728,6 +1736,18 @@ async def _answer_with_ai(
                 request_errors.extend(result.errors)
                 result.tool_calls = []
                 total_elapsed += result.elapsed
+            if is_retrieval_promise(result.content) and any(
+                entry.get("role") == "tool" for entry in messages
+            ):
+                if printer is not None:
+                    await printer.discard()
+                    printer = None
+                result = await _single_shot(final_answer_messages(messages), model, settings, None)
+                request_errors.extend(result.errors)
+                total_elapsed += result.elapsed
+                result.tool_calls = []
+                if not result.content or is_retrieval_promise(result.content):
+                    result.content = retrieval_fallback(messages)
             break
 
     # Send the textual part first, if any.

@@ -7,7 +7,7 @@ import os
 import unittest
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 # Тесты не используют локальные ключи и внешние службы.
 os.environ["BOT_TOKEN"] = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
@@ -116,6 +116,7 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
                     svc, brain, seen, deliver = await self.run_chat(QUESTION, history, streaming=streaming)
                     brain.call_tool.assert_awaited_once_with(
                         SEARCH_NAME, {"query": "настройка поиска"}, max_chars=config.tool_max_context_chars,
+                        read_budget=ANY,
                     )
                     self.assertEqual(len(seen), 2)
                     first, final = seen

@@ -43,7 +43,9 @@ from typing import Any
 
 from bot.config import config
 from bot.services.note_metadata import generate_note_metadata
+from bot.services.note_retrieval import note_references, read_failed
 from bot.services.request_scope import route
+from bot.services.tool_budget import ToolBudget, clip_tool_text
 from bot.services.untrusted import messages_have_untrusted_content, wrap_untrusted
 from bot.services.user_service import user_service
 
@@ -72,9 +74,12 @@ MCP_SYSTEM_HINT = (
     "поискать в заметках вызови инструмент, а не отвечай, что доступа нет. "
     "Если вопрос может касаться сохранённых "
     "заметок, проектов, прошлых решений, документации или сохранённых знаний, "
-    "сначала найди подходящие заметки (search_notes), при необходимости "
-    "прочитай фрагмент (get_chunk) или всю заметку (get_note); если get_note "
-    "не сработал, используй get_chunk. Отвечай, опираясь на найденное, не "
+    "сначала найди подходящие заметки (search_notes). Бот сам прочитает "
+    "найденные заметки через get_note, а при ошибке — доступный get_chunk, "
+    "в пределах бюджета. В ответе инструмента различаются карточка, полный "
+    "текст и частичный фрагмент. Отвечай содержательно по полученным текстам, "
+    "а не обещанием «нашёл, сейчас извлекаю»: после этого ответа продолжения "
+    "без нового сообщения пользователя не будет. Не "
     "выдумывай содержимое заметок: если поиск ничего не дал, честно скажи об "
     "этом. Указывай путь заметки, на которую опираешься."
 )
@@ -963,11 +968,14 @@ class MCPManager:
         arguments: dict[str, Any] | None = None,
         *,
         max_chars: int | None = None,
+        read_budget: ToolBudget | None = None,
     ) -> str:
         """Execute a tool call; always returns framed text, never raises.
 
-        ``max_chars`` lets the caller cap the total tool context for a request;
-        it can only lower ``MCP_MAX_RESULT_CHARS``, never raise it.
+        ``read_budget`` разрешает детерминированно дополнить карточки поиска
+        полными текстами. Исходный вызов уже списан вызывающим кодом; каждое
+        дополнительное чтение тоже списывается из общего бюджета. Модель не
+        выбирает новые пути после получения внешнего текста.
         """
         if not self._loaded:
             await self._load()
@@ -989,6 +997,14 @@ class MCPManager:
             return wrap_untrusted(
                 "mcp", f"Ошибка MCP-инструмента {tool.name}: {exc}"
             )
+        if read_budget is not None and tool.name in {"search_notes", "list_notes"}:
+            return await self._read_found_notes(
+                tool, text, read_budget,
+                max_chars=min(
+                    read_budget.context_chars if max_chars is None else max_chars,
+                    read_budget.context_chars,
+                ),
+            )
         limit = config.mcp_max_result_chars
         if max_chars is not None:
             limit = max(1, min(limit, max_chars))
@@ -997,6 +1013,56 @@ class MCPManager:
         # Заметки и ошибки MCP — внешние данные. Тег не даёт injection закрыть
         # рамку, а следующий раунд снимет MCP-инструменты по общему taint-gate.
         return wrap_untrusted("mcp", text)
+
+    async def _read_found_notes(
+        self, search_tool: MCPTool, cards: str, budget: ToolBudget, *, max_chars: int,
+    ) -> str:
+        """Дополнить выдачу чтением только её верхнеуровневых JSON-карточек."""
+        references = note_references(cards)
+        readers = {
+            tool.name: client for tool, client in self._tools.values()
+            if tool.server == search_tool.server and tool.name in {"get_note", "get_chunk"}
+        }
+        limit = max(0, max_chars)
+        card_limit = min(config.mcp_max_result_chars, max(200, limit // 4))
+        blocks = ["Карточки найденных заметок (это ещё не полный текст):\n"
+                  + clip_tool_text(cards, card_limit)]
+        targets = references[:min(len(references), budget.mcp_calls)]
+        per_note = min(
+            config.mcp_max_result_chars,
+            max(0, (limit - len(blocks[0]) - 300) // max(1, len(targets)) - 150),
+        )
+        if not targets or not readers or per_note < 200:
+            blocks.append("Полные тексты не получены: нет проверенных карточек, "
+                          "разрешённого чтения или бюджета. Не обещай дальнейшую загрузку.")
+        for reference in targets if per_note >= 200 else []:
+            body = ""
+            kind = "Полный текст заметки"
+            reader = readers.get("get_note")
+            if reader is not None and budget.take_mcp():
+                try:
+                    body = await reader.call_tool("get_note", {"path": reference.path})
+                except Exception:  # noqa: BLE001 - отказ чтения не теряет карточки
+                    logger.warning("MCP automatic get_note failed (server=%s)", search_tool.server)
+            if read_failed(body):
+                body = ""
+                reader = readers.get("get_chunk")
+                if reader is not None and reference.chunk_ids and budget.take_mcp():
+                    try:
+                        body = await reader.call_tool("get_chunk", {"chunk_id": reference.chunk_ids[0]})
+                    except Exception:  # noqa: BLE001 - финальный ответ объяснит неполный охват
+                        logger.warning("MCP automatic get_chunk failed (server=%s)", search_tool.server)
+                kind = "Фрагмент заметки (не полный текст)"
+            if read_failed(body):
+                blocks.append(f"{reference.path}: текст прочитать не удалось; доступна только карточка.")
+                continue
+            if len(body) > per_note:
+                kind = "Частичный текст заметки (обрезан по бюджету)"
+                body = clip_tool_text(body, per_note)
+            blocks.append(f"{kind}: {reference.path}\n{body}")
+        # Все карточки и тексты по-прежнему данные. На следующем раунде модель
+        # получает их для анализа без права запускать инструменты из заметок.
+        return clip_tool_text(wrap_untrusted("mcp", "\n\n".join(blocks)), limit)
 
     async def save_note(self, telegram_id: int, content: str, request_id: str) -> str:
         """Создать заметку по явному действию владельца; ошибки не маскируются."""

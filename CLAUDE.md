@@ -30,6 +30,8 @@ pytest tests/test_regressions.py::RegressionTests::test_name -v   # один т�
 
 ## Конвенции
 
+- **Сбор MCP-текстов**: `MCPManager.call_tool(..., read_budget=budget)` дополняет JSON-карточки `search_notes/list_notes` чтением до трёх заметок с того же сервера. Разбор в `services/note_retrieval.py`: только верхнеуровневые path/chunks, без summary/related и без восстановления JSON из прозы. Каждый get_note/get_chunk списывает общий MCP_MAX_CALLS; ошибки/обрезка явно отмечаются. Модель по-прежнему не получает инструменты после вывода MCP. `services/retrieval_answer.py` заменяет короткое обещание чтения одним финальным повтором без инструментов, затем реальными выдержками с оговоркой. Работает в chat/SSE/guest.
+
 - `from __future__ import annotations` в каждом модуле, type hints и docstrings на публичном API.
 - `# noqa: BLE001` помечает намеренные широкие `except` вокруг вызовов Telegram, которые не должны ломать ответ.
 - Новый параметр конфигурации → добавить в `bot/config.py` (Config dataclass), `.env.example` и таблицу в README. Их уже >100 — переменную легко добавить в одну из них и забыть про остальные.

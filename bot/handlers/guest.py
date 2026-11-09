@@ -54,6 +54,12 @@ from bot.services.mcp import (
 )
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
+from bot.services.retrieval_answer import (
+    ensure_note_lookup,
+    final_answer_messages,
+    is_retrieval_promise,
+    retrieval_fallback,
+)
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.search import build_assistant_tool_message, build_tool_response
@@ -668,6 +674,8 @@ async def _build_reply(
         result.tool_calls = [
             call for call in result.tool_calls if call.name in offered_names
         ]
+        if mcp_rounds == 0:
+            ensure_note_lookup(result, offered_tools, text)
 
         image_call = next(
             (call for call in result.tool_calls if call.name == "generate_image"),
@@ -694,7 +702,7 @@ async def _build_reply(
                     messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
                     continue
                 output = await mcp_manager.call_tool(
-                    call.name, call.arguments, max_chars=budget.context_chars
+                    call.name, call.arguments, max_chars=budget.context_chars, read_budget=budget,
                 )
                 messages.append(build_tool_response(call.id, budget.clip(output)))
             continue
@@ -711,6 +719,17 @@ async def _build_reply(
             ) or ChatResult()
             result.tool_calls = []
             image_call = None
+        if is_retrieval_promise(result.content) and mcp_rounds:
+            previous_elapsed = result.elapsed
+            result = await ai_client.chat_completion_result(
+                messages=final_answer_messages(messages),
+                model=settings["model"], temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"], public=True,
+            ) or ChatResult()
+            result.elapsed += previous_elapsed
+            result.tool_calls = []
+            if not result.content or is_retrieval_promise(result.content):
+                result.content = retrieval_fallback(messages)
         break
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
