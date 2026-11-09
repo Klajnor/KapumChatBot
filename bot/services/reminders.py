@@ -56,11 +56,13 @@ from bot.services.search import (
     build_assistant_tool_message,
     build_tool_response,
     format_search_results,
+    isolate_search_history,
     remove_search_hint,
     search_configured,
     search_web,
 )
 from bot.services.telegram_utils import format_timing, throttle, with_timing
+from bot.services.time_context import current_time_hint
 from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import apply_untrusted_hint, messages_have_untrusted_content
 from bot.services.user_service import UserService
@@ -524,11 +526,7 @@ async def _run_ai_prompt(
     the admin's private notes. Returns the final result and the total time
     spent over all rounds.
     """
-    now = datetime.datetime.now(datetime.UTC).astimezone(get_timezone())
-    system = (
-        f"{settings['system_prompt']}\n\n"
-        f"Текущая дата и время: {now:%Y-%m-%d %H:%M} ({now.tzname()})."
-    )
+    system = f"{settings['system_prompt']}\n\n{current_time_hint(get_timezone())}"
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         *(history or []),
@@ -538,6 +536,7 @@ async def _run_ai_prompt(
     search_ready = search_configured()
     tools = [SEARCH_TOOL] if search_ready else None
     if search_ready:
+        isolate_search_history(messages)
         apply_search_hint(messages)
 
     elapsed = 0.0

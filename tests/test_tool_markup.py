@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
 from bot.config import config
 from bot.services.ai_client import AIClient
 from bot.services.search import SEARCH_TOOL
-from bot.services.tool_markup import TOOL_CALLS_HINT, strip_tool_markup
+from bot.services.tool_markup import (
+    TOOL_CALLS_HINT,
+    strip_tool_markup,
+    tool_stream_preview,
+)
 
 LT = "\x3c"
 
@@ -20,6 +25,37 @@ def tag(name: str, body: str = "", *, attrs: str = "") -> str:
 
 
 class StripToolMarkupTests(unittest.TestCase):
+    def test_json_search_calls_with_preamble_are_not_an_answer(self):
+        call = json.dumps({"name": "web_search", "arguments": {"query": "AI news"}})
+        self.assertIsNone(strip_tool_markup("Запускаю поиск.\n" + call + " " + call))
+
+    def test_json_native_envelope_and_call_list_are_dropped(self):
+        call = {"id": "c1", "type": "function", "function": {
+            "name": "search_web", "arguments": '{"query": "news"}',
+        }}
+        for value in (call, [call], {"tool_calls": [call]}):
+            with self.subTest(value=value):
+                self.assertIsNone(strip_tool_markup(json.dumps(value)))
+
+    def test_json_code_examples_and_unrelated_data_are_preserved(self):
+        call = '{"name": "web_search", "arguments": {"query": "news"}}'
+        for text in (
+            f"Пример: `{call}`", f"Пример:\n```json\n{call}\n```",
+            '{"name": "product", "arguments": {"color": "red"}}',
+            '{"query": "AI news", "results": []}',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(strip_tool_markup(text), text)
+
+    def test_stream_preview_keeps_prose_formulas_and_completed_code_examples(self):
+        for text in (
+            "Обычный ответ.", r"Формула: $\frac{a}{b}$",
+            'Пример: `{"name":"web_search","arguments":{"query":"news"}}`',
+            '```json\n{"name":"web_search","arguments":{"query":"news"}}\n```',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(tool_stream_preview(text), text)
+
     def test_plain_text_and_none_are_untouched(self):
         self.assertIsNone(strip_tool_markup(None))
         self.assertEqual(strip_tool_markup("Обычный ответ."), "Обычный ответ.")

@@ -34,7 +34,13 @@ from bot.services.stickers import (  # noqa: F401 - совместимость �
     prepare_sticker_result,
     to_sticker_webp,
 )
-from bot.services.tool_markup import TOOL_CALLS_HINT, strip_tool_markup
+from bot.services.tool_markup import (
+    TOOL_CALLS_HINT,
+    TOOL_CALLS_RETRY_HINT,
+    has_json_tool_calls,
+    strip_tool_markup,
+    tool_stream_preview,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -906,16 +912,32 @@ class AIClient:
             if status == 200 and data is not None:
                 result = self._parse_result(data, finalize=False)
                 self._recover_search_dsml(result, payload.get("tools") or [])
+                retry_payload = self._text_tool_retry_payload(payload, result)
+                if retry_payload is not None:
+                    errors.append(request_error(
+                        str(payload["model"]), "TEXT_TOOL_CALL", "Text instead of structured tool_calls",
+                        secrets=self._error_secrets(),
+                    ))
+                    payload = retry_payload
+                    status, data, _elapsed = await self._post_chat(
+                        payload, retries=1, model_id=attempt_model, errors=errors
+                    )
+                    result = (
+                        self._parse_result(data, finalize=False)
+                        if status == 200 and data is not None else ChatResult()
+                    )
+                    self._recover_search_dsml(result, payload.get("tools") or [])
                 result.content = self._finalize(result.content)
                 if result.content or result.tool_calls:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
                     result.errors = errors
                     return result
-                errors.append(request_error(
-                    str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
-                    secrets=self._error_secrets(),
-                ))
+                if status == 200 and data is not None:
+                    errors.append(request_error(
+                        str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
+                        secrets=self._error_secrets(),
+                    ))
 
             logger.warning(
                 "Model %s did not answer with tools (status %s); "
@@ -1085,6 +1107,20 @@ class AIClient:
                     attempt_model,
                     allow_retry=not tools,
                 )
+                self._recover_search_dsml(result, payload.get("tools") or [])
+                retry_payload = self._text_tool_retry_payload(payload, result)
+                if retry_payload is not None:
+                    errors.extend(result.errors)
+                    errors.append(request_error(
+                        str(payload["model"]), "TEXT_TOOL_CALL", "Text instead of structured tool_calls",
+                        secrets=self._error_secrets(),
+                    ))
+                    payload = retry_payload
+                    result = await self._stream_attempt_with_thinking_fallback(
+                        payload, on_delta, attempt_model, allow_retry=False,
+                    )
+                    self._recover_search_dsml(result, payload.get("tools") or [])
+                result.content = self._finalize(result.content)
             except AIStreamError as exc:
                 errors.extend(self._stream_errors(payload, exc))
                 last_error = exc
@@ -1209,7 +1245,9 @@ class AIClient:
                     parts.append(piece)
                     if on_delta is not None:
                         try:
-                            await on_delta("".join(parts))
+                            preview = tool_stream_preview("".join(parts))
+                            if preview:
+                                await on_delta(preview)
                         except Exception as exc:  # noqa: BLE001 - UI must not kill the stream
                             logger.warning("Stream on_delta failed: %s", exc)
                 for raw in delta.get("tool_calls") or []:
@@ -1252,7 +1290,7 @@ class AIClient:
             len(tool_calls),
         )
         return ChatResult(
-            content=self._finalize(content),
+            content=content,
             tool_calls=tool_calls,
             elapsed=time.monotonic() - started,
             usage=usage,
@@ -1791,6 +1829,30 @@ class AIClient:
         return None
 
     # --- Internals ---------------------------------------------------------
+
+    @staticmethod
+    def _text_tool_retry_payload(
+        payload: dict[str, Any], result: ChatResult,
+    ) -> dict[str, Any] | None:
+        """Один повтор JSON-имитации через штатный протокол, без исполнения текста."""
+        offered = {
+            str((tool.get("function") or {}).get("name", ""))
+            for tool in payload.get("tools") or []
+        }
+        if not offered or result.tool_calls or not has_json_tool_calls(result.content, allowed_names=offered):
+            return None
+        logger.warning("Model returned JSON tool calls in content; retrying with native tools")
+        # Не добавляем имитацию в messages: её аргументы не доверены, а даты
+        # могут быть выдуманы. Исходные messages и tools остаются неизменными.
+        retry = {
+            **payload,
+            "messages": AIClient._with_hint(payload["messages"], TOOL_CALLS_RETRY_HINT),
+        }
+        if "search_web" in offered and has_json_tool_calls(result.content, allowed_names={"search_web"}):
+            # Попросить провайдера именно о штатном поисковом вызове. Запрос
+            # модель строит заново — аргументы текстового JSON не исполняются.
+            retry["tool_choice"] = {"type": "function", "function": {"name": "search_web"}}
+        return retry
 
     @staticmethod
     def is_vision_model(model: str) -> bool:

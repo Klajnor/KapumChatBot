@@ -71,6 +71,7 @@ from bot.services.outgoing_files import files_tool, prepare_files
 from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
+from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
 from bot.services.rich import (
     RICH_LIMIT,
@@ -85,6 +86,7 @@ from bot.services.search import (
     build_assistant_tool_message,
     build_tool_response,
     format_search_results,
+    isolate_search_history,
     remove_search_hint,
     search_configured,
     search_web,
@@ -108,6 +110,7 @@ from bot.services.telegram_utils import (
 )
 from bot.services.telegraph import needs_telegraph, notice_text, publish_answer
 from bot.services.themed_responses import get_random_themed_response
+from bot.services.time_context import current_time_hint
 from bot.services.tool_budget import CALL_LIMIT_NOTICE, ToolBudget
 from bot.services.untrusted import (
     apply_untrusted_hint,
@@ -1500,7 +1503,7 @@ async def _answer_with_ai(
         )
     history = await service.get_history(message.chat.id, user_id=user.id)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": settings["system_prompt"]},
+        {"role": "system", "content": f"{settings['system_prompt']}\n\n{current_time_hint(get_timezone())}"},
         *history,
         {"role": "user", "content": text},
     ]
@@ -1516,23 +1519,24 @@ async def _answer_with_ai(
         model=model,
     )
 
+    search_ready = search_configured()
+    search_only = search_ready and isolate_search_history(messages)
     tools: list[dict[str, Any]] = []
     # Without an image intent (when classification ran) the model is not even
     # offered the generation tools, so it cannot draw by accident.
-    allow_images = intent is None or intent is Intent.IMAGE
+    allow_images = not search_only and (intent is None or intent is Intent.IMAGE)
     if config.enable_image_generation and allow_images:
         tools.append(IMAGE_TOOL)
     if config.enable_sticker_generation and allow_images:
         tools.append(STICKER_TOOL)
-    if config.enable_file_replies:
+    if config.enable_file_replies and not search_only:
         tools.append(files_tool())
-    search_ready = search_configured()
     if search_ready:
         tools.append(SEARCH_TOOL)
         apply_search_hint(messages)
     # MCP tools (the Obsidian "second brain") are exposed to owners only by
     # default; a server that fails to start simply contributes no tools.
-    mcp_ready = mcp_available(user.id)
+    mcp_ready = not search_only and mcp_available(user.id)
     if mcp_ready:
         mcp_tools = await mcp_manager.openai_tools()
         if mcp_tools:
