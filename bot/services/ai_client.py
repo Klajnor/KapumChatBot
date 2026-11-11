@@ -28,6 +28,7 @@ from bot.services.ai_errors import AIRequestError, provider_error, request_error
 from bot.services.http_body import read_bounded
 from bot.services.http_redirect import warn_redirect_blocked
 from bot.services.image_tools import canonical_operations
+from bot.services.request_scope import WEB_MARKER_RE
 from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
     STICKER_MAX_BYTES,
@@ -2240,10 +2241,24 @@ class AIClient:
             payload.update(thinking.payload_fields())
             if config.builtin_web_search(model):
                 payload["enable_search"] = True
-                payload["search_options"] = {
+                last_user_text = next(
+                    (
+                        str(entry.get("content") or "")
+                        for entry in reversed(messages)
+                        if entry.get("role") == "user"
+                    ),
+                    "",
+                )
+                search_options: dict[str, Any] = {
                     "search_strategy": "turbo",
                     "enable_source": True,
                 }
+                # The provider lets the model skip search even when the user
+                # explicitly says «найди в интернете». Force it for such
+                # requests; an ordinary question remains model-decided.
+                if WEB_MARKER_RE.search(last_user_text):
+                    search_options["forced_search"] = True
+                payload["search_options"] = search_options
         return payload
 
     @staticmethod

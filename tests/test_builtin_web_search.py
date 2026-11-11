@@ -99,6 +99,20 @@ class BuiltinSearchPayloadTests(unittest.TestCase):
             native["parameters"]["search_options"]["search_strategy"], "turbo"
         )
 
+    def test_explicit_internet_request_forces_provider_search(self):
+        client = AIClient(api_key="test")
+        with patch.object(config, "builtin_web_search", return_value=True):
+            payload = client._chat_payload(
+                [{"role": "user", "content": "Найди в интернете погоду в Москве"}],
+                "qwen3.8-flash",
+                0.2,
+                100,
+                public=True,
+            )
+        self.assertTrue(payload["search_options"]["forced_search"])
+        native = _native_payload(payload)
+        self.assertTrue(native["parameters"]["search_options"]["forced_search"])
+
     def test_internal_payload_does_not_enable_provider_search(self):
         client = AIClient(api_key="test")
         with patch.object(config, "builtin_web_search", return_value=True):

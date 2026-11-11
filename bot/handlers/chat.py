@@ -74,7 +74,7 @@ from bot.services.pdf_ocr import ocr_pdf
 from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
-from bot.services.request_scope import route
+from bot.services.request_scope import WEB_MARKER_RE, route
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -1568,7 +1568,14 @@ async def _answer_with_ai(
     # available in every request, including notes-only and externally sourced
     # ones. MCP, generation and file sending keep their own taint gate below.
     builtin_search = config.builtin_web_search(model)
-    search_ready = search_configured() and not builtin_search
+    explicit_web = bool(WEB_MARKER_RE.search(text))
+    # Provider search is preferred, but an explicit «найди в интернете»
+    # also offers the local tool as a fallback: some models/regions return
+    # no sources for a forced built-in search and otherwise answer that
+    # they have no internet access.
+    search_ready = search_configured() and (
+        not builtin_search or explicit_web
+    )
     search_only = (
         not combined
         and (search_ready or builtin_search)

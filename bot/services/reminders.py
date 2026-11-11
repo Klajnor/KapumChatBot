@@ -49,6 +49,7 @@ from bot.services.access import check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
 from bot.services.operations import stage, tracked
+from bot.services.request_scope import WEB_MARKER_RE
 from bot.services.rich import send_rich_to
 from bot.services.search import (
     SEARCH_TOOL,
@@ -534,7 +535,10 @@ async def _run_ai_prompt(
     ]
     model = settings["model"]
     builtin_search = config.builtin_web_search(model)
-    search_ready = search_configured() and not builtin_search
+    explicit_web = bool(WEB_MARKER_RE.search(due.text))
+    search_ready = search_configured() and (
+        not builtin_search or explicit_web
+    )
     tools = [SEARCH_TOOL] if search_ready else None
     if search_ready or builtin_search:
         isolate_search_history(messages)

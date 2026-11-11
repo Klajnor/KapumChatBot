@@ -133,7 +133,9 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
             add_message=AsyncMock(return_value=SimpleNamespace(id=1)),
         )
 
-    async def _run(self, text: str, *, search: bool, history=None):
+    async def _run(
+        self, text: str, *, search: bool, history=None, builtin: bool = False
+    ):
         message, service = self._message(), self._service(history)
         single = AsyncMock(return_value=ChatResult(content="done", elapsed=0.1))
         deliver = AsyncMock(return_value=True)
@@ -146,7 +148,7 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "enable_web_search", search),
             patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_key", "tvly-test"),
-            patch.object(config, "builtin_web_search", return_value=False),
+            patch.object(config, "builtin_web_search", return_value=builtin),
             patch.object(chat, "waiting", _no_wait),
             patch.object(chat, "_single_shot", single),
             patch.object(chat, "deliver_answer", deliver),
@@ -165,6 +167,14 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
             search=True,
         )
         self.assertEqual(names, {"search_web"})
+
+    async def test_explicit_web_request_keeps_local_search_fallback_with_builtin(self):
+        names, _deliver = await self._run(
+            "найди в интернете погоду в Москве",
+            search=True,
+            builtin=True,
+        )
+        self.assertIn("search_web", names)
 
     async def test_search_results_keep_refinement_search_only(self):
         names, _deliver = await self._run(

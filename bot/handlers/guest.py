@@ -55,7 +55,7 @@ from bot.services.mcp import (
 )
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
-from bot.services.request_scope import route
+from bot.services.request_scope import WEB_MARKER_RE, route
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -640,7 +640,10 @@ async def _build_reply(
     # in every guest request; external content still withholds MCP, image
     # generation and file sending.
     builtin_search = config.builtin_web_search(settings["model"])
-    search_ready = search_configured() and not builtin_search
+    explicit_web = bool(WEB_MARKER_RE.search(text))
+    search_ready = search_configured() and (
+        not builtin_search or explicit_web
+    )
     if search_ready:
         tools.append(SEARCH_TOOL)
         apply_search_hint(messages)
