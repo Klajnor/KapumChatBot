@@ -23,6 +23,7 @@ from bot.handlers.chat import (
     DEFAULT_VIDEO_PROMPT,
     _compose_document_context,
     _without_mcp_tools,
+    _without_search_tool,
     _without_untrusted_side_effects,
     read_links,
 )
@@ -64,7 +65,16 @@ from bot.services.retrieval_answer import (
 from bot.services.retrieval_plan import apply_combined_hint, isolate_combined_history
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
-from bot.services.search import build_assistant_tool_message, build_tool_response
+from bot.services.search import (
+    SEARCH_TOOL,
+    apply_search_hint,
+    build_assistant_tool_message,
+    build_tool_response,
+    format_search_results,
+    remove_search_hint,
+    search_configured,
+    search_web,
+)
 from bot.services.telegram_utils import (
     PARSE_MODES,
     format_timing,
@@ -625,17 +635,29 @@ async def _build_reply(
         # vision-пути выше). После вырезания истории тегов больше нет.
         remove_untrusted_hint(messages)
     tools: list[dict[str, Any]] = []
+    # Prefer the provider's built-in search for models that support it; the
+    # local search_web tool is the fallback for the others. Search is available
+    # in every guest request; external content still withholds MCP, image
+    # generation and file sending.
+    builtin_search = config.builtin_web_search(settings["model"])
+    search_ready = search_configured() and not builtin_search
+    if search_ready:
+        tools.append(SEARCH_TOOL)
+        apply_search_hint(messages)
     if config.enable_image_generation and not external and not mcp_only:
         tools.append(IMAGE_TOOL)
     mcp_ready = mcp_ready and (not external or mcp_only)
     if mcp_ready:
         tools.extend(mcp_tools)
     if combined:
-        # Guest API по-прежнему не выполняет веб-поиск. Не изображаем наличие
-        # веб-источников, но разрешаем безопасно прочитать часть из заметок.
-        apply_combined_hint(messages, web_available=False, notes_available=mcp_ready)
+        apply_combined_hint(
+            messages,
+            web_available=search_ready or builtin_search,
+            notes_available=mcp_ready,
+        )
 
     budget = ToolBudget()
+    search_rounds = 0
     mcp_rounds = 0
     result = ChatResult()
     while True:
@@ -688,6 +710,11 @@ async def _build_reply(
             (call for call in result.tool_calls if call.name == "generate_image"),
             None,
         )
+        search_calls = (
+            [call for call in result.tool_calls if call.name == "search_web"]
+            if search_ready
+            else []
+        )
         mcp_calls = (
             [
                 call for call in result.tool_calls
@@ -696,14 +723,50 @@ async def _build_reply(
             if mcp_ready
             else []
         )
+        can_search = (
+            bool(search_calls)
+            and search_rounds < config.max_search_rounds
+            and budget.search_left
+        )
         can_mcp = (
             bool(mcp_calls)
             and mcp_rounds < config.mcp_max_rounds
             and budget.mcp_left
         )
-        if mcp_calls and image_call is None and can_mcp:
-            mcp_rounds += 1
-            messages.append(build_assistant_tool_message(result.content, mcp_calls))
+        if (search_calls or mcp_calls) and image_call is None and (can_search or can_mcp):
+            messages.append(
+                build_assistant_tool_message(
+                    result.content, [*search_calls, *mcp_calls]
+                )
+            )
+            if search_calls:
+                search_rounds += 1
+            if mcp_calls:
+                mcp_rounds += 1
+            for call in search_calls:
+                if not budget.take_search():
+                    messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
+                    continue
+                query = str(call.arguments.get("query") or "").strip()
+                max_results = call.arguments.get("max_results")
+                if not isinstance(max_results, int) or isinstance(max_results, bool):
+                    max_results = None
+                found = await search_web(query, max_results) if query else []
+                failed = bool(getattr(found, "error", "") or "")
+                messages.append(
+                    build_tool_response(
+                        call.id,
+                        budget.clip(
+                            format_search_results(query, found, failed=failed)
+                        ),
+                    )
+                )
+                if failed:
+                    # Do not offer a broken provider again on the next round.
+                    search_ready = False
+                    tools = _without_search_tool(tools)
+                    remove_search_hint(messages)
+                    logger.warning("Guest web search failed; retrying without it")
             for call in mcp_calls:
                 if not budget.take_mcp():
                     messages.append(build_tool_response(call.id, CALL_LIMIT_NOTICE))
@@ -713,12 +776,12 @@ async def _build_reply(
                 )
                 messages.append(build_tool_response(call.id, budget.clip(output)))
             continue
-        if mcp_calls and not result.content and image_call is None:
-            # Budget spent and the model only asked for notes: one final
-            # tools-less request so the guest still gets an answer.
-            logger.info("Guest MCP round limit reached; forcing a final answer")
+        if (search_calls or mcp_calls) and not result.content and image_call is None:
+            # Round/budget limit reached and the model only asked for tools:
+            # one final tools-less request so the guest still gets an answer.
+            logger.info("Guest tool round limit reached; forcing a final answer")
             result = await ai_client.chat_completion_result(
-                messages=messages,
+                messages=final_answer_messages(messages),
                 model=settings["model"],
                 temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"],
@@ -726,8 +789,21 @@ async def _build_reply(
             ) or ChatResult()
             result.tool_calls = []
             image_call = None
+        if not result.content and not result.tool_calls and image_call is None:
+            # No answer and no usable tool call (for example, a tool was
+            # filtered out or the search provider failed): ask once more
+            # without tools instead of returning an error.
+            logger.info("Guest model returned no answer; forcing a final request")
+            result = await ai_client.chat_completion_result(
+                messages=final_answer_messages(messages),
+                model=settings["model"],
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"],
+                public=True,
+            ) or ChatResult()
+            result.tool_calls = []
         if is_retrieval_promise(result.content) and (
-            mcp_rounds or route(text) in {"notes", "combined"}
+            search_rounds or mcp_rounds or route(text) in {"notes", "combined"}
         ):
             previous_elapsed = result.elapsed
             result = await ai_client.chat_completion_result(

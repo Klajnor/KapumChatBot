@@ -1563,8 +1563,17 @@ async def _answer_with_ai(
     request_route = route(text) if not messages_have_untrusted_content([messages[-1]]) else None
     combined = request_route == "combined" and isolate_combined_history(messages)
     mcp_only = not combined and mcp_ready and isolate_mcp_history(messages)
-    search_ready = not mcp_only and request_route != "notes" and search_configured()
-    search_only = not combined and search_ready and isolate_search_history(messages)
+    # Prefer the provider's built-in web search when the selected model
+    # supports it; otherwise offer the local search_web tool. Search remains
+    # available in every request, including notes-only and externally sourced
+    # ones. MCP, generation and file sending keep their own taint gate below.
+    builtin_search = config.builtin_web_search(model)
+    search_ready = search_configured() and not builtin_search
+    search_only = (
+        not combined
+        and (search_ready or builtin_search)
+        and isolate_search_history(messages)
+    )
     isolated = combined or mcp_only or search_only or request_route == "notes"
     tools: list[dict[str, Any]] = []
     # Without an image intent (when classification ran) the model is not even
@@ -1585,7 +1594,11 @@ async def _answer_with_ai(
     if mcp_ready:
         tools.extend(mcp_tools)
     if combined:
-        apply_combined_hint(messages, web_available=search_ready, notes_available=mcp_ready)
+        apply_combined_hint(
+            messages,
+            web_available=search_ready or builtin_search,
+            notes_available=mcp_ready,
+        )
     tools_arg: list[dict[str, Any]] | None
     printer: _StreamPrinter | None = None
     total_elapsed = 0.0
@@ -1614,19 +1627,6 @@ async def _answer_with_ai(
                     remove_mcp_hint(messages)
                     logger.info(
                         "MCP tools withheld: the request contains untrusted content"
-                    )
-                # A document/page/forward must not be able to steer web search
-                # either: the query would be a paid call and an exfiltration
-                # channel. Search results themselves are allowed so a search
-                # round can still refine its own query.
-                if search_ready and messages_have_untrusted_content(
-                    messages, ignore_sources={"search"}
-                ):
-                    search_ready = False
-                    remove_search_hint(messages)
-                    logger.info(
-                        "Search tool withheld: the request contains external "
-                        "untrusted content"
                     )
             if mcp_ready:
                 apply_mcp_hint(messages)

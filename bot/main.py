@@ -260,6 +260,8 @@ async def main() -> None:
         if config.enable_digest:
             digest_task = asyncio.create_task(digest_scheduler_loop())
 
+        logger.info("AI chat protocol: %s", config.ai_api_type)
+
         # Hide curated models the account cannot access via the API.
         available = await ai_client.refresh_available_models()
         logger.info(

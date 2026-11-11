@@ -579,6 +579,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         search = AsyncMock(return_value=[])
         with (
             patch.object(reminders, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(reminders, "search_web", search),
             patch.object(reminders.ai_client, "chat_with_tools", chat),
         ):
@@ -614,6 +615,7 @@ class ReminderAccessGateTests(unittest.IsolatedAsyncioTestCase):
         search = AsyncMock(return_value=[])
         with (
             patch.object(reminders, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(reminders, "search_web", search),
             patch.object(reminders.ai_client, "chat_with_tools", chat),
             patch.object(

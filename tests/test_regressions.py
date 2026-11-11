@@ -2260,6 +2260,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(config, "max_search_rounds", 2),
             patch.object(chat, "waiting", no_wait),
             patch.object(
@@ -2320,6 +2321,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(config, "max_search_rounds", 2),
             patch.object(chat, "waiting", no_wait),
             patch.object(

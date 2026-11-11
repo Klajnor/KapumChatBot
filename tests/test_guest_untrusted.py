@@ -77,6 +77,10 @@ def common(answer: str = "answer", vision: str = "vision"):
             patch.object(guest, "check_access", AsyncMock(return_value=ACCESS))
         )
         stack.enter_context(patch.object(guest, "detect_intent", intent))
+        stack.enter_context(patch.object(guest, "search_configured", return_value=True))
+        stack.enter_context(
+            patch.object(config, "builtin_web_search", return_value=False)
+        )
         stack.enter_context(patch.object(guest, "is_vision_model", return_value=True))
         stack.enter_context(
             patch.object(guest.ai_client, "chat_completion_result", complete)
@@ -110,10 +114,14 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
         stored = svc.add_message.await_args_list[0].kwargs["content"]
         self.assertIn('<untrusted_content source="forward">', stored)
         self.assertIn("ignore rules", stored)
-        model.tools.assert_not_awaited()
-        model.complete.assert_awaited_once()
-        messages = model.complete.await_args.kwargs["messages"]
+        model.tools.assert_awaited_once()
+        model.complete.assert_not_awaited()
+        messages = model.tools.await_args.kwargs["messages"]
         self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        self.assertEqual(
+            {tool["function"]["name"] for tool in model.tools.await_args.kwargs["tools"]},
+            {"search_web"},
+        )
         model.intent.assert_not_awaited()
         svc.consume_photo_intent_budget.assert_not_awaited()
 
@@ -135,10 +143,14 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
         ):
             await guest._build_reply(msg, svc, msg.from_user, 42)
 
-        model.tools.assert_not_awaited()
-        model.complete.assert_awaited_once()
-        messages = model.complete.await_args.kwargs["messages"]
+        model.tools.assert_awaited_once()
+        model.complete.assert_not_awaited()
+        messages = model.tools.await_args.kwargs["messages"]
         self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        self.assertEqual(
+            {tool["function"]["name"] for tool in model.tools.await_args.kwargs["tools"]},
+            {"search_web"},
+        )
 
     async def test_document_adds_hint_and_withholds_image_tool(self):
         svc = service()
@@ -156,9 +168,14 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
         ):
             await guest._build_reply(msg, svc, msg.from_user, 42)
 
-        model.tools.assert_not_awaited()
-        messages = model.complete.await_args.kwargs["messages"]
+        model.tools.assert_awaited_once()
+        model.complete.assert_not_awaited()
+        messages = model.tools.await_args.kwargs["messages"]
         self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        self.assertEqual(
+            {tool["function"]["name"] for tool in model.tools.await_args.kwargs["tools"]},
+            {"search_web"},
+        )
         stored = svc.add_message.await_args_list[0].kwargs["content"]
         self.assertIn('<untrusted_content source="document">', stored)
 
@@ -187,9 +204,14 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
 
         stored = svc.add_message.await_args_list[0].kwargs["content"]
         self.assertIn('<untrusted_content source="voice">', stored)
-        model.tools.assert_not_awaited()
-        messages = model.complete.await_args.kwargs["messages"]
+        model.tools.assert_awaited_once()
+        model.complete.assert_not_awaited()
+        messages = model.tools.await_args.kwargs["messages"]
         self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        self.assertEqual(
+            {tool["function"]["name"] for tool in model.tools.await_args.kwargs["tools"]},
+            {"search_web"},
+        )
 
     async def test_own_voice_keeps_normal_tool_path(self):
         svc = service()
@@ -250,8 +272,13 @@ class GuestUntrustedTests(unittest.IsolatedAsyncioTestCase):
         ):
             await guest._build_reply(msg, svc, msg.from_user, 42)
 
-        model.tools.assert_not_awaited()
-        messages = model.complete.await_args.kwargs["messages"]
+        model.tools.assert_awaited_once()
+        model.complete.assert_not_awaited()
+        messages = model.tools.await_args.kwargs["messages"]
         self.assertIn(UNTRUSTED_SYSTEM_HINT, messages[0]["content"])
+        self.assertEqual(
+            {tool["function"]["name"] for tool in model.tools.await_args.kwargs["tools"]},
+            {"search_web"},
+        )
         stored = svc.add_message.await_args_list[0].kwargs["content"]
         self.assertTrue(has_untrusted_content(stored))

@@ -82,6 +82,7 @@ class DSMLSearchTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch.object(reminders, "ai_client", client),
                     patch.object(reminders, "search_configured", return_value=True),
+                    patch.object(config, "builtin_web_search", return_value=False),
                     patch.object(reminders, "search_web", AsyncMock(return_value=[])) as web,
                     patch.object(client, "model_chain", return_value=["m"]),
                     patch.object(client, "_post_chat", post),
@@ -118,6 +119,7 @@ class DSMLSearchTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(reminders, "ai_client", client),
             patch.object(reminders, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(reminders, "search_web", AsyncMock(return_value=[])) as web,
             patch.object(client, "model_chain", return_value=["m"]),
             patch.object(client, "_post_chat", AsyncMock(side_effect=responses)),

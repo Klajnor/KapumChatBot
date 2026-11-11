@@ -561,16 +561,168 @@ def _extract_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     return usage if isinstance(usage, dict) and usage else None
 
 
-def _derive_native_base_url(compatible_base_url: str) -> str:
+def _derive_native_base_url(base_url: str) -> str:
     """Convert an OpenAI-compatible base URL to the DashScope native API base.
 
-    ``.../compatible-mode/v1`` -> ``.../api/v1`` (used by image generation).
+    ``.../compatible-mode/v1`` -> ``.../api/v1``; an already native base is
+    returned unchanged. Used by chat, image generation and ASR fallbacks.
     """
-    base = compatible_base_url.rstrip("/")
+    base = (base_url or "").rstrip("/")
     suffix = "/compatible-mode/v1"
     if base.endswith(suffix):
         return base[: -len(suffix)] + "/api/v1"
-    return config.image_api_url or f"{base}/api/v1"
+    if base.endswith("/api/v1"):
+        return base
+    return f"{base}/api/v1" if base else ""
+
+
+def _derive_compatible_base_url(base_url: str) -> str:
+    """Convert a native DashScope base URL to the OpenAI-compatible one.
+
+    ``.../api/v1`` -> ``.../compatible-mode/v1``; any other base is kept:
+    model listing and the ASR HTTP fallback always use the compatible protocol.
+    """
+    base = (base_url or "").rstrip("/")
+    suffix = "/api/v1"
+    if base.endswith(suffix):
+        return base[: -len(suffix)] + "/compatible-mode/v1"
+    return base
+
+
+def _native_content_parts(content: list[Any]) -> list[dict[str, Any]]:
+    """Convert OpenAI-style content parts to DashScope native parts.
+
+    Text becomes ``{"text": ...}`` and ``image_url`` becomes ``{"image": ...}``.
+    Unknown parts are left untouched instead of silently dropping data.
+    """
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            parts.append({"text": part["text"]})
+        elif part.get("type") == "image_url":
+            reference = part.get("image_url")
+            url = (
+                reference.get("url")
+                if isinstance(reference, dict)
+                else reference
+            )
+            if isinstance(url, str) and url:
+                parts.append({"image": url})
+        elif isinstance(part.get("text"), str) and set(part) <= {"text", "type"}:
+            parts.append({"text": part["text"]})
+        else:
+            parts.append(dict(part))
+    return parts
+
+
+def _native_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI chat messages to the DashScope native request format."""
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        entry = dict(message)
+        content = entry.get("content")
+        if isinstance(content, list):
+            entry["content"] = _native_content_parts(content)
+        raw_calls = entry.get("tool_calls")
+        if isinstance(raw_calls, list):
+            calls = []
+            for raw in raw_calls:
+                if not isinstance(raw, dict):
+                    continue
+                call = dict(raw)
+                function = dict(call.get("function") or {})
+                arguments = function.get("arguments")
+                if isinstance(arguments, (dict, list)):
+                    function["arguments"] = json.dumps(arguments, ensure_ascii=False)
+                call["function"] = function
+                calls.append(call)
+            entry["tool_calls"] = calls
+            if entry.get("content") is None:
+                # DashScope sends an empty content field with tool calls.
+                entry["content"] = ""
+        converted.append(entry)
+    return converted
+
+
+def _native_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap an OpenAI-shaped chat payload into DashScope native fields.
+
+    Native requests put generation settings and tools inside ``parameters``
+    and the conversation inside ``input.messages``. ``stream_options`` and
+    other OpenAI-only fields are not sent.
+    """
+    parameters: dict[str, Any] = {"result_format": "message"}
+    for key in (
+        "temperature",
+        "max_tokens",
+        "enable_thinking",
+        "thinking_budget",
+        "reasoning_effort",
+        "parallel_tool_calls",
+        "enable_search",
+        "search_options",
+    ):
+        if key in payload:
+            parameters[key] = payload[key]
+    if payload.get("stream"):
+        parameters["incremental_output"] = True
+    if payload.get("tools"):
+        parameters["tools"] = payload["tools"]
+    if payload.get("tool_choice"):
+        parameters["tool_choice"] = payload["tool_choice"]
+    return {
+        "model": payload.get("model"),
+        "input": {"messages": _native_messages(payload.get("messages") or [])},
+        "parameters": parameters,
+    }
+
+
+def _native_response(data: dict[str, Any]) -> dict[str, Any]:
+    """Convert a native DashScope response into the OpenAI-shaped envelope.
+
+    The rest of the client (parsing, usage, finalisation) stays protocol
+    agnostic: it always sees ``choices[0].message``.
+    """
+    output = data.get("output")
+    if not isinstance(output, dict):
+        return data
+    choices = output.get("choices")
+    if isinstance(choices, list) and choices:
+        converted: list[dict[str, Any]] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            delta_part = choice.get("delta")
+            if isinstance(message, dict) and isinstance(delta_part, dict):
+                message = {**delta_part, **message}
+            elif not isinstance(message, dict):
+                message = delta_part
+            message = dict(message) if isinstance(message, dict) else {}
+            if message.get("content") is None and message.get("tool_calls"):
+                message["content"] = ""
+            converted.append(
+                {
+                    "finish_reason": choice.get("finish_reason"),
+                    "message": message,
+                }
+            )
+        if converted:
+            return {**data, "choices": converted}
+    text = output.get("text")
+    if isinstance(text, str):
+        return {
+            **data,
+            "choices": [
+                {
+                    "finish_reason": output.get("finish_reason"),
+                    "message": {"role": "assistant", "content": text},
+                }
+            ],
+        }
+    return {**data, "choices": []}
 
 
 # HTTP statuses that are not model-specific: switching to the next model in the
@@ -602,15 +754,19 @@ def _without_thinking(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 class AIClient:
-    """Async client for Qwen (OpenAI-compatible chat + DashScope native APIs)."""
+    """Async client for Qwen (native DashScope chat by default, compatible mode optional)."""
 
     def __init__(self, *, api_key: str | None = None, base_url: str | None = None) -> None:
         self.api_key = api_key or config.ai_api_key
         self.base_url = (base_url or config.ai_base_url).rstrip("/")
+        # Model listing and the ASR HTTP fallback always speak the compatible
+        # protocol, even when chat itself uses the native DashScope API.
+        self.compat_base_url = _derive_compatible_base_url(self.base_url)
         self.native_base_url = (
             config.image_api_url.rstrip("/")
             or _derive_native_base_url(self.base_url)
         )
+        self.api_type = config.ai_api_type
         self._session: aiohttp.ClientSession | None = None
         # Provider model IDs reported as available, per provider base URL
         # (a missing / ``None`` entry = unknown).
@@ -653,7 +809,7 @@ class AIClient:
         given provider (default: ``AI_BASE_URL``). Returns ``None`` when the
         request fails so callers can fall back gracefully.
         """
-        url = f"{(base_url or self.base_url).rstrip('/')}/models"
+        url = f"{_derive_compatible_base_url(base_url or self.base_url)}/models"
         logger.info("AI API request: method=GET path=/models")
         try:
             session = await self._get_session()
@@ -688,10 +844,62 @@ class AIClient:
             return None
         return {"Authorization": f"Bearer {api_key}"}
 
-    def _route(self, model_id: str | None) -> tuple[str, dict[str, str] | None]:
-        """``(chat/completions URL, header override)`` for an internal model id."""
+    def _model_api_type(self, model_id: str | None) -> str:
+        """API type configured for one model, falling back to the global one."""
+        if not model_id:
+            return self.api_type
         spec = config.resolve_model(model_id)
-        base = (spec.get("base_url") or self.base_url).rstrip("/")
+        return str(spec.get("api_type") or self.api_type)
+
+    def _uses_native(self, model_id: str | None) -> bool:
+        """True when chat requests for this model use the native DashScope API."""
+        return bool(model_id) and self._model_api_type(model_id) == "dashscope"
+
+    @staticmethod
+    def _payload_has_image(payload: dict[str, Any]) -> bool:
+        """True when the OpenAI-shaped payload contains an image part."""
+        for message in payload.get("messages") or []:
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url"
+                for part in content
+            ):
+                return True
+        return False
+
+    def _native_chat_url(
+        self, spec: dict[str, Any], payload: dict[str, Any]
+    ) -> str:
+        """Native generation endpoint for a model.
+
+        Text-only models use ``text-generation``; vision models (and any
+        request that actually carries an image) use ``multimodal-generation``
+        — Qwen 3.8 Max and the Qwen-VL family reject the text endpoint.
+        """
+        if spec.get("vision") or self._payload_has_image(payload):
+            path = "/services/aigc/multimodal-generation/generation"
+        else:
+            path = "/services/aigc/text-generation/generation"
+        base = _derive_native_base_url(spec.get("base_url") or self.base_url)
+        return f"{base}{path}"
+
+    def _route(
+        self,
+        model_id: str | None,
+        *,
+        native: bool = False,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str] | None]:
+        """``(request URL, header override)`` for an internal model id."""
+        spec = config.resolve_model(model_id)
+        if native:
+            return (
+                self._native_chat_url(spec, payload or {}),
+                self._auth_headers(spec.get("api_key")),
+            )
+        base = _derive_compatible_base_url(
+            spec.get("base_url") or self.base_url
+        )
         return f"{base}/chat/completions", self._auth_headers(spec.get("api_key"))
 
     def _error_secrets(self) -> tuple[str, ...]:
@@ -1309,8 +1517,18 @@ class AIClient:
     async def _stream_lines(
         self, payload: dict[str, Any], model_id: str | None = None
     ) -> AsyncIterator[str]:
-        """POST the streaming request and yield its raw SSE lines."""
-        target, headers = self._route(model_id)
+        """POST the streaming request and yield OpenAI-shaped SSE lines.
+
+        In native DashScope mode the upstream event stream is translated on
+        the fly, so :meth:`_stream_attempt` does not need a second parser.
+        """
+        native = self._uses_native(model_id)
+        target, headers = self._route(
+            model_id, native=native, payload=payload
+        )
+        request_payload = _native_payload(payload) if native else payload
+        if native:
+            headers = {**(headers or {}), "X-DashScope-SSE": "enable"}
         timeout = aiohttp.ClientTimeout(
             total=config.request_timeout,
             sock_read=max(10, config.stream_stall_timeout),
@@ -1319,7 +1537,7 @@ class AIClient:
             session = await self._get_session()
             async with session.post(
                 target,
-                json=payload,
+                json=request_payload,
                 timeout=timeout,
                 headers=headers,
                 allow_redirects=False,
@@ -1336,14 +1554,121 @@ class AIClient:
                     raise AIStreamError(f"HTTP {resp.status}", status=resp.status, errors=[
                         provider_error(str(payload["model"]), resp.status, body, secrets=self._error_secrets()),
                     ])
-                async for line in _sse_lines(resp.content):
-                    yield line
+                if native:
+                    async for line in self._native_stream_lines(
+                        resp.content, model_id
+                    ):
+                        yield line
+                else:
+                    async for line in _sse_lines(resp.content):
+                        yield line
         except AIStreamError:
             raise
         except TimeoutError as exc:
             raise AIStreamError("Request timed out", code="TIMEOUT") from exc
         except aiohttp.ClientError as exc:
             raise AIStreamError("Network request failed", code="NETWORK_ERROR") from exc
+
+    async def _native_stream_lines(
+        self, chunks: Any, model_id: str | None = None
+    ) -> AsyncIterator[str]:
+        """Translate native DashScope SSE events to OpenAI-shaped chunks.
+
+        Native streams send the incremental text in ``output.choices[].message``
+        (not ``delta``) and have no ``[DONE]`` sentinel; the final event carries
+        ``finish_reason`` and ``usage``. The synthetic ``[DONE]`` keeps the
+        regular stream parser unchanged.
+        """
+        finished = False
+        async for line in _sse_lines(chunks):
+            if not line.startswith("data:"):
+                continue
+            raw = line[len("data:"):].strip()
+            if raw == "[DONE]":
+                yield "data: [DONE]"
+                return
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            output = event.get("output")
+            if not isinstance(output, dict):
+                if event.get("code") or event.get("message"):
+                    spec = config.resolve_model(model_id)
+                    model = spec.get("model") or spec.get("id", "")
+                    raise AIStreamError(
+                        "API stream error",
+                        errors=[provider_error(
+                            str(model), 200, raw, secrets=self._error_secrets(),
+                        )],
+                    )
+                continue
+            usage = event.get("usage")
+            delta: dict[str, Any] = {}
+            finish_reason: Any = output.get("finish_reason")
+            choices = output.get("choices")
+            if not isinstance(choices, list):
+                choices = []
+            if not choices and isinstance(output.get("text"), str):
+                choices = [{
+                    "message": {"content": output["text"]},
+                    "finish_reason": finish_reason,
+                }]
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message")
+                delta_part = choice.get("delta")
+                if isinstance(message, dict) and isinstance(delta_part, dict):
+                    # Native normally uses ``message``; accept a ``delta``
+                    # shape from compatible-style streams as well.
+                    message = {**delta_part, **message}
+                elif not isinstance(message, dict):
+                    message = delta_part
+                if not isinstance(message, dict):
+                    message = {}
+                text = self._normalize_content(message.get("content"))
+                if text:
+                    delta["content"] = text
+                raw_calls = message.get("tool_calls")
+                if isinstance(raw_calls, list) and raw_calls:
+                    calls = []
+                    for index, raw_call in enumerate(raw_calls):
+                        if not isinstance(raw_call, dict):
+                            continue
+                        function = raw_call.get("function") or {}
+                        arguments = function.get("arguments", "")
+                        if isinstance(arguments, (dict, list)):
+                            arguments = json.dumps(
+                                arguments, ensure_ascii=False
+                            )
+                        calls.append({
+                            "index": raw_call.get("index", index),
+                            "id": raw_call.get("id", ""),
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": arguments,
+                            },
+                        })
+                    if calls:
+                        delta["tool_calls"] = calls
+                reason = choice.get("finish_reason")
+                if reason is not None:
+                    finish_reason = reason
+            if finish_reason is not None and str(finish_reason).lower() != "null":
+                finished = True
+            if delta or isinstance(usage, dict) or finished:
+                chunk: dict[str, Any] = {"choices": [{"delta": delta}]}
+                if isinstance(usage, dict):
+                    chunk["usage"] = usage
+                yield "data: " + json.dumps(chunk, ensure_ascii=False)
+            if finished:
+                yield "data: [DONE]"
+                return
+        if not finished:
+            yield "data: [DONE]"
 
     # --- Speech recognition ------------------------------------------------
 
@@ -1587,7 +1912,13 @@ class AIClient:
             "stream": False,
             "asr_options": asr_options,
         }
-        status, data, _elapsed = await self._post_chat(payload, retries=1)
+        # ASR has no native chat equivalent in this client: always use the
+        # OpenAI-compatible endpoint, even when AI_API_TYPE=dashscope.
+        status, data, _elapsed = await self._post_chat(
+            payload,
+            url=f"{self.compat_base_url}/chat/completions",
+            retries=1,
+        )
         if status == 200 and data is not None:
             return self._extract_content(data)
         return None
@@ -1825,7 +2156,11 @@ class AIClient:
             return None
         trusted_origins = {
             (parsed.scheme, parsed.netloc)
-            for parsed in (urlsplit(self.base_url), urlsplit(self.native_base_url))
+            for parsed in (
+                urlsplit(self.base_url),
+                urlsplit(self.compat_base_url),
+                urlsplit(self.native_base_url),
+            )
         }
         header_variants = [None]
         if (source.scheme, source.netloc) in trusted_origins:
@@ -1886,18 +2221,29 @@ class AIClient:
             # Модель должна вызывать инструменты штатно, а не «рисовать»
             # вызов текстом в ответе (см. bot/services/tool_markup.py).
             rendered = AIClient._with_hint(rendered, TOOL_CALLS_HINT)
+        spec = config.resolve_model(model)
+        model_temperature = spec.get("temperature")
+        effective_temperature = (
+            model_temperature
+            if model_temperature is not None
+            else (config.default_temperature if temperature is None else temperature)
+        )
         payload = {
-            "model": (spec := config.resolve_model(model)).get("model", spec["id"]),
+            "model": spec.get("model", spec["id"]),
             "messages": rendered,
-            "temperature": (
-                config.default_temperature if temperature is None else temperature
-            ),
+            "temperature": effective_temperature,
             "max_tokens": (
                 config.default_max_tokens if max_tokens is None else max_tokens
             ),
         }
         if public:
             payload.update(thinking.payload_fields())
+            if config.builtin_web_search(model):
+                payload["enable_search"] = True
+                payload["search_options"] = {
+                    "search_strategy": "turbo",
+                    "enable_source": True,
+                }
         return payload
 
     @staticmethod
@@ -1998,12 +2344,18 @@ class AIClient:
         requests without an alternative model (e.g. image generation).
         ``errors``, если передан, пополняется причиной каждой неудачной попытки.
         """
+        native = self._uses_native(model_id) and not url
         if url:
             target, headers = url, None
+        elif native:
+            target, headers = self._route(
+                model_id, native=True, payload=payload
+            )
         elif model_id:
             target, headers = self._route(model_id)
         else:
-            target, headers = f"{self.base_url}/chat/completions", None
+            target, headers = f"{self.compat_base_url}/chat/completions", None
+        request_payload = _native_payload(payload) if native else payload
         request_timeout = aiohttp.ClientTimeout(total=timeout or config.request_timeout)
         started = time.monotonic()
         request_id = uuid4().hex[:12]
@@ -2021,7 +2373,7 @@ class AIClient:
                 session = await self._get_session()
                 async with session.post(
                     target,
-                    json=payload,
+                    json=request_payload,
                     timeout=request_timeout,
                     headers=headers,
                     allow_redirects=False,
@@ -2048,7 +2400,17 @@ class AIClient:
                                     secrets=self._error_secrets(),
                                 ))
                             return resp.status, None, _elapsed()
-                        if not isinstance(data, dict) or data.get("error"):
+                        if native and isinstance(data, dict):
+                            data = _native_response(data)
+                        if (
+                            not isinstance(data, dict)
+                            or data.get("error")
+                            or (
+                                native
+                                and data.get("code")
+                                and not data.get("choices")
+                            )
+                        ):
                             if errors is not None:
                                 errors.append(
                                     provider_error(str(payload["model"]), 200, body, secrets=self._error_secrets())

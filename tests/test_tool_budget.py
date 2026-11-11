@@ -182,6 +182,7 @@ class AnswerLoopBudgetTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
             patch.object(config, "search_api_key", "tvly-test"),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(config, "max_search_rounds", 2),
             patch.object(config, "search_max_calls", 2),
             patch.object(chat, "waiting", _no_wait),
@@ -216,6 +217,7 @@ class ReminderToolBudgetTests(unittest.IsolatedAsyncioTestCase):
         final = ChatResult(content="done", elapsed=1.0)
         with (
             patch.object(reminders, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(config, "search_max_calls", 2),
             patch.object(
                 reminders.ai_client, "chat_with_tools",

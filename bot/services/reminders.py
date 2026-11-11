@@ -533,10 +533,12 @@ async def _run_ai_prompt(
         {"role": "user", "content": due.text},
     ]
     model = settings["model"]
-    search_ready = search_configured()
+    builtin_search = config.builtin_web_search(model)
+    search_ready = search_configured() and not builtin_search
     tools = [SEARCH_TOOL] if search_ready else None
-    if search_ready:
+    if search_ready or builtin_search:
         isolate_search_history(messages)
+    if search_ready:
         apply_search_hint(messages)
 
     elapsed = 0.0
@@ -545,13 +547,6 @@ async def _run_ai_prompt(
     while True:
         if messages_have_untrusted_content(messages):
             apply_untrusted_hint(messages)
-        # External untrusted content (document/page/forward/history) must not
-        # steer the paid search call; search results themselves may be refined.
-        if tools and messages_have_untrusted_content(
-            messages, ignore_sources={"search"}
-        ):
-            tools = None
-            remove_search_hint(messages)
         if tools:
             result = await ai_client.chat_with_tools(
                 messages=messages,

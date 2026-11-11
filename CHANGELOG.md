@@ -2,6 +2,21 @@
 
 ## История по коммитам
 
+### 2026-11-11
+- **Температура задаётся для каждой модели.** Добавлены `MODEL_n_TEMPERATURE` и `FALLBACK_MODEL_TEMPERATURE` (`0…2`). Значение переопределяет температуру из `/settings` для этой модели; пусто — `DEFAULT_TEMPERATURE`. Нужно для Kimi K3.1 Pro, который принимает только `temperature=1`. Обновлены `.env.example`, README, `_chat_payload` и тесты.
+
+### 2026-11-11
+- **Встроенный веб-поиск модели приоритетнее локального.** Добавлен `MODEL_n_WEB_SEARCH` (`auto`/`true`/`false`). Для Qwen и DeepSeek-V4 в режиме `auto` бот включает серверный `enable_search` и **не предлагает** локальный `search_web`, поэтому сторонний поисковый провайдер в таком запросе не используется. Для GLM/Kimi и при `WEB_SEARCH=false` остаётся прежний локальный поиск. Работает в обычном чате, guest и AI-напоминаниях; `ENABLE_WEB_SEARCH=false` отключает оба вида.
+
+### 2026-11-11
+- **Тип API задаётся для каждой модели отдельно.** Добавлены `MODEL_n_API_TYPE` и `FALLBACK_MODEL_API_TYPE`: `dashscope` (нативный `/api/v1`) или `openai` (совместимый `/chat/completions`). Пустое значение наследует глобальный `AI_API_TYPE`; неверное — предупреждение и глобальный тип. Один бот может держать Qwen на native, а стороннюю модель — на OpenAI-совместимом endpoint. Обновлены `AIClient._uses_native`, `.env.example`, README и тесты.
+
+### 2026-11-11
+- **Веб-поиск доступен в любом запросе.** `search_web` больше не отключается при документах, страницах, цитатах/форвардах, результатах MCP и явной просьбе «только в заметках»: модель всегда получает инструмент, если поисковый провайдер настроен. Гостевой режим и AI-напоминания тоже ищут в интернете. MCP, генерация картинок/стикеров и отправка файлов при недоверенном контенте по-прежнему блокируются. Остаточный риск — недоверенный текст может подсказать поисковый запрос и передать часть данных провайдеру; это отражено в README и AGENTS.
+
+### 2026-11-11
+- **Выбор протокола AI: нативный DashScope по умолчанию.** `AI_API_TYPE=dashscope` (по умолчанию) отправляет чат в `/api/v1` нативного DashScope: text-generation для текстовых моделей и multimodal-generation для vision-моделей; `AI_API_TYPE=openai` сохраняет OpenAI-совместимый `/chat/completions` для OpenRouter и сторонних endpoint (DeepSeek/GLM внутри Model Studio работают и в native). Совместимый `AI_BASE_URL` автоматически превращается в нативный base, а список моделей и HTTP-fallback ASR остаются на `/compatible-mode/v1`. Добавлены конвертация запросов/ответов, SSE-потока и tool calls; README, `.env.example` и `tests/test_api_type.py` обновлены.
+
 ### 2026-11-10
 - **Заметки и веб: единый содержательный анализ без перекрёстной утечки.** Явная просьба «в моих заметках и в интернете» или сопоставление двух источников включает смешанный режим. Весь план составляется только по текущему тексту до получения данных, бот дополняет недостающий вид поиска. Затем читаются заметки/страницы и формируется общий ответ с путями, ссылками, расхождениями и выводами без новых инструментов. Контекст делится между источниками, веб-ссылки нумеруются без пересечений; недоступность одного источника не блокирует другой. Guest ограничен заметками и не публикует их в Telegraph.
 
@@ -354,6 +369,46 @@
 ---
 
 ## Подробные заметки
+
+### Температура на каждую модель (2026-11-11)
+
+- `_model_set` читает `MODEL_n_TEMPERATURE` / `FALLBACK_MODEL_TEMPERATURE`; `Config.__post_init__` проверяет число, диапазон `0…2` и сохраняет `None` для пустого/неверного значения (с предупреждением).
+- `AIClient._chat_payload` берёт `temperature` из spec модели, если она задана; иначе использует переданную пользователем температуру или `DEFAULT_TEMPERATURE`. Поэтому Kimi K3.1 Pro может получать обязательный `temperature=1`, не меняя остальные модели.
+- В локальный `.env.windows` добавлено `MODEL_5_TEMPERATURE=1` для Kimi; на сервере это нужно продублировать в `.env.linux`.
+- Проверки: `tests/test_model_temperature.py` (чтение, пустое/неверное значение, приоритет над caller). Полный прогон: 1010 passed, 3 skipped, 236 subtests. Живые Telegram/AI API не вызывались.
+
+### Встроенный поиск модели вместо стороннего провайдера (2026-11-11)
+
+- `_model_set` читает `MODEL_n_WEB_SEARCH` / `FALLBACK_MODEL_WEB_SEARCH`; `Config` нормализует к `auto`/`true`/`false`. `Config.builtin_web_search()` возвращает `false` при выключенном `ENABLE_WEB_SEARCH`, учитывает явное значение и для `auto` включает поиск только для известных семейств: Qwen и DeepSeek-V4 на `api_type=dashscope`. GLM/Kimi в Chat Completions `enable_search` не поддерживают и остаются на локальном поиске.
+- `_chat_payload(public=True)` добавляет `enable_search: true` и `search_options={search_strategy: turbo, enable_source: true}`; `_native_payload` переносит их в `parameters`. Внутренние запросы (`public=False`: intent, OCR, метаданные заметок и т.п.) поиск не включают.
+- `chat`, `guest` и `reminders` при `config.builtin_web_search(model)` не добавляют `SEARCH_TOOL` и не вызывают `search_web`; для моделей без встроенного поиска поведение прежнее. `isolate_search_history` по-прежнему применяется к чистому новому запросу, чтобы старая недоверенная история не попадала во встроенный поиск.
+- Проверен живой endpoint: Qwen3.8 Max/Flash, DeepSeek V4 Pro/V4.1 Flash и Qwen3.6 Flash принимают `enable_search` (в том числе с streaming); GLM-5.3/5.2 возвращают `This model does not support enable_search`, поэтому у них `auto` даёт `false`.
+- Проверки: `tests/test_builtin_web_search.py` (auto/true/false, payload native, internal/public, guest и reminder без локального инструмента), обновлены тестовые харнессы, где проверяется локальный `search_web`. Полный прогон: 1005 passed, 3 skipped, 236 subtests. Живые Telegram/AI/search API — только минимальные проверки моделей.
+
+### Тип API на каждую модель (2026-11-11)
+
+- `_model_set` читает `MODEL_n_API_TYPE` / `FALLBACK_MODEL_API_TYPE`. `Config.__post_init__` нормализует значение; пусто наследует `AI_API_TYPE`, неизвестное значение логируется и заменяется глобальным. В каждом spec теперь есть `api_type`.
+- `AIClient._model_api_type()` читает тип из `resolve_model()`; `_uses_native()` больше не зависит только от глобального `self.api_type`. Поэтому `_post_chat` и `_stream_lines` выбирают native/compatible для конкретной модели, даже если модели используют разные URL и ключи.
+- `AI_API_TYPE` остаётся значением по умолчанию для слотов без собственного `API_TYPE`; `list_models` и HTTP-fallback ASR по-прежнему всегда ходят в совместимый `/compatible-mode/v1`.
+- Документация: в `.env.example` добавлены пустые `MODEL_n_API_TYPE` и `FALLBACK_MODEL_API_TYPE`, README описывает смешанную конфигурацию (Qwen native + сторонний OpenAI-совместимый endpoint).
+- Проверки: `tests/test_api_type.py` (наследование, override, неверное значение, выбор протокола по модели). Полный прогон: 998 passed, 3 skipped, 236 subtests. Живые Telegram/AI API не вызывались.
+
+### Веб-поиск во всех запросах, включая guest и напоминания (2026-11-11)
+
+- `chat._answer_with_ai` больше не вычисляет `search_ready` из `mcp_only`, `request_route == "notes"` и taint-гейта: инструмент `search_web` добавляется всегда, когда `search_configured()`. Удалён блок, снимавший поиск при внешнем недоверенном контенте; MCP, `generate_image`, `generate_sticker` и `send_files` по-прежнему отключаются через `_without_untrusted_side_effects`/`_without_mcp_tools`.
+- `services/reminders.py:_run_ai_prompt` больше не убирает `search_web` при недоверенной истории или тексте напоминания. `remove_search_hint` остаётся только для реального сбоя провайдера.
+- `handlers/guest.py`: добавлен полноценный поисковый цикл — `SEARCH_TOOL`, `apply_search_hint`, выполнение `search_web`, обрезка/обрамление результатов, общий `ToolBudget`, `SEARCH_MAX_ROUNDS`, удаление сломанного инструмента после ошибки и финальный запрос без инструментов при исчерпании раундов. После выдачи поиска MCP/генерация закрываются, сам поиск остаётся для уточнения. Guest больше не сообщает, что веб недоступен.
+- Остаточный риск: недоверенный документ/страница/заметка теперь может подсказать модели аргументы поискового запроса, то есть попытаться вынести часть приватного текста поисковому провайдеру. Это осознанный компромисс по требованию «поиск в любом запросе»; MCP/запись/генерация/файлы остаются защищены.
+- Проверки: обновлены `tests/test_untrusted_side_effects.py`, `tests/test_mcp_history.py`, `tests/test_guest_untrusted.py`, `tests/test_guest_mcp.py`, `tests/test_combined_retrieval.py`; добавлен `tests/test_search_any_request.py` (guest-поиск, сохранение поиска после выдачи, поиск в напоминании с недоверенным текстом). Полный прогон: 995 passed, 3 skipped, 236 subtests. Живые Telegram/AI/search API не вызывались.
+
+### Нативный DashScope по умолчанию и переключатель протокола (2026-11-11)
+
+- `AI_API_TYPE` принимает `dashscope` (алиасы `native`, `qwen`, `dashscope-native`) и `openai` (`compatible`, `openai-compatible`, `compat`). Пустое/неизвестное значение даёт предупреждение и `dashscope`: бот рассчитан в первую очередь на Qwen. Конфигурация нормализуется в `Config.__post_init__`.
+- Нативный режим оставляет `AIClient` прежним внутри: `_chat_payload` и парсинг ответов работают с OpenAI-формой, а `_native_payload`/`_native_response` переводят её на границе HTTP. `messages` уходят в `input.messages`; `temperature`, `max_tokens`, thinking-поля, `tools` и `tool_choice` — в `parameters`; `stream_options` не отправляется, для SSE добавляются `incremental_output: true` и заголовок `X-DashScope-SSE: enable`.
+- Vision-модели (`VISION=true`) и запросы с изображением идут в `/services/aigc/multimodal-generation/generation`, текстовые — в `/services/aigc/text-generation/generation`: Qwen 3.8 Max и Qwen-VL не принимают текстовый эндпоинт. Content-части `text/image_url` переводятся в `text/image`.
+- Нативные SSE-события несут приращение в `output.choices[].message` (не `delta`) и не имеют `[DONE]`; `_native_stream_lines` превращает их в привычные OpenAI-чанки, добавляет синтетический `[DONE]` и обрабатывает `finish_reason`/`usage`/tool calls. Ошибки потока без `output` поднимают `AIStreamError`.
+- `AI_BASE_URL` может остаться `.../compatible-mode/v1`: native base выводится заменой на `/api/v1`; обратное преобразование используется для `GET /models` и HTTP-fallback ASR. `IMAGE_API_URL` по-прежнему задаёт отдельный нативный base для генерации картинок.
+- Проверки: `tests/test_api_type.py` (конфиг и алиасы, base URL, payload/response, выбор эндпоинта, реальный `_post_chat`, SSE и tool-call фрагменты), обновлён `tests/test_ai_errors.py`. Полный прогон: 993 passed, 3 skipped, 236 subtests. Живые Telegram/AI API не вызывались.
 
 ### Смешанный поиск: чистый план → сбор двух источников → общий анализ (2026-11-10)
 

@@ -237,6 +237,7 @@ class IsolatedSearchTests(unittest.IsolatedAsyncioTestCase):
                                    enable_file_replies=True),
                     patch.object(chat, "ai_client", client),
                     patch.object(chat, "search_configured", return_value=True),
+                    patch.object(config, "builtin_web_search", return_value=False),
                     patch.object(chat, "mcp_available", return_value=True),
                     patch.object(chat.mcp_manager, "openai_tools", AsyncMock()) as mcp,
                     patch.object(chat, "search_web", AsyncMock(return_value=[])) as search,
@@ -272,6 +273,7 @@ class IsolatedSearchTests(unittest.IsolatedAsyncioTestCase):
         history = [{"role": "user", "content": wrap_untrusted("web", "PRIVATE PAGE")}]
         with (
             patch.object(reminders, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(reminders.ai_client, "chat_with_tools", AsyncMock(return_value=final)) as tools,
             patch.object(reminders.ai_client, "chat_completion_result", AsyncMock(return_value=final)) as plain,
         ):

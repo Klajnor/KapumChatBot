@@ -305,7 +305,9 @@ class ClientErrorTests(unittest.IsolatedAsyncioTestCase):
             if started == 2:
                 ready.set()
             await ready.wait()
-            question = kwargs["json"]["messages"][-1]["content"]
+            sent = kwargs["json"]
+            messages = sent.get("messages") or (sent.get("input") or {}).get("messages") or []
+            question = messages[-1]["content"]
             yield response(429, error_body("Quota", question))
 
         self.session.post.side_effect = post

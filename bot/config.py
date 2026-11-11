@@ -119,11 +119,13 @@ _TRUE_FLAGS = {"1", "true", "yes", "on", "y", "vision", "да"}
 
 
 def _model_set(prefix: str, *, default_vision: bool = False) -> dict[str, Any] | None:
-    """Read one model set (``<prefix>NAME/ID/URL/MODEL/VISION/API_KEY``).
+    """Read one model set (NAME/ID/URL/MODEL/VISION/API_KEY/API_TYPE/...).
 
     Returns ``None`` when the set is not filled in (no internal id or no
-    provider model id). An empty URL / API key means "use AI_BASE_URL /
-    AI_API_KEY", which is resolved by the caller.
+    provider model id). An empty URL / API key / API type means "use
+    AI_BASE_URL / AI_API_KEY / AI_API_TYPE", which is resolved by the caller.
+    ``WEB_SEARCH`` is ``auto`` (known model families), ``true`` or ``false``.
+    ``TEMPERATURE`` is optional; empty means the global DEFAULT_TEMPERATURE.
     """
     internal_id = os.getenv(f"{prefix}ID", "").strip()
     provider_model = os.getenv(f"{prefix}MODEL", "").strip()
@@ -137,6 +139,9 @@ def _model_set(prefix: str, *, default_vision: bool = False) -> dict[str, Any] |
         "model": provider_model,
         "vision": vision_raw in _TRUE_FLAGS if vision_raw else default_vision,
         "api_key": os.getenv(f"{prefix}API_KEY", "").strip(),
+        "api_type": os.getenv(f"{prefix}API_TYPE", "").strip().lower(),
+        "web_search": os.getenv(f"{prefix}WEB_SEARCH", "").strip().lower(),
+        "temperature": os.getenv(f"{prefix}TEMPERATURE", "").strip(),
     }
 
 
@@ -148,6 +153,38 @@ THINKING_LEVELS = ("off", "low", "medium", "high", "max")
 DEFAULT_THINKING_LEVEL = "medium"
 # Qwen 3.8 accepts up to 262 144 thinking tokens; other models clamp their own.
 MAX_THINKING_BUDGET = 262_144
+
+# Protocol used for chat requests. The bot is Qwen-first, so the native
+# DashScope API (``/api/v1``) is the default; ``openai`` keeps the
+# OpenAI-compatible ``/compatible-mode/v1/chat/completions`` protocol used by
+# other providers.
+AI_API_TYPES = ("dashscope", "openai")
+DEFAULT_AI_API_TYPE = "dashscope"
+_AI_API_TYPE_ALIASES = {
+    "dashscope": "dashscope",
+    "native": "dashscope",
+    "dashscope-native": "dashscope",
+    "qwen": "dashscope",
+    "openai": "openai",
+    "compatible": "openai",
+    "openai-compatible": "openai",
+    "compat": "openai",
+}
+
+
+def _normalize_ai_api_type(value: str) -> str | None:
+    """Return the canonical API type for ``AI_API_TYPE`` or ``None``."""
+    return _AI_API_TYPE_ALIASES.get(value.strip().lower())
+
+
+def _normalize_web_search(value: str) -> str:
+    """Return ``auto``, ``true`` or ``false`` for a model's WEB_SEARCH."""
+    normalized = value.strip().lower()
+    if normalized in _TRUE_FLAGS:
+        return "true"
+    if normalized in {"0", "false", "no", "off", "n", "нет"}:
+        return "false"
+    return "auto"
 
 
 # Notice shown while a slow AI request is still running (see PROGRESS_TEXT).
@@ -706,6 +743,13 @@ class Config:
             "AI_BASE_URL",
             "QWEN_BASE_URL",
             default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        )
+    )
+    # Chat protocol: ``dashscope`` (native /api/v1, default because the bot is
+    # Qwen-first) or ``openai`` (OpenAI-compatible /compatible-mode/v1).
+    ai_api_type: str = field(
+        default_factory=lambda: _env(
+            "AI_API_TYPE", default=DEFAULT_AI_API_TYPE
         )
     )
     # Model catalog for the /models menu, built from the MODEL_1_* ... MODEL_6_*
@@ -1405,6 +1449,16 @@ class Config:
         if self.parse_mode not in {"markdown", "html", "plain"}:
             self.parse_mode = "markdown"
 
+        normalized_api_type = _normalize_ai_api_type(self.ai_api_type)
+        if normalized_api_type is None:
+            logging.getLogger(__name__).warning(
+                "Invalid AI_API_TYPE %r; using %s",
+                self.ai_api_type,
+                DEFAULT_AI_API_TYPE,
+            )
+            normalized_api_type = DEFAULT_AI_API_TYPE
+        self.ai_api_type = normalized_api_type
+
         if self.thinking_level not in THINKING_LEVELS:
             logging.getLogger(__name__).warning(
                 "Invalid THINKING_LEVEL %r; using %s",
@@ -1555,10 +1609,45 @@ class Config:
             self.ai_models = [dict(model) for model in DEFAULT_AI_MODELS]
         fallback = _model_set("FALLBACK_MODEL_")
         self.ai_fallback_models = [fallback] if fallback else []
-        # Empty URL / key in a set -> the global provider settings.
+        # Empty URL / key / API type in a set -> the global provider settings.
         for spec in (*self.ai_models, *self.ai_fallback_models):
             spec["base_url"] = spec.get("base_url") or self.ai_base_url.rstrip("/")
             spec["api_key"] = spec.get("api_key") or self.ai_api_key
+            raw_api_type = spec.get("api_type") or self.ai_api_type
+            normalized_api_type = _normalize_ai_api_type(raw_api_type)
+            if normalized_api_type is None:
+                logging.getLogger(__name__).warning(
+                    "Invalid API_TYPE for model %s: %r; using %s",
+                    spec.get("id"),
+                    raw_api_type,
+                    self.ai_api_type,
+                )
+                normalized_api_type = self.ai_api_type
+            spec["api_type"] = normalized_api_type
+            spec["web_search"] = _normalize_web_search(
+                spec.get("web_search") or "auto"
+            )
+            raw_temperature = spec.get("temperature")
+            spec["temperature"] = None
+            if raw_temperature not in (None, ""):
+                try:
+                    temperature = float(raw_temperature)
+                except (TypeError, ValueError):
+                    logging.getLogger(__name__).warning(
+                        "Invalid TEMPERATURE for model %s: %r; using default",
+                        spec.get("id"),
+                        raw_temperature,
+                    )
+                else:
+                    if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                        logging.getLogger(__name__).warning(
+                            "TEMPERATURE for model %s is out of range: %r; "
+                            "using default",
+                            spec.get("id"),
+                            raw_temperature,
+                        )
+                    else:
+                        spec["temperature"] = temperature
         if not self.default_model:
             self.default_model = self.ai_models[0]["id"]
 
@@ -1593,6 +1682,30 @@ class Config:
             if spec["id"] == self.default_model:
                 return spec
         return self.ai_models[0]
+
+    def builtin_web_search(self, model_id: str | None) -> bool:
+        """Whether chat requests should use the provider's built-in search.
+
+        ``WEB_SEARCH=true`` forces it, ``false`` disables it. ``auto`` trusts
+        the known model families: Qwen and DeepSeek-V4 currently accept
+        ``enable_search`` on Model Studio; GLM/Kimi need a separate API.
+        """
+        if not self.enable_web_search:
+            return False
+        spec = self.resolve_model(model_id)
+        setting = spec.get("web_search") or "auto"
+        if setting == "true":
+            return True
+        if setting == "false":
+            return False
+        if (spec.get("api_type") or self.ai_api_type) != "dashscope":
+            return False
+        provider_model = str(spec.get("model") or spec.get("id") or "").lower()
+        if "omni" in provider_model:
+            # Omni models need search_strategy=agent, which the text endpoint
+            # does not accept; use the local provider unless explicitly forced.
+            return False
+        return provider_model.startswith(("qwen", "deepseek-v4"))
 
     def is_owner(self, telegram_id: int) -> bool:
         """True for IDs from ``OWNER_IDS``: they can never be demoted or blocked."""

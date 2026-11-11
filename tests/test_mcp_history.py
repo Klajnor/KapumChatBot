@@ -90,6 +90,7 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
                            enable_image_generation=True, enable_sticker_generation=True,
                            enable_file_replies=True),
             patch.object(chat, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(chat, "mcp_available", return_value=available),
             patch.object(chat, "mcp_manager", brain),
             patch.object(chat, "_single_shot", side_effect=answer),
@@ -120,11 +121,17 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(len(seen), 2)
                     first, final = seen
-                    self.assertEqual([tool["function"]["name"] for tool in first["tools"]], [SEARCH_NAME])
+                    self.assertEqual(
+                        [tool["function"]["name"] for tool in first["tools"]],
+                        ["search_web", SEARCH_NAME],
+                    )
                     self.assertIn(MCP_SYSTEM_HINT, first["messages"][0]["content"])
                     self.assertEqual(first["messages"][-1], {"role": "user", "content": QUESTION})
                     self.assertEqual(len(first["messages"]), 2)
-                    self.assertIsNone(final["tools"])
+                    self.assertEqual(
+                        [tool["function"]["name"] for tool in final["tools"]],
+                        ["search_web"],
+                    )
                     self.assertIn(UNTRUSTED_SYSTEM_HINT, final["messages"][0]["content"])
                     self.assertNotIn(MCP_SYSTEM_HINT, final["messages"][0]["content"])
                     for payload in seen:
@@ -147,30 +154,42 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
                 history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]
                 _, brain, seen, _ = await self.run_chat(text, history)
                 brain.call_tool.assert_not_awaited()
-                self.assertIsNone(seen[0]["tools"])
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in seen[0]["tools"]],
+                    ["search_web"],
+                )
                 self.assertIn("PRIVATE MATERIAL", str(seen[0]["messages"]))
 
-    async def test_disabled_mcp_does_not_isolate_history_or_expose_tools(self):
+    async def test_disabled_mcp_does_not_isolate_history_and_keeps_search(self):
         history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]
         # Без упоминания интернета: это не запрос на изолированный веб-поиск.
         _, brain, seen, _ = await self.run_chat("Поищи во втором мозге про Python", history, available=False)
         brain.openai_tools.assert_not_awaited()
         self.assertIn("PRIVATE MATERIAL", str(seen[0]["messages"]))
-        self.assertIsNone(seen[0]["tools"])
+        self.assertEqual(
+            [tool["function"]["name"] for tool in seen[0]["tools"]],
+            ["search_web"],
+        )
 
     async def test_clean_history_is_not_discarded(self):
         history = [{"role": "user", "content": "Ранее обсуждали Python"}]
         _, _, seen, _ = await self.run_chat("Поищи во втором мозге про Python", history)
         self.assertIn(history[0], seen[0]["messages"])
-        # Явная просьба только к заметкам не должна случайно отправляться в веб.
-        self.assertNotIn("search_web", {tool["function"]["name"] for tool in seen[0]["tools"]})
+        # Явная просьба к заметкам больше не отключает веб-поиск.
+        self.assertIn(
+            "search_web",
+            {tool["function"]["name"] for tool in seen[0]["tools"]},
+        )
 
     async def test_empty_catalog_does_not_open_web_search_or_media_tools(self):
         history = [{"role": "user", "content": wrap_untrusted("document", "PRIVATE MATERIAL")}]
         _, brain, seen, _ = await self.run_chat(QUESTION, history, catalog_ready=False)
         brain.openai_tools.assert_awaited_once()
         brain.call_tool.assert_not_awaited()
-        self.assertIsNone(seen[0]["tools"])
+        self.assertEqual(
+            [tool["function"]["name"] for tool in seen[0]["tools"]],
+            ["search_web"],
+        )
         self.assertNotIn(MCP_SYSTEM_HINT, seen[0]["messages"][0]["content"])
         # Пустой каталог не должен вырезать историю: изоляция теперь решается
         # только после успешной загрузки инструментов.
@@ -215,6 +234,8 @@ class GuestMCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.multiple(config, enable_image_generation=True, enable_link_analysis=False),
             patch.object(guest, "check_access", AsyncMock(return_value=AccessResult(True, "guest"))),
+            patch.object(guest, "search_configured", return_value=False),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(guest, "mcp_available", return_value=True),
             patch.object(guest, "mcp_manager", brain),
             patch.object(guest.ai_client, "chat_with_tools", side_effect=answer),
@@ -246,6 +267,8 @@ class GuestMCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.multiple(config, enable_image_generation=True, enable_link_analysis=False),
             patch.object(guest, "check_access", AsyncMock(return_value=AccessResult(True, "guest"))),
+            patch.object(guest, "search_configured", return_value=False),
+            patch.object(config, "builtin_web_search", return_value=False),
             patch.object(guest, "mcp_available", return_value=True),
             patch.object(guest, "mcp_manager", brain),
             patch.object(guest.ai_client, "chat_with_tools", AsyncMock()) as tools,
