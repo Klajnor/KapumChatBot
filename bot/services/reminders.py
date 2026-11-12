@@ -50,6 +50,7 @@ from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
 from bot.services.operations import stage, tracked
 from bot.services.request_scope import WEB_MARKER_RE
+from bot.services.response_metadata import AnswerMetadata, metadata_for_result
 from bot.services.rich import send_rich_to
 from bot.services.search import (
     SEARCH_TOOL,
@@ -548,6 +549,7 @@ async def _run_ai_prompt(
     elapsed = 0.0
     rounds = 0
     budget = ToolBudget()
+    metadata = AnswerMetadata()
     while True:
         if messages_have_untrusted_content(messages):
             apply_untrusted_hint(messages)
@@ -569,13 +571,16 @@ async def _run_ai_prompt(
                 public=True,
             )
         elapsed += result.elapsed
+        metadata.add(result)
         calls = [call for call in result.tool_calls if call.name == "search_web"]
         if not calls or not tools:
+            result.metadata = metadata.summary()
             return result, elapsed
         if rounds >= config.max_search_rounds:
             # Budget spent: one final tools-less request for an answer.
             tools = None
             if result.content:
+                result.metadata = metadata.summary()
                 return result, elapsed
             messages.append(build_assistant_tool_message(result.content, calls))
             for call in calls:
@@ -593,6 +598,8 @@ async def _run_ai_prompt(
             max_results = call.arguments.get("max_results")
             if not isinstance(max_results, int) or isinstance(max_results, bool):
                 max_results = None
+            if query:
+                metadata.api_search_used = True
             found = await search_web(query, max_results) if query else []
             failed = bool(getattr(found, "error", "") or "")
             messages.append(
@@ -697,6 +704,7 @@ async def _fire_ai(due: DueReminder) -> None:
         tokens=result.total_tokens,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
+        metadata=metadata_for_result(result),
     )
     markdown = f"🔔 **Scheduled AI request**\n_{due.text[:300]}_\n\n{result.content}"
     # Same delivery chain as an interactive answer: rich message first, then

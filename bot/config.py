@@ -192,7 +192,8 @@ def _normalize_web_search(value: str) -> str:
 DEFAULT_PROGRESS_TEXT = "{spinner} Waiting for the AI response… {seconds} s"
 
 # Footer appended to an answer with the AI API processing time.
-# Placeholders: {seconds}, {model}, {tokens}.
+# Плейсхолдеры: {seconds}, {model}, {tokens}, {search}, {reasoning}.
+# Без {search}/{reasoning} новые метрики дописываются автоматически.
 DEFAULT_TIMING_FORMAT = "⏱️ {seconds} s · {model}"
 
 # Footer used instead of DEFAULT_TIMING_FORMAT when the API reported token
@@ -1322,6 +1323,8 @@ class Config:
     # Used instead of TIMING_FORMAT when the API reported token usage
     # (chat/vision answers). Supports {input} and {output} on top of
     # {seconds}, {model} and {tokens}.
+    # {search}/{reasoning} доступны в обоих шаблонах; отсутствующие поля
+    # подтверждённого поиска/reasoning добавляются отдельными частями футера.
     timing_format_tokens: str = field(
         default_factory=lambda: _env(
             "TIMING_FORMAT_TOKENS", default=DEFAULT_TIMING_FORMAT_TOKENS

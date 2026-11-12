@@ -29,6 +29,15 @@ from bot.services.http_body import read_bounded
 from bot.services.http_redirect import warn_redirect_blocked
 from bot.services.image_tools import canonical_operations
 from bot.services.request_scope import WEB_MARKER_RE
+from bot.services.response_metadata import (
+    ResponseMetadata,
+    combine_metadata,
+    merge_usage,
+    metadata_for_result,
+    model_search_used,
+    reasoning_tokens,
+    response_metadata,
+)
 from bot.services.science import normalize_formulas
 from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
     STICKER_MAX_BYTES,
@@ -500,6 +509,12 @@ class ChatResult:
     model: str | None = None
     # Только ошибки этого вызова; общего last_error у клиента нет.
     errors: list[AIRequestError] = field(default_factory=list)
+    metadata: ResponseMetadata | None = None
+
+    @property
+    def reasoning_tokens(self) -> int | None:
+        """Токены размышления из API; не вычисляются по длине reasoning_content."""
+        return self.metadata.reasoning_tokens if self.metadata is not None else reasoning_tokens(self.usage)
 
     @property
     def total_tokens(self) -> int | None:
@@ -1032,6 +1047,7 @@ class AIClient:
         """
         started = time.monotonic()
         errors: list[AIRequestError] = []
+        metadata: list[ResponseMetadata] = []
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages,
@@ -1054,6 +1070,7 @@ class AIClient:
                     payload, retries=2, model_id=attempt_model, errors=errors
                 )
             if status == 200 and data is not None:
+                metadata.append(response_metadata(data, search_enabled=bool(payload.get("enable_search"))))
                 content = self._finalize(self._extract_content(data))
                 if content:
                     return ChatResult(
@@ -1062,6 +1079,7 @@ class AIClient:
                         usage=_extract_usage(data),
                         model=attempt_model,
                         errors=errors,
+                        metadata=combine_metadata(metadata),
                     )
                 errors.append(request_error(
                     str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
@@ -1078,7 +1096,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors, metadata=combine_metadata(metadata))
 
     async def chat_with_tools(
         self,
@@ -1098,6 +1116,7 @@ class AIClient:
         """
         started = time.monotonic()
         errors: list[AIRequestError] = []
+        metadata: list[ResponseMetadata] = []
         for attempt_model in self.model_chain(model):
             offered = tools if tools is not None else [IMAGE_TOOL]
             payload = self._chat_payload(
@@ -1137,7 +1156,8 @@ class AIClient:
                 )
 
             if status == 200 and data is not None:
-                result = self._parse_result(data, finalize=False)
+                result = self._parse_result(data, finalize=False, search_enabled=bool(payload.get("enable_search")))
+                metadata.append(result.metadata or ResponseMetadata())
                 self._recover_search_dsml(result, payload.get("tools") or [])
                 retry_payload = self._text_tool_retry_payload(payload, result)
                 if retry_payload is not None:
@@ -1150,9 +1170,10 @@ class AIClient:
                         payload, retries=1, model_id=attempt_model, errors=errors
                     )
                     result = (
-                        self._parse_result(data, finalize=False)
+                        self._parse_result(data, finalize=False, search_enabled=bool(payload.get("enable_search")))
                         if status == 200 and data is not None else ChatResult()
                     )
+                    metadata.append(result.metadata or ResponseMetadata())
                     self._recover_search_dsml(result, payload.get("tools") or [])
                 result.content = self._finalize(
                     result.content, tools_offered=bool(payload.get("tools"))
@@ -1161,6 +1182,7 @@ class AIClient:
                     result.elapsed = time.monotonic() - started
                     result.model = attempt_model
                     result.errors = errors
+                    result.metadata = combine_metadata(metadata)
                     return result
                 if status == 200 and data is not None:
                     errors.append(request_error(
@@ -1180,7 +1202,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors, metadata=combine_metadata(metadata))
 
     async def chat_completion_with_image(
         self,
@@ -1218,6 +1240,7 @@ class AIClient:
         """
         started = time.monotonic()
         errors: list[AIRequestError] = []
+        metadata: list[ResponseMetadata] = []
         for attempt_model in self.model_chain(model, require_vision=True):
             payload = self._chat_payload(
                 self.vision_messages(messages, text, image_bytes),
@@ -1241,6 +1264,7 @@ class AIClient:
                     payload, retries=2, model_id=attempt_model, errors=errors
                 )
             if status == 200 and data is not None:
+                metadata.append(response_metadata(data, search_enabled=bool(payload.get("enable_search"))))
                 content = self._finalize(self._extract_content(data))
                 if content:
                     return ChatResult(
@@ -1249,6 +1273,7 @@ class AIClient:
                         usage=_extract_usage(data),
                         model=attempt_model,
                         errors=errors,
+                        metadata=combine_metadata(metadata),
                     )
                 errors.append(request_error(
                     str(payload["model"]), "EMPTY_RESPONSE", "HTTP 200: no usable answer",
@@ -1266,7 +1291,7 @@ class AIClient:
                     status,
                 )
                 break
-        return ChatResult(elapsed=time.monotonic() - started, errors=errors)
+        return ChatResult(elapsed=time.monotonic() - started, errors=errors, metadata=combine_metadata(metadata))
 
     @staticmethod
     def vision_messages(
@@ -1316,6 +1341,7 @@ class AIClient:
         started = time.monotonic()
         last_error: AIStreamError | None = None
         errors: list[AIRequestError] = []
+        metadata: list[ResponseMetadata] = []
         for attempt_model in self.model_chain(model, require_vision=require_vision):
             payload = self._chat_payload(
                 messages,
@@ -1336,6 +1362,7 @@ class AIClient:
                     attempt_model,
                     allow_retry=not tools,
                 )
+                metadata.append(metadata_for_result(result))
                 self._recover_search_dsml(result, payload.get("tools") or [])
                 retry_payload = self._text_tool_retry_payload(payload, result)
                 if retry_payload is not None:
@@ -1348,6 +1375,7 @@ class AIClient:
                     result = await self._stream_attempt_with_thinking_fallback(
                         payload, on_delta, attempt_model, allow_retry=False,
                     )
+                    metadata.append(metadata_for_result(result))
                     self._recover_search_dsml(result, payload.get("tools") or [])
                 result.content = self._finalize(
                     result.content, tools_offered=bool(tools)
@@ -1380,6 +1408,7 @@ class AIClient:
             result.elapsed = time.monotonic() - started
             result.model = attempt_model
             result.errors = [*errors, *result.errors]
+            result.metadata = combine_metadata(metadata)
             return result
 
         last_error = last_error or AIStreamError("no model produced an answer")
@@ -1440,6 +1469,7 @@ class AIClient:
         parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         usage: dict[str, Any] | None = None
+        search_used: bool | None = None if payload.get("enable_search") else False
         saw_done = False
         malformed = 0
 
@@ -1464,7 +1494,10 @@ class AIClient:
                     str(payload["model"]), 200, data, secrets=self._error_secrets(),
                 )])
             if isinstance(event.get("usage"), dict):
-                usage = event["usage"]
+                usage = merge_usage(usage, event["usage"])
+            search_event = model_search_used(event)
+            if search_event is True or (search_event is False and search_used is not True):
+                search_used = search_event
             for choice in event.get("choices") or []:
                 if not isinstance(choice, dict):
                     continue
@@ -1528,6 +1561,7 @@ class AIClient:
             tool_calls=tool_calls,
             elapsed=time.monotonic() - started,
             usage=usage,
+            metadata=ResponseMetadata(model_search_used=search_used, reasoning_tokens=reasoning_tokens(usage)),
         )
 
     async def _stream_lines(
@@ -1620,6 +1654,10 @@ class AIClient:
                             str(model), 200, raw, secrets=self._error_secrets(),
                         )],
                     )
+                # Некоторые native-провайдеры присылают финальный usage отдельно
+                # от output. Не теряем его, в том числе после finish_reason.
+                if isinstance(event.get("usage"), dict):
+                    yield "data: " + json.dumps({"choices": [], "usage": event["usage"]})
                 continue
             usage = event.get("usage")
             delta: dict[str, Any] = {}
@@ -1675,16 +1713,15 @@ class AIClient:
                     finish_reason = reason
             if finish_reason is not None and str(finish_reason).lower() != "null":
                 finished = True
-            if delta or isinstance(usage, dict) or finished:
+            search_info = output.get("search_info", event.get("search_info"))
+            if delta or isinstance(usage, dict) or isinstance(search_info, dict) or finished:
                 chunk: dict[str, Any] = {"choices": [{"delta": delta}]}
                 if isinstance(usage, dict):
                     chunk["usage"] = usage
+                if isinstance(search_info, dict):
+                    chunk["search_info"] = search_info
                 yield "data: " + json.dumps(chunk, ensure_ascii=False)
-            if finished:
-                yield "data: [DONE]"
-                return
-        if not finished:
-            yield "data: [DONE]"
+        yield "data: [DONE]"
 
     # --- Speech recognition ------------------------------------------------
 
@@ -2604,11 +2641,12 @@ class AIClient:
 
     @classmethod
     def _parse_result(
-        cls, data: dict[str, Any], elapsed: float = 0.0, *, finalize: bool = True
+        cls, data: dict[str, Any], elapsed: float = 0.0, *, finalize: bool = True,
+        search_enabled: bool | None = None,
     ) -> ChatResult:
         choices = data.get("choices") or []
         if not choices:
-            return ChatResult()
+            return ChatResult(usage=_extract_usage(data), metadata=response_metadata(data, search_enabled=search_enabled))
         message = choices[0].get("message") or {}
 
         calls: list[ToolCall] = []
@@ -2640,6 +2678,7 @@ class AIClient:
             tool_calls=calls,
             elapsed=elapsed,
             usage=_extract_usage(data),
+            metadata=response_metadata(data, search_enabled=search_enabled),
         )
 
 

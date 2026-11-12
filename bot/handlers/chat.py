@@ -75,6 +75,7 @@ from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
 from bot.services.request_scope import WEB_MARKER_RE, route
+from bot.services.response_metadata import AnswerMetadata, metadata_for_result
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -1366,6 +1367,7 @@ async def _resolve_tool_round(
     search_allowed: bool,
     mcp_allowed: bool,
     budget: ToolBudget | None = None,
+    metadata: AnswerMetadata | None = None,
 ) -> bool:
     """Run the model's search/MCP calls and append the tool exchange.
 
@@ -1429,6 +1431,8 @@ async def _resolve_tool_round(
             max_results = call.arguments.get("max_results")
             if not isinstance(max_results, int) or isinstance(max_results, bool):
                 max_results = None
+            if query and metadata is not None:
+                metadata.api_search_used = True
             results = await search_web(query, max_results) if query else []
             error = str(getattr(results, "error", "") or "")
             if error:
@@ -1616,6 +1620,7 @@ async def _answer_with_ai(
     # Total calls/context for this question, not per round: one model turn may
     # ask for many searches or MCP reads.
     budget = ToolBudget()
+    metadata = AnswerMetadata()
     result: ChatResult
     request_errors: list[AIRequestError] = []
 
@@ -1669,6 +1674,7 @@ async def _answer_with_ai(
                 result = await _single_shot(messages, model, settings, tools_arg)
 
             total_elapsed += result.elapsed
+            metadata.add(result)
             request_errors.extend(result.errors)
 
             # Ответ модели — недоверенный ввод. Отсутствие инструмента в
@@ -1750,6 +1756,7 @@ async def _answer_with_ai(
                     search_allowed=can_search,
                     mcp_allowed=can_mcp,
                     budget=budget,
+                    metadata=metadata,
                 )
                 if search_failed:
                     # The provider is down (not just "zero hits"): make one
@@ -1787,6 +1794,7 @@ async def _answer_with_ai(
                 request_errors.extend(result.errors)
                 result.tool_calls = []
                 total_elapsed += result.elapsed
+                metadata.add(result)
             if is_retrieval_promise(result.content) and (
                 request_route in {"notes", "combined"}
                 or any(entry.get("role") == "tool" for entry in messages)
@@ -1797,6 +1805,7 @@ async def _answer_with_ai(
                 result = await _single_shot(final_answer_messages(messages), model, settings, None)
                 request_errors.extend(result.errors)
                 total_elapsed += result.elapsed
+                metadata.add(result)
                 result.tool_calls = []
                 if not result.content or is_retrieval_promise(result.content):
                     result.content = retrieval_fallback(messages)
@@ -1817,6 +1826,7 @@ async def _answer_with_ai(
             tokens=result.total_tokens,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            metadata=metadata.summary(),
         )
         await deliver_answer(
             message,
@@ -2514,6 +2524,7 @@ async def _handle_photo(
             tokens=vision_result.total_tokens,
             input_tokens=vision_result.input_tokens,
             output_tokens=vision_result.output_tokens,
+            metadata=metadata_for_result(vision_result),
         )
         # No "Ask another model" button: re-asking needs the image attached.
         # The 📄/📝 export buttons still apply to the answer text.
@@ -3354,6 +3365,7 @@ async def _process_album(
                 tokens=album_result.total_tokens,
                 input_tokens=album_result.input_tokens,
                 output_tokens=album_result.output_tokens,
+                metadata=metadata_for_result(album_result),
             )
             await deliver_answer(
                 message,

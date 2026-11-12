@@ -56,6 +56,7 @@ from bot.services.mcp import (
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.request_scope import WEB_MARKER_RE, route
+from bot.services.response_metadata import AnswerMetadata, metadata_for_result
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -609,6 +610,7 @@ async def _build_reply(
             tokens=vision.total_tokens,
             input_tokens=vision.input_tokens,
             output_tokens=vision.output_tokens,
+            metadata=metadata_for_result(vision),
         )
         telegraph_reply = await _maybe_telegraph_reply(
             text, response, footer, allow=not external
@@ -663,6 +665,7 @@ async def _build_reply(
     search_rounds = 0
     mcp_rounds = 0
     result = ChatResult()
+    metadata = AnswerMetadata()
     while True:
         # Note text returned by MCP is framed as untrusted; once it is in the
         # context, neither the notes tools nor the paid image tool may stay
@@ -700,6 +703,7 @@ async def _build_reply(
                 public=True,
             ) or ChatResult()
 
+        metadata.add(result)
         # The model's turn is untrusted input: only tools it was actually
         # offered may run.
         offered_names = {tool["function"]["name"] for tool in offered_tools}
@@ -754,6 +758,8 @@ async def _build_reply(
                 max_results = call.arguments.get("max_results")
                 if not isinstance(max_results, int) or isinstance(max_results, bool):
                     max_results = None
+                if query:
+                    metadata.api_search_used = True
                 found = await search_web(query, max_results) if query else []
                 failed = bool(getattr(found, "error", "") or "")
                 messages.append(
@@ -790,6 +796,7 @@ async def _build_reply(
                 max_tokens=settings["max_tokens"],
                 public=True,
             ) or ChatResult()
+            metadata.add(result)
             result.tool_calls = []
             image_call = None
         if not result.content and not result.tool_calls and image_call is None:
@@ -804,6 +811,7 @@ async def _build_reply(
                 max_tokens=settings["max_tokens"],
                 public=True,
             ) or ChatResult()
+            metadata.add(result)
             result.tool_calls = []
         if is_retrieval_promise(result.content) and (
             search_rounds or mcp_rounds or route(text) in {"notes", "combined"}
@@ -814,6 +822,7 @@ async def _build_reply(
                 model=settings["model"], temperature=settings["temperature"],
                 max_tokens=settings["max_tokens"], public=True,
             ) or ChatResult()
+            metadata.add(result)
             result.elapsed += previous_elapsed
             result.tool_calls = []
             if not result.content or is_retrieval_promise(result.content):
@@ -853,6 +862,7 @@ async def _build_reply(
         tokens=result.total_tokens,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
+        metadata=metadata.summary(),
     )
     telegraph_reply = await _maybe_telegraph_reply(
         text, result.content, footer,

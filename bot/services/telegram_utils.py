@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from string import Formatter
 from typing import Any
 
 from aiogram.enums import ChatType
@@ -26,6 +27,7 @@ from bot.services.formulas import (
     split_blocks,
 )
 from bot.services.markdown import render, split_chunks
+from bot.services.response_metadata import ResponseMetadata
 from bot.services.science import normalize_formulas
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,7 @@ def format_timing(
     tokens: int | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    metadata: ResponseMetadata | None = None,
 ) -> str:
     """Footer with the AI API processing time, or "" when it should not show.
 
@@ -115,12 +118,15 @@ def format_timing(
     When the API reported token usage (any of ``tokens``/``input_tokens``/
     ``output_tokens`` is known), ``TIMING_FORMAT_TOKENS`` is used instead:
     it additionally supports ``{input}`` and ``{output}``. Requests without
-    usage counters (e.g. image generation) keep the plain format.
+    usage counters (e.g. image generation) keep the plain format. ``{search}``
+    и ``{reasoning}`` доступны в обоих шаблонах. Если они не указаны, известные
+    метрики дописываются автоматически; неизвестный reasoning не показывается.
     """
     if not config.show_timing or not elapsed or elapsed <= 0:
         return ""
     has_usage = (
         tokens is not None or input_tokens is not None or output_tokens is not None
+        or (metadata is not None and metadata.reasoning_tokens is not None)
     )
     if has_usage:
         template = config.timing_format_tokens or DEFAULT_TIMING_FORMAT_TOKENS
@@ -132,15 +138,39 @@ def format_timing(
         "tokens": tokens if tokens is not None else "—",
         "input": input_tokens if input_tokens is not None else "—",
         "output": output_tokens if output_tokens is not None else "—",
+        "search": _search_label(metadata),
+        "reasoning": (
+            (f"≥{metadata.reasoning_tokens}" if metadata.reasoning_partial else metadata.reasoning_tokens)
+            if metadata is not None and metadata.reasoning_tokens is not None else "—"
+        ),
     }
     try:
-        return template.format(**values)
+        rendered = template.format(**values)
+        fields = {name for _, name, _, _ in Formatter().parse(template)}
     except (KeyError, IndexError, ValueError):
         logger.warning("Invalid TIMING_FORMAT %r; using the default", template)
         fallback = (
             DEFAULT_TIMING_FORMAT_TOKENS if has_usage else DEFAULT_TIMING_FORMAT
         )
-        return fallback.format(**values)
+        rendered = fallback.format(**values)
+        fields = {name for _, name, _, _ in Formatter().parse(fallback)}
+    if metadata is not None:
+        if "search" not in fields:
+            rendered += f" · 🔎 {values['search']}"
+        if metadata.reasoning_tokens is not None and "reasoning" not in fields:
+            rendered += f" · 🧠 {values['reasoning']} tok"
+    return rendered
+
+
+def _search_label(metadata: ResponseMetadata | None) -> str:
+    """Не выдавать разрешённый, но неподтверждённый поиск за выполненный."""
+    if metadata is None:
+        return "unknown"
+    if metadata.model_search_used is True:
+        return "model + API" if metadata.api_search_used else "model"
+    if metadata.model_search_used is None:
+        return "API; model unknown" if metadata.api_search_used else "unknown"
+    return "API" if metadata.api_search_used else "none"
 
 
 def with_timing(text: str, footer: str) -> str:
