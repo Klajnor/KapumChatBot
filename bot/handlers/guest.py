@@ -22,6 +22,7 @@ from bot.handlers.chat import (
     DEFAULT_LINK_PROMPT,
     DEFAULT_VIDEO_PROMPT,
     _compose_document_context,
+    _describe_reply_context,
     _without_mcp_tools,
     _without_search_tool,
     _without_untrusted_side_effects,
@@ -76,6 +77,7 @@ from bot.services.search import (
     search_configured,
     search_web,
 )
+from bot.services.telegram_quotes import DEFAULT_QUOTE_QUESTION, has_quote
 from bot.services.telegram_utils import (
     PARSE_MODES,
     format_timing,
@@ -224,7 +226,13 @@ async def _download(message: Message, file_id: str) -> bytes | None:
 
 async def _download_photo(message: Message) -> bytes | None:
     """Return the largest attached (or replied-to) photo, if any."""
-    source = message if message.photo else message.reply_to_message
+    if message.photo:
+        source = message
+    elif has_quote(message):
+        # Выделена подпись: не скачиваем всё изображение из replied-сообщения.
+        source = None
+    else:
+        source = message.reply_to_message
     if source is None or not source.photo:
         return None
     return await _download(message, source.photo[-1].file_id)
@@ -234,6 +242,8 @@ def _voice_of(message: Message):
     """Return the voice note attached to the message or to the replied one."""
     if message.voice is not None:
         return message.voice
+    if has_quote(message):
+        return None
     reply = message.reply_to_message
     return reply.voice if reply is not None else None
 
@@ -242,6 +252,8 @@ def _document_of(message: Message):
     """Return the document attached to the message or to the replied one."""
     if message.document is not None:
         return message.document
+    if has_quote(message):
+        return None
     reply = message.reply_to_message
     return reply.document if reply is not None else None
 
@@ -447,6 +459,16 @@ async def _build_reply(
             )
         text = f"{text}\n{transcript}".strip() if text else transcript.strip()
 
+    # Цитату добавляем ПОСЛЕ чтения ссылок/ASR: URL и инструкции внутри неё
+    # являются данными, не запросом на загрузку или платное действие. Один
+    # разделитель сохраняет структуру document/link-контекста без второго
+    # «User request» внутри него.
+    quoted = _describe_reply_context(message, text_only=True)
+    if quoted:
+        text = f"{quoted}\n\n---\n\n{text or DEFAULT_QUOTE_QUESTION}"
+        external = True
+        text_external = True
+
     if not text:
         # Nothing to send to the model: give the quota unit back.
         await refund_access(service, caller_id, access)
@@ -470,7 +492,7 @@ async def _build_reply(
     # the next question keeps the taint gate active.
     photo_source = message if getattr(message, "photo", None) else None
     replied = getattr(message, "reply_to_message", None)
-    if photo_source is None and getattr(replied, "photo", None):
+    if photo_source is None and not has_quote(message) and getattr(replied, "photo", None):
         photo_source = replied
     photo_foreign = _attachment_foreign(message, photo_source, caller_id)
     external = external or photo_foreign

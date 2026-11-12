@@ -107,6 +107,13 @@ from bot.services.search import (
 )
 from bot.services.sticker_sets import add_keyboard, save_sticker
 from bot.services.stickers import sticker_error_message
+from bot.services.telegram_quotes import (
+    DEFAULT_QUOTE_QUESTION,
+    MAX_QUOTE_CHARS,
+    has_quote,
+    reply_message_text,
+    selected_quote_text,
+)
 from bot.services.telegram_utils import (
     edit_formatted,
     format_timing,
@@ -330,7 +337,7 @@ def _is_addressed(message: Message) -> bool:
 
 # A quoted message is included in the AI request verbatim; keep it bounded so
 # one huge forward cannot crowd out the conversation history.
-_MAX_QUOTED_CHARS = 4000
+_MAX_QUOTED_CHARS = MAX_QUOTE_CHARS
 _MAX_DISPLAY_NAME_CHARS = 64
 # Имена Telegram вводит пользователь и они вставляются в текст запроса вне
 # untrusted-рамки: переносы строк и угловые скобки могли бы ломать её разметку.
@@ -350,40 +357,61 @@ def _sender_name(message: Message) -> str:
     """Human-readable sender of a message (for quoted/forwarded context)."""
     sender_chat = getattr(message, "sender_chat", None)
     if sender_chat is not None:
-        return _safe_display_name(sender_chat.title, "channel")
-    user = message.from_user
+        return _safe_display_name(getattr(sender_chat, "title", None), "channel")
+    user = getattr(message, "from_user", None)
     if user is None:
         return "unknown"
-    return _safe_display_name(user.first_name or user.username, "user")
+    return _safe_display_name(
+        getattr(user, "first_name", None) or getattr(user, "username", None),
+        "user",
+    )
 
 
-def _describe_quoted(reply: Message | None) -> str | None:
+def _describe_quoted(
+    reply: Message | None,
+    *,
+    include_bot: bool = False,
+    text_only: bool = False,
+) -> str | None:
     """Render the replied-to message as a context block for the AI.
 
     Returns None when there is nothing worth quoting: no reply at all, a
-    reply to a photo (the vision pipeline attaches the image itself) or a
-    reply to the bot's own answer (already part of the user's history).
+    reply to a photo (the vision pipeline attaches the image itself) or, by
+    default, a reply to the bot's own answer (already part of the user's
+    history). ``include_bot`` is used for explicit follow-ups, where even the
+    bot's answer may be missing from another participant's history.
+    ``text_only`` skips media placeholders for callers that handle attachments
+    themselves.
     """
-    if reply is None or reply.photo:
+    if reply is None or getattr(reply, "photo", None):
         return None
     bot_id = get_bot_id()
-    if bot_id != 0 and reply.from_user is not None and reply.from_user.id == bot_id:
+    author = getattr(reply, "from_user", None)
+    if (
+        not include_bot
+        and bot_id != 0
+        and author is not None
+        and getattr(author, "id", None) == bot_id
+    ):
         return None
 
     parts: list[str] = []
-    text = reply.text or reply.caption or ""
+    text = reply_message_text(reply)
+    if text_only and not text:
+        return None
     if text:
         parts.append(text)
-    if reply.voice is not None:
+    if not text_only and getattr(reply, "voice", None) is not None:
         parts.append("[Voice message]")
-    if reply.video is not None:
+    if not text_only and getattr(reply, "video", None) is not None:
         parts.append("[Video]")
-    if reply.animation is not None:
+    if not text_only and getattr(reply, "animation", None) is not None:
         parts.append("[Animation]")
-    if reply.document is not None:
-        parts.append(f"[Document: {reply.document.file_name or 'file'}]")
-    if reply.sticker is not None:
-        emoji = reply.sticker.emoji or ""
+    if not text_only and getattr(reply, "document", None) is not None:
+        file_name = getattr(reply.document, "file_name", None) or "file"
+        parts.append(f"[Document: {file_name}]")
+    if not text_only and getattr(reply, "sticker", None) is not None:
+        emoji = getattr(reply.sticker, "emoji", None) or ""
         parts.append(f"[Sticker{' ' + emoji if emoji else ''}]")
     if not parts:
         return None
@@ -395,6 +423,26 @@ def _describe_quoted(reply: Message | None) -> str | None:
     return f"[Quoted message from {_sender_name(reply)}]\n{wrap_untrusted('quoted', body)}"
 
 
+def _describe_reply_context(message: Message, *, text_only: bool = False) -> str | None:
+    """Выбранная цитата важнее целого reply, в том числе ответа самого бота."""
+    reply = getattr(message, "reply_to_message", None)
+    if has_quote(message):
+        body = selected_quote_text(message) or "[Selected quote text is unavailable]"
+        source = _sender_name(reply) if reply is not None else "another message"
+        return f"[Selected quote from {source}]\n{wrap_untrusted('quoted', body)}"
+    if reply is not None:
+        return _describe_quoted(reply, include_bot=True, text_only=text_only)
+    if getattr(message, "external_reply", None) is not None:
+        # Bot API не возвращает текст external_reply и не позволяет загрузить
+        # произвольное сообщение по id. Не читаем чужие чаты и не выдумываем текст.
+        return wrap_untrusted(
+            "quoted",
+            "[Replied-to message is from another chat or topic; its text is "
+            "unavailable. Ask the user to select or paste a quote.]",
+        )
+    return None
+
+
 def _forward_source_name(message: Message) -> str | None:
     """Where a forwarded message came from, when Telegram tells us."""
     origin = getattr(message, "forward_origin", None)
@@ -403,7 +451,8 @@ def _forward_source_name(message: Message) -> str | None:
     sender = getattr(origin, "sender_user", None)
     if sender is not None:
         return _safe_display_name(
-            sender.first_name or getattr(sender, "username", None), "user"
+            getattr(sender, "first_name", None) or getattr(sender, "username", None),
+            "user",
         )
     chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
     if chat is not None:
@@ -411,18 +460,22 @@ def _forward_source_name(message: Message) -> str | None:
     return None
 
 
-def _with_quoted_context(message: Message, text: str) -> str:
+def _with_quoted_context(
+    message: Message, text: str, *, with_forward: bool = True
+) -> str:
     """Prepend quoted-reply and forwarding provenance to the question.
 
     The combined text is what the AI sees and what is stored in history, so
     follow-up questions keep working after the original leaves the window.
     Both the quoted body and a forwarded message are third-party content and
     are wrapped as untrusted (see ``bot/services/untrusted.py``).
+    ``with_forward=False`` is used by document requests whose body is already
+    framed as untrusted, to avoid wrapping that frame a second time.
     """
-    quoted = _describe_quoted(message.reply_to_message)
+    quoted = _describe_reply_context(message)
     if quoted:
         text = f"{quoted}\n\n---\n\n{text}"
-    if message.forward_date is not None:
+    if with_forward and is_forwarded(message):
         source = _forward_source_name(message)
         label = (
             f"[Forwarded message from {source}]" if source else "[Forwarded message]"
@@ -1910,6 +1963,8 @@ async def handle_text(message: Message) -> None:
         return
 
     text = strip_bot_mention(message.text)
+    if not text and has_quote(message):
+        text = DEFAULT_QUOTE_QUESTION
     if not text:
         return
 
@@ -1934,7 +1989,7 @@ async def handle_text(message: Message) -> None:
     # A question sent as a reply to a photo analyzes (or regenerates from)
     # the quoted image instead of chatting about text alone.
     reply = message.reply_to_message
-    if reply is not None and reply.photo:
+    if reply is not None and reply.photo and not has_quote(message):
         await _guarded(
             message,
             lambda m: _route_single_photo(m, photo_from=reply, question=text),
@@ -2294,7 +2349,12 @@ async def _handle_document(message: Message) -> None:
             caption,
             link_blocks,
         )
-        await _answer_with_ai(message, service, combined, access)
+        await _answer_with_ai(
+            message,
+            service,
+            _with_quoted_context(message, combined, with_forward=False),
+            access,
+        )
     except Exception:
         if access is not None:
             await refund_access(service, user.id, access)
@@ -2333,7 +2393,11 @@ async def _route_single_photo(
         enhance_ops: list[str] = []
         # Подпись пересланного фото — чужой текст, как и пересланное сообщение:
         # по ней не выбираем генерацию/улучшение и не тратим helper-бюджет.
-        intent_caption = None if is_forwarded(message) else caption
+        # Выделенная цитата тоже не должна запускать платный side-effect:
+        # такое фото анализируется вместе с цитатой обычным путём.
+        intent_caption = (
+            None if is_forwarded(message) or has_quote(message) else caption
+        )
         if intent_caption:
             # Нужны и доступ, и отдельный бюджет: при text-only/clarify обычная
             # квота может не списаться или вернуться, но API-попытка уже платная.
@@ -2389,7 +2453,7 @@ async def _handle_photo(
     else:
         caption = strip_bot_mention(message.caption or "") or DEFAULT_VISION_PROMPT
         # A photo sent as a reply to a text message: quote it for context.
-        quoted = _describe_quoted(message.reply_to_message)
+        quoted = _describe_reply_context(message)
         if quoted:
             caption = f"{quoted}\n\n---\n\n{caption}"
 
@@ -2441,7 +2505,9 @@ async def _handle_photo(
             {"role": "system", "content": settings["system_prompt"]},
             *history,
         ]
-        if caption_tainted:
+        if caption_tainted or messages_have_untrusted_content([
+            {"role": "user", "content": vision_caption},
+        ]):
             apply_untrusted_hint(messages)
 
         await service.add_message(
@@ -3085,6 +3151,7 @@ async def _process_album(
         return
 
     caption = strip_bot_mention(message.caption or "")
+    quoted_context = _describe_reply_context(message)
 
     service = await _open_registered(message)
     if service is None:
@@ -3105,6 +3172,7 @@ async def _process_album(
         if (
             caption
             and not caption_tainted
+            and not has_quote(message)
             and await service.consume_photo_intent_budget(user.id)
         ):
             intent, enhance_ops = await detect_intent(caption, settings["model"])
@@ -3310,6 +3378,9 @@ async def _process_album(
                     if image_origin
                     else wrap_untrusted("photo", caption)
                 )
+            if quoted_context:
+                album_text = f"{quoted_context}\n\n---\n\n{album_text}"
+            if quoted_context or (caption_tainted and caption):
                 apply_untrusted_hint(base_messages)
 
             full_messages = [dict(entry) for entry in base_messages]
@@ -3323,13 +3394,16 @@ async def _process_album(
                 })
             full_messages.append({"role": "user", "content": content_parts})
 
+            history_body = f"[Album {len(valid_images)} images] {caption}"
+            if quoted_context:
+                history_body = f"{history_body}\n{quoted_context}"
             await service.add_message(
                 chat_id=message.chat.id,
                 user_id=user.id,
                 role="user",
                 content=_with_photo_provenance(
                     image_origin,
-                    f"[Album {len(valid_images)} images] {caption}",
+                    history_body,
                     body_is_untrusted=caption_tainted,
                 ),
                 model=settings["model"],

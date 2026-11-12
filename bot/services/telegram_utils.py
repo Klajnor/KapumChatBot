@@ -256,14 +256,22 @@ def mentions_bot(text: str | None) -> bool:
 
 def is_reply_to_bot(message: Message) -> bool:
     """Return True if the message replies to one of the bot's own messages."""
-    reply = message.reply_to_message
+    reply = getattr(message, "reply_to_message", None)
     bot_id = get_bot_id()
-    return (
+    author = getattr(reply, "from_user", None)
+    if (
         reply is not None
-        and reply.from_user is not None
+        and author is not None
         and bot_id != 0
-        and reply.from_user.id == bot_id
-    )
+        and getattr(author, "id", None) == bot_id
+    ):
+        return True
+    # Reply из другого топика/чата может прийти без reply_to_message. Только
+    # проверенный Telegram user id происхождения, никогда имя/текст цитаты.
+    external = getattr(message, "external_reply", None)
+    origin = getattr(external, "origin", None)
+    author = getattr(origin, "sender_user", None)
+    return bot_id != 0 and author is not None and getattr(author, "id", None) == bot_id
 
 
 def is_forwarded(message: Message) -> bool:
