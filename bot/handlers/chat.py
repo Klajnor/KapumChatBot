@@ -111,6 +111,7 @@ from bot.services.telegram_quotes import (
     DEFAULT_QUOTE_QUESTION,
     MAX_QUOTE_CHARS,
     has_quote,
+    message_text,
     reply_message_text,
     selected_quote_text,
 )
@@ -327,10 +328,16 @@ def _is_addressed(message: Message) -> bool:
         return True
     if is_reply_to_bot(message):
         return True
-    text = message.text or message.caption or ""
+    own_text = message.text or message.caption or ""
+    if not own_text.strip():
+        own_text = ""
+    text = message_text(message)
     if mentions_bot(text):
         return True
-    return text.lstrip().startswith("/")
+    return (
+        not bool(getattr(message, "rich_message", None))
+        and own_text.lstrip().startswith("/")
+    )
 
 
 # --- Quoted / forwarded context ---------------------------------------------
@@ -519,7 +526,9 @@ def _with_photo_provenance(
     the image gets an explicit untrusted placeholder.
     """
     if label is None:
-        return body
+        # Пересланная подпись вокруг собственного фото: метки происхождения
+        # нет, но текст всё равно чужой и должен сохранить taint в истории.
+        return wrap_untrusted("photo", body) if body_is_untrusted else body
     if body_is_untrusted:
         return f"{label}\n{wrap_untrusted('photo', body)}"
     return f"{label}\n{body}\n{wrap_untrusted('photo', '[image contents]')}"
@@ -1952,17 +1961,20 @@ async def _answer_with_ai(
 # --- Handlers --------------------------------------------------------------
 
 
-@router.message(F.text, ~F.text.startswith("/"))
+@router.message(F.rich_message | (F.text & ~F.text.startswith("/")))
 @tracked("Chat request")
 async def handle_text(message: Message) -> None:
-    """Handle text messages: chat with the AI."""
+    """Handle text and rich messages: chat with the AI."""
     user = message.from_user
-    if user is None or not message.text:
+    if user is None:
+        return
+    raw_text = message_text(message)
+    if not raw_text and not has_quote(message):
         return
     if not _is_addressed(message):
         return
 
-    text = strip_bot_mention(message.text)
+    text = strip_bot_mention(raw_text)
     if not text and has_quote(message):
         text = DEFAULT_QUOTE_QUESTION
     if not text:
@@ -2458,13 +2470,17 @@ async def _handle_photo(
             caption = f"{quoted}\n\n---\n\n{caption}"
 
     # Forwarded text around a photo is somebody else's words: frame it for the
-    # model, exactly like a forwarded text message.
-    caption_tainted = origin is not None and is_forwarded(message)
-    vision_caption = (
-        f"{origin}\n{wrap_untrusted('photo', caption)}"
-        if caption_tainted
-        else caption
-    )
+    # model, exactly like a forwarded text message. The replied-to photo may be
+    # the user's own, so the forwarded message itself must taint the caption.
+    caption_tainted = is_forwarded(message)
+    if caption_tainted:
+        vision_caption = (
+            f"{origin}\n{wrap_untrusted('photo', caption)}"
+            if origin
+            else wrap_untrusted("photo", caption)
+        )
+    else:
+        vision_caption = caption
 
     service = await _open_registered(message)
     if service is None:
@@ -3643,7 +3659,7 @@ async def cb_resend_with_model(callback: CallbackQuery) -> None:
             await service.session.close()
 
 
-@router.edited_message(F.text, ~F.text.startswith("/"))
+@router.edited_message(F.rich_message | (F.text & ~F.text.startswith("/")))
 async def handle_edited_text(message: Message) -> None:
     """Handle a user editing an already-sent question.
 
@@ -3657,12 +3673,15 @@ async def handle_edited_text(message: Message) -> None:
     flood of bot messages.
     """
     user = message.from_user
-    if user is None or not message.text:
+    raw_text = message_text(message)
+    if user is None or (not raw_text and not has_quote(message)):
         return
     if not _is_addressed(message):
         return
 
-    text = strip_bot_mention(message.text)
+    text = strip_bot_mention(raw_text)
+    if not text and has_quote(message):
+        text = DEFAULT_QUOTE_QUESTION
     if not text:
         return
 

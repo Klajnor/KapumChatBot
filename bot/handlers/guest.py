@@ -77,7 +77,11 @@ from bot.services.search import (
     search_configured,
     search_web,
 )
-from bot.services.telegram_quotes import DEFAULT_QUOTE_QUESTION, has_quote
+from bot.services.telegram_quotes import (
+    DEFAULT_QUOTE_QUESTION,
+    has_quote,
+    message_text,
+)
 from bot.services.telegram_utils import (
     PARSE_MODES,
     format_timing,
@@ -278,8 +282,8 @@ def _attachment_foreign(
 
 
 def _extract_text(message: Message) -> str:
-    """Summoning text with the ``@bot`` mention removed."""
-    return strip_bot_mention(message.text or message.caption or "").strip()
+    """Summoning text with the ``@bot`` mention removed, including rich text."""
+    return strip_bot_mention(message_text(message)).strip()
 
 
 # --- Reply pipeline --------------------------------------------------------

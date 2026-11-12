@@ -100,6 +100,14 @@ class PhotoProvenanceTests(unittest.TestCase):
         self.assertIn("[Image] look", forwarded)
         self.assertTrue(has_untrusted_content(forwarded))
 
+        # Пересланная подпись вокруг собственного фото: метки нет, но текст
+        # всё равно должен остаться недоверенным в истории.
+        unlabelled = chat._with_photo_provenance(
+            None, "[Image] forwarded caption", body_is_untrusted=True
+        )
+        self.assertIn('<untrusted_content source="photo">', unlabelled)
+        self.assertTrue(has_untrusted_content(unlabelled))
+
         replied = chat._with_photo_provenance(
             "[Image from Alice]", "[Image] what is this?", body_is_untrusted=False
         )

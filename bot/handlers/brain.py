@@ -22,6 +22,7 @@ from aiogram.types import (
 from bot.services import limits
 from bot.services.ai_client import ai_client
 from bot.services.mcp import MCPError, mcp_manager, mcp_write_available
+from bot.services.telegram_quotes import has_quote, message_text
 from bot.services.telegram_utils import is_forwarded, safe_answer, safe_answer_callback
 from bot.services.user_service import user_service
 
@@ -125,8 +126,7 @@ async def maybe_remember(message: Message, text: str) -> bool:
         await safe_answer(message, "⚠️ Could not check the save request. Please try again; nothing was saved.")
         return True
     if not content and message.reply_to_message is not None:
-        reply = message.reply_to_message
-        content = reply.text or reply.caption or ""
+        content = message_text(message.reply_to_message)
     await _save(message, user.id, content, f"tg:{message.chat.id}:{message.message_id}")
     return True
 
@@ -147,8 +147,8 @@ async def choose_forward(message: Message) -> None:
     ]])
     await safe_answer(
         message,
-        "What would you like to do? Remember saves text/caption only, not attachments. "
-        "Saved notes are readable by all bot users.",
+        "What would you like to do? Remember saves text/rich text/caption only, "
+        "not attachments. Saved notes are readable by all bot users.",
         reply_markup=keyboard,
     )
 
@@ -194,7 +194,7 @@ async def brain_callback(callback: CallbackQuery) -> None:
             return
         origin = pending.message
         if action == "forward":
-            if await _save(message, user.id, origin.text or origin.caption or "",
+            if await _save(message, user.id, message_text(origin),
                            f"tg:{origin.chat.id}:{origin.message_id}"):
                 _pending.pop(key, None)
             return
@@ -204,7 +204,10 @@ async def brain_callback(callback: CallbackQuery) -> None:
     # Обычные обработчики сами берут слот и проверяют доступ/квоту.
     from bot.handlers import chat
 
-    if origin.text:
+    if origin.text or (
+        getattr(origin, "rich_message", None)
+        and (message_text(origin) or has_quote(origin))
+    ):
         await chat.handle_text(origin)
     elif origin.photo:
         await chat.handle_photo(origin)
@@ -213,4 +216,4 @@ async def brain_callback(callback: CallbackQuery) -> None:
     elif origin.voice:
         await chat.handle_voice(origin)
     else:
-        await safe_answer(message, "⚠️ This message type cannot be analyzed. Please send text, a photo, a document or a voice message.")
+        await safe_answer(message, "⚠️ This message type cannot be analyzed. Please send text, a rich message, a photo, a document or a voice message.")

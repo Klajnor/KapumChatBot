@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 MAX_QUOTE_CHARS = 4000
+# Rich-сообщение — это сам запрос пользователя, а не короткая цитата: не
+# обрезаем его на 4000 символах, как контекст reply.
+MAX_RICH_MESSAGE_CHARS = 32000
 DEFAULT_QUOTE_QUESTION = "Поясни процитированный фрагмент."
 
 
@@ -18,7 +21,7 @@ def _rich_plain(value: Any, limit: int) -> str:
     remaining = limit + 1
     nodes = 2000
 
-    def walk(item: Any, depth: int = 0) -> None:
+    def walk(item: Any, depth: int = 0, joiner: str = "") -> None:
         nonlocal remaining, nodes
         if remaining <= 0 or nodes <= 0 or depth > 20:
             return
@@ -28,9 +31,11 @@ def _rich_plain(value: Any, limit: int) -> str:
             parts.append(piece)
             remaining -= len(piece)
         elif isinstance(item, (list, tuple)):
-            for child in item:
+            for index, child in enumerate(item):
                 if remaining <= 0 or nodes <= 0:
                     break
+                if index and joiner:
+                    walk(joiner, depth + 1)
                 walk(child, depth + 1)
         elif item is not None:
             # В историю попадает видимый текст, не скрытые thinking-блоки,
@@ -56,12 +61,15 @@ def _rich_plain(value: Any, limit: int) -> str:
             for name in ("blocks", "items", "rows", "cells", "header", "buttons"):
                 children = _field(item, name)
                 if isinstance(children, (list, tuple)):
+                    # Ячейки одной строки таблицы разделяем, а не склеиваем
+                    # вроде «AB12»; строки и блоки идут с новой строки.
+                    inner_joiner = " | " if name in {"cells", "rows", "header"} else ""
                     for child in children:
                         if remaining <= 0 or nodes <= 0:
                             break
                         if parts and not parts[-1].endswith("\n"):
                             walk("\n", depth + 1)
-                        walk(child, depth + 1)
+                        walk(child, depth + 1, inner_joiner)
 
     walk(value)
     text = "".join(parts)
@@ -88,8 +96,27 @@ def selected_quote_text(message: Any, *, limit: int = MAX_QUOTE_CHARS) -> str:
 
 def reply_message_text(message: Any, *, limit: int = MAX_QUOTE_CHARS) -> str:
     """Обычный текст/подпись либо видимые текстовые блоки rich-сообщения."""
+    rich = _field(message, "rich_message")
+    if rich is not None:
+        text = _rich_plain(rich, limit)
+        if text.strip():
+            return text
     for name in ("text", "caption"):
         text = _field(message, name)
         if isinstance(text, str) and text.strip():
             return text[:limit] + "…" if len(text) > limit else text
-    return _rich_plain(_field(message, "rich_message"), limit)
+    return ""
+
+
+def message_text(
+    message: Any, *, limit: int = MAX_RICH_MESSAGE_CHARS
+) -> str:
+    """Видимый текст самого сообщения: text/caption или rich_message.
+
+    В отличие от ``reply_message_text`` (контекст цитаты/reply), здесь
+    допустим полный rich-запрос до 32 000 символов: это не чужой фрагмент,
+    а сообщение, которое пользователь попросил разобрать.
+    """
+    text = reply_message_text(message, limit=limit)
+    # Rich-дерево из пустых блоков/thinking может дать только переводы строк.
+    return text if text.strip() else ""
