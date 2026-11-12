@@ -41,7 +41,8 @@ def _rich_plain(value: Any, limit: int) -> str:
             # В историю попадает видимый текст, не скрытые thinking-блоки,
             # file_id, URL медиаресурсов или произвольные дополнительные поля.
             kind = _field(item, "type")
-            if getattr(kind, "value", kind) == "thinking":
+            kind = getattr(kind, "value", kind)
+            if isinstance(kind, str) and kind.lower() == "thinking":
                 return
             for name in (
                 "title",

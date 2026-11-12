@@ -189,6 +189,27 @@ class VisionHistoryTaintTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(stored.index("describe it"), stored.index("<untrusted_content"))
         self.assertTrue(has_untrusted_content(stored))
 
+    async def test_forwarded_question_replying_to_own_photo_is_tainted(self):
+        own = photo_message(caption="my own photo")
+        message = photo_message(caption="", reply=own)
+        message.forward_date = datetime.datetime(2026, 10, 31)
+        message.forward_origin = SimpleNamespace(
+            sender_user=SimpleNamespace(first_name="Alice")
+        )
+        svc = service()
+        with patch.object(chat, "_open_registered", AsyncMock(return_value=svc)):
+            await chat._handle_photo(
+                message, photo_from=own, question="describe this"
+            )
+
+        stored = svc.add_message.await_args_list[0].kwargs["content"]
+        self.assertTrue(has_untrusted_content(stored))
+        vision = chat.ai_client.chat_with_image_result.await_args
+        self.assertIn('<untrusted_content source="photo">', vision.kwargs["text"])
+        self.assertIn(
+            UNTRUSTED_SYSTEM_HINT, vision.kwargs["messages"][0]["content"]
+        )
+
     async def test_forwarded_photo_to_generation_marks_history(self):
         message = photo_message(forwarded=True, caption="draw it")
         svc = service()
