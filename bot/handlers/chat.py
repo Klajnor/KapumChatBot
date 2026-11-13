@@ -285,6 +285,79 @@ def _album_key(chat_id: int, group_id: str) -> str:
     return f"{chat_id}:{group_id}"
 
 
+# Пересланный пост из канала Telegram не всегда приходит одним обновлением:
+# длинный текст и медиагруппа доставляются двумя сообщениями. Текст ждёт
+# альбом, чтобы пост был проанализирован один раз и целиком.
+_FORWARD_TEXT_MERGE_SECONDS = _ALBUM_COLLECT_SECONDS
+
+
+def _is_forwarded_post(message: Message) -> bool:
+    """Пересланный пост канала: его текст и медиа могли прийти раздельно."""
+    if not is_forwarded(message):
+        return False
+    origin = getattr(message, "forward_origin", None)
+    kind = getattr(origin, "type", None)
+    if kind is None:
+        # Старые объекты Bot API и SimpleNamespace в тестах не знают ``type``:
+        # sender_chat уже означает публикацию канала/группы.
+        kind = "channel" if getattr(origin, "sender_chat", None) is not None else None
+    return kind == "channel"
+
+
+async def _forward_album_key(message: Message) -> str | None:
+    """Ключ собираемого пересланного альбома этого отправителя в этом чате."""
+    sender = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    sender_id = getattr(sender, "id", 0) or 0
+    chat_id = getattr(chat, "id", None)
+    if sender_id <= 0 or chat_id is None:
+        return None
+    prefix = f"{chat_id}:"
+    async with _album_lock:
+        for key, entry in _album_images.items():
+            if not key.startswith(prefix):
+                continue
+            if entry.get("user_id") != sender_id:
+                continue
+            if entry.get("denied") or entry.get("processing"):
+                continue
+            if not entry.get("channel_post"):
+                continue
+            return key
+    return None
+
+
+async def _attach_forward_text(message: Message, text: str) -> bool:
+    """Дописать текст к собираемому альбому того же пересланного поста."""
+    key = await _forward_album_key(message)
+    if key is None:
+        return False
+    async with _album_lock:
+        entry = _album_images.get(key)
+        if entry is None or entry.get("denied") or entry.get("processing"):
+            return False
+        # Альбом без единого скачанного фото уже не будет обработан; текст
+        # лучше ответить отдельно, чем потерять.
+        if not entry.get("images") and not entry.get("pending"):
+            return False
+        entry.setdefault("extra_text", []).append(text)
+        return True
+
+
+async def _absorb_forwarded_post_text(message: Message, text: str) -> bool:
+    """Слить отдельно пришедший текст пересланного поста с его альбомом.
+
+    Telegram иногда доставляет пересланный пост как два сообщения: текст и
+    медиагруппу. Текст коротко ждёт альбом (альбом собирается столько же) и,
+    если тот появился, уходит в один анализ вместе с картинками. Возвращает
+    True, когда отдельного текстового ответа быть не должно.
+    """
+    if await _attach_forward_text(message, text):
+        return True
+    await asyncio.sleep(_FORWARD_TEXT_MERGE_SECONDS)
+    return await _attach_forward_text(message, text)
+
+
 async def _album_access_allowed(user_id: int) -> tuple[bool, str | None]:
     """Check authorization before an album photo is downloaded.
 
@@ -1980,6 +2053,18 @@ async def handle_text(message: Message) -> None:
     if not text:
         return
 
+    # Пересланный пост канала может прийти двумя сообщениями: текст и
+    # медиагруппа. Текст коротко ждёт альбом и анализируется вместе с ним
+    # один раз, а не отдельным ответом.
+    if (
+        not has_quote(message)
+        and getattr(message, "reply_to_message", None) is None
+        and not getattr(message, "media_group_id", None)
+        and _is_forwarded_post(message)
+        and await _absorb_forwarded_post_text(message, text)
+    ):
+        return
+
     # Бесплатные для квоты вопросов помощники тоже вызывают платный AI.
     # Берём слот ДО них. Перед обычным запросом он освобождается: voice уже
     # вызывает helper под своим _guarded, двойной слот ему не нужен.
@@ -3064,6 +3149,9 @@ async def _handle_album_photo(message: Message) -> None:
                     "last": now,
                     "user_id": sender_id,
                     "pending": 0,
+                    # Пост канала может прийти текстом и альбомом отдельно:
+                    # только у пересланного поста текст сливается с фото.
+                    "channel_post": _is_forwarded_post(message),
                 }
                 _album_total_bytes[key] = 0
         if notice is None and entry is not None:
@@ -3141,11 +3229,15 @@ async def _handle_album_photo(message: Message) -> None:
             return
         entry["processing"] = True
         images: list[tuple[str, bytes]] = entry.pop("images", [])
+        # Текст пересланного поста, пришедший отдельным сообщением, уже здесь.
+        extra_text: list[str] = entry.pop("extra_text", [])
         first_message: Message = entry["message"]
 
     try:
         if images:
-            await _guarded(first_message, lambda m: _process_album(m, images))
+            await _guarded(
+                first_message, lambda m: _process_album(m, images, extra_text)
+            )
     finally:
         images.clear()
         image_bytes = None
@@ -3157,7 +3249,9 @@ async def _handle_album_photo(message: Message) -> None:
 @tracked("Photo album")
 @stage("Analyzing album")
 async def _process_album(
-    message: Message, images: list[tuple[str, bytes]]
+    message: Message,
+    images: list[tuple[str, bytes]],
+    extra_text: list[str] | None = None,
 ) -> None:
     """Process a collected album: vision analysis, generation or enhancement."""
     user = message.from_user
@@ -3167,6 +3261,11 @@ async def _process_album(
         return
 
     caption = strip_bot_mention(message.caption or "")
+    # Текст пересланного поста мог прийти отдельным сообщением: дополняем
+    # подпись, чтобы один анализ видел и все картинки, и весь текст.
+    extra = [part.strip() for part in (extra_text or []) if part.strip()]
+    if extra:
+        caption = "\n\n".join(part for part in [caption, *extra] if part)
     quoted_context = _describe_reply_context(message)
 
     service = await _open_registered(message)
@@ -3180,7 +3279,7 @@ async def _process_album(
             return
         settings = await service.get_user_settings(user.id)
         image_origin = _photo_provenance(message, None, user_id=user.id)
-        caption_tainted = is_forwarded(message)
+        caption_tainted = is_forwarded(message) or bool(extra)
 
         # Detect intent via AI before processing (safe: defaults to 'analyze').
         # Подпись пересланного альбома — чужой текст, классификатор не зовём.
