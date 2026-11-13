@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Router
@@ -289,6 +290,158 @@ def _album_key(chat_id: int, group_id: str) -> str:
 # длинный текст и медиагруппа доставляются двумя сообщениями. Текст ждёт
 # альбом, чтобы пост был проанализирован один раз и целиком.
 _FORWARD_TEXT_MERGE_SECONDS = _ALBUM_COLLECT_SECONDS
+
+# Десяток сообщений, пересланных из личной переписки, тоже должен стать одним
+# запросом: пачка собирается, пока сообщения идут, и закрывается после
+# _FORWARD_TEXT_MERGE_SECONDS тишины.
+_forward_bursts: dict[str, dict[str, Any]] = {}
+_forward_burst_lock: asyncio.Lock = asyncio.Lock()
+_FORWARD_BURST_MAX_PARTS = 20
+
+
+def _is_forwarded_personal(message: Message) -> bool:
+    """Пересылка из личной переписки: авторы — люди, а не канал."""
+    if not is_forwarded(message) or not _is_private(message):
+        return False
+    origin = getattr(message, "forward_origin", None)
+    kind = getattr(origin, "type", None)
+    if kind is None:
+        # Старые объекты Bot API не знают ``type``: автор-пользователь есть.
+        kind = "user" if getattr(origin, "sender_user", None) is not None else None
+    return kind in ("user", "hidden_user")
+
+
+def _forward_burst_key(message: Message) -> str | None:
+    """Ключ пачки: чат и тот, кто пересылает сообщения."""
+    user = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    user_id = getattr(user, "id", 0) or 0
+    chat_id = getattr(chat, "id", None)
+    if user_id <= 0 or chat_id is None:
+        return None
+    return f"{chat_id}:{user_id}"
+
+
+def _forward_burst_message(message: Message, burst_id: str) -> Any:
+    """Копия пересланного фото с общим ``media_group_id`` для сбора альбома."""
+    return SimpleNamespace(
+        media_group_id=burst_id,
+        chat=message.chat,
+        from_user=message.from_user,
+        caption="",
+        photo=message.photo,
+        bot=message.bot,
+        answer=message.answer,
+        message_id=getattr(message, "message_id", 0),
+        message_thread_id=getattr(message, "message_thread_id", None),
+        forward_origin=getattr(message, "forward_origin", None),
+        forward_date=getattr(message, "forward_date", None),
+        reply_to_message=None,
+        external_reply=None,
+        quote=None,
+    )
+
+
+async def _queue_forwarded_burst(message: Message) -> bool:
+    """Собрать пересланные из личной переписки сообщения в одну пачку.
+
+    Возвращает True, если сообщение принято в пачку и отвечать на него
+    отдельно не нужно. Пачка закрывается после паузы ``_FORWARD_TEXT_MERGE_SECONDS``
+    и обрабатывается одним запросом: весь текст и все картинки вместе.
+    """
+    if not _is_forwarded_personal(message):
+        return False
+    if getattr(message, "reply_to_message", None) is not None or has_quote(message):
+        return False
+    key = _forward_burst_key(message)
+    if key is None:
+        return False
+    async with _forward_burst_lock:
+        entry = _forward_bursts.get(key)
+        if entry is None:
+            entry = _forward_bursts[key] = {"parts": [], "task": None}
+        previous = entry.get("task")
+        if previous is not None and previous is not asyncio.current_task():
+            previous.cancel()
+        if len(entry["parts"]) < _FORWARD_BURST_MAX_PARTS:
+            entry["parts"].append(message)
+        else:
+            logger.warning(
+                "Forwarded burst %s exceeded %d messages; extra one skipped",
+                key,
+                _FORWARD_BURST_MAX_PARTS,
+            )
+        entry["task"] = asyncio.create_task(_flush_forwarded_burst(key))
+    return True
+
+
+async def _flush_forwarded_burst(key: str) -> None:
+    """Закрыть пачку после паузы и обработать её одним запросом."""
+    try:
+        await asyncio.sleep(_FORWARD_TEXT_MERGE_SECONDS)
+        async with _forward_burst_lock:
+            entry = _forward_bursts.get(key)
+            if entry is None or entry.get("task") is not asyncio.current_task():
+                return
+            _forward_bursts.pop(key, None)
+            parts = list(entry.get("parts", []))
+        if parts:
+            await _process_forwarded_burst(parts)
+    except asyncio.CancelledError:
+        return
+    except Exception:  # noqa: BLE001 - фоновая пачка не должна падать молча
+        logger.exception("Forwarded burst processing failed")
+
+
+async def _process_forwarded_burst(parts: list[Message]) -> None:
+    """Ответить на пачку пересланных сообщений один раз, целиком."""
+    texts: list[str] = []
+    photos: list[Message] = []
+    for part in parts:
+        if getattr(part, "photo", None):
+            photos.append(part)
+        text = message_text(part).strip()
+        if text:
+            texts.append(text)
+    if not photos:
+        if texts:
+            await handle_text(parts[0], merged_text="\n\n".join(texts))
+        return
+
+    anchor = photos[0]
+    sender_id = getattr(getattr(anchor, "from_user", None), "id", 0) or 0
+    allowed, denial = await _album_access_allowed(sender_id)
+    if not allowed:
+        if denial:
+            await safe_answer(anchor, denial)
+        return
+
+    burst_id = f"forwarded-{time.monotonic_ns()}"
+    key = _album_key(anchor.chat.id, burst_id)
+    async with _album_lock:
+        _album_images[key] = {
+            "images": [],
+            "message": _forward_burst_message(anchor, burst_id),
+            "last": time.monotonic(),
+            "user_id": sender_id,
+            "pending": 0,
+            # Весь текст пачки идёт в один запрос вместе со всеми фото.
+            "extra_text": list(texts),
+            "merged_text": True,
+        }
+        _album_total_bytes[key] = 0
+    try:
+        await asyncio.gather(
+            *(
+                _handle_album_photo(_forward_burst_message(part, burst_id))
+                for part in photos
+            )
+        )
+    finally:
+        async with _album_lock:
+            _album_images.pop(key, None)
+            _album_total_bytes.pop(key, None)
+            _album_download_bytes.pop(key, None)
 
 
 def _is_forwarded_post(message: Message) -> bool:
@@ -2036,12 +2189,16 @@ async def _answer_with_ai(
 
 @router.message(F.rich_message | (F.text & ~F.text.startswith("/")))
 @tracked("Chat request")
-async def handle_text(message: Message) -> None:
-    """Handle text and rich messages: chat with the AI."""
+async def handle_text(message: Message, merged_text: str | None = None) -> None:
+    """Handle text and rich messages: chat with the AI.
+
+    ``merged_text`` is used internally when a batch of forwarded messages is
+    answered as one question; Telegram handlers always call without it.
+    """
     user = message.from_user
     if user is None:
         return
-    raw_text = message_text(message)
+    raw_text = message_text(message) if merged_text is None else merged_text
     if not raw_text and not has_quote(message):
         return
     if not _is_addressed(message):
@@ -2051,6 +2208,11 @@ async def handle_text(message: Message) -> None:
     if not text and has_quote(message):
         text = DEFAULT_QUOTE_QUESTION
     if not text:
+        return
+
+    # Пересланные из личной переписки сообщения приходят по одному: копим их
+    # в пачку и отвечаем один раз, когда поток сообщений закончился.
+    if merged_text is None and await _queue_forwarded_burst(message):
         return
 
     # Пересланный пост канала может прийти двумя сообщениями: текст и
@@ -2264,6 +2426,9 @@ async def _handle_voice(message: Message) -> None:
 @router.message(F.photo)
 async def handle_photo(message: Message) -> None:
     """Photos: route to album (media group), vision analysis, or generation."""
+    # Пересланные из личной переписки фото копятся вместе с текстом пачки.
+    if await _queue_forwarded_burst(message):
+        return
     # Media groups (albums) are collected and processed together.
     if message.media_group_id:
         # Do not even start collecting a group photo the bot was not asked
@@ -3174,7 +3339,13 @@ async def _handle_album_photo(message: Message) -> None:
                 notice = _ALBUM_BUDGET_NOTICE
             if not entry.get("processing"):
                 entry["last"] = now
-            if not entry["message"].caption and message.caption:
+            # Пачка пересланных сообщений хранит весь текст в extra_text:
+            # подпись отдельного фото не должна подменить якорь и продублировать его.
+            if (
+                not entry.get("merged_text")
+                and not entry["message"].caption
+                and message.caption
+            ):
                 entry["message"] = message
             if notice is None:
                 entry["pending"] = entry.get("pending", 0) + 1
