@@ -250,6 +250,7 @@ class ReminderHelperGateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat, "maybe_timezone_dialog", AsyncMock(return_value=False)),
             patch.object(chat, "maybe_freeform_reminder", AsyncMock(side_effect=slow)) as helper,
             patch.object(chat, "safe_answer", AsyncMock()) as answer,
+            patch.object(chat, "_queue_message_batch", AsyncMock(return_value=False)),
         ):
             first = asyncio.create_task(chat.handle_text(self.message))
             try:
@@ -272,6 +273,7 @@ class ReminderHelperGateTests(unittest.IsolatedAsyncioTestCase):
                 session=SimpleNamespace(close=AsyncMock()),
             ))),
             patch.object(chat, "_consume_access", AsyncMock(return_value=None)) as consume,
+            patch.object(chat, "_queue_message_batch", AsyncMock(return_value=False)),
         ):
             await chat.handle_text(self.message)
         consume.assert_awaited_once()

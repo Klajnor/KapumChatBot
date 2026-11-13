@@ -107,6 +107,21 @@ def forwarded_photo(file_id: str = "f1", *, caption: str = ""):
     return message
 
 
+def own_text(text: str):
+    message = album_message(forwarded=False)
+    message.caption = None
+    message.media_group_id = None
+    message.text = text
+    return message
+
+
+def own_photo(file_id: str = "f1", *, caption: str = ""):
+    message = album_message(caption=caption, forwarded=False)
+    message.media_group_id = None
+    message.photo = [SimpleNamespace(file_id=file_id, file_size=10)]
+    return message
+
+
 class ForwardedPostMergeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         chat._album_images.clear()
@@ -154,12 +169,18 @@ class ForwardedPostMergeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(chat._is_forwarded_post(message))
 
-    async def test_handle_text_does_not_answer_forwarded_post_twice(self):
+    async def test_channel_post_text_joins_album_in_group(self):
         message = post_text()
+        message.chat = SimpleNamespace(id=-100, type="supergroup")
+        album = album_message()
+        album.chat = message.chat
         key = chat._album_key(message.chat.id, "grp")
-        chat._album_images[key] = collecting_album(album_message())
+        chat._album_images[key] = collecting_album(album)
 
-        with patch.object(chat, "_open_registered", AsyncMock()) as register:
+        with (
+            patch.object(chat, "_is_addressed", return_value=True),
+            patch.object(chat, "_open_registered", AsyncMock()) as register,
+        ):
             await chat.handle_text(message)
 
         register.assert_not_awaited()
@@ -202,15 +223,15 @@ class ForwardedPostMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(has_untrusted_content(stored))
 
 
-class ForwardedBurstTests(unittest.IsolatedAsyncioTestCase):
+class MessageBatchTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         chat._album_images.clear()
         chat._album_total_bytes.clear()
         chat._album_download_bytes.clear()
-        chat._forward_bursts.clear()
+        chat._message_batches.clear()
         for name, value in (
             ("_album_lock", asyncio.Lock()),
-            ("_forward_burst_lock", asyncio.Lock()),
+            ("_message_batch_lock", asyncio.Lock()),
             ("_FORWARD_TEXT_MERGE_SECONDS", 0),
         ):
             item = patch.object(chat, name, value)
@@ -220,7 +241,7 @@ class ForwardedBurstTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         tasks = [
             entry["task"]
-            for entry in chat._forward_bursts.values()
+            for entry in chat._message_batches.values()
             if entry.get("task") is not None
         ]
         for task in tasks:
@@ -230,21 +251,28 @@ class ForwardedBurstTests(unittest.IsolatedAsyncioTestCase):
                 await task
             except asyncio.CancelledError:
                 pass
-        chat._forward_bursts.clear()
+        chat._message_batches.clear()
         chat._album_images.clear()
         chat._album_total_bytes.clear()
         chat._album_download_bytes.clear()
 
-    async def test_batch_of_forwarded_texts_is_answered_once(self):
-        first = forwarded_text("First message")
-        second = forwarded_text("Second message")
-        third = forwarded_text("Third message")
+    async def _settle(self, message):
+        """Дождаться обработки пачки, к которой относится сообщение."""
+        key = chat._batch_key(message)
+        await asyncio.sleep(0)
+        entry = chat._message_batches.get(key)
+        if entry is not None and entry.get("task") is not None:
+            await entry["task"]
+
+    async def test_batch_of_messages_is_answered_once(self):
+        first = own_text("First message")
+        second = own_text("Second message")
+        third = own_text("Third message")
 
         with patch.object(chat, "handle_text", AsyncMock()) as answer:
             for message in (first, second, third):
-                self.assertTrue(await chat._queue_forwarded_burst(message))
-            entry = chat._forward_bursts[chat._forward_burst_key(first)]
-            await entry["task"]
+                self.assertTrue(await chat._queue_message_batch(message))
+            await self._settle(first)
 
         answer.assert_awaited_once()
         self.assertIs(answer.await_args.args[0], first)
@@ -253,16 +281,30 @@ class ForwardedBurstTests(unittest.IsolatedAsyncioTestCase):
             "First message\n\nSecond message\n\nThird message",
         )
 
+    async def test_forwarded_text_is_merged_with_own_question(self):
+        own = own_text("My question")
+        forwarded = forwarded_text("Somebody else's text")
+
+        with patch.object(chat, "handle_text", AsyncMock()) as answer:
+            await chat._process_message_batch([own, forwarded])
+
+        answer.assert_awaited_once()
+        # Весь общий вопрос уходит как недоверенный: якорь — пересланная часть.
+        self.assertIs(answer.await_args.args[0], forwarded)
+        self.assertIn("My question", answer.await_args.kwargs["merged_text"])
+        self.assertIn("Somebody else's text", answer.await_args.kwargs["merged_text"])
+
     async def test_batch_with_photos_uses_one_album_and_all_texts(self):
-        text = forwarded_text("Caption text")
-        first = forwarded_photo("f1", caption="Photo one")
-        second = forwarded_photo("f2")
-        seen: dict[str, Any] = {"groups": set(), "extra": None}
+        text = own_text("Caption text")
+        first = own_photo("f1", caption="Photo one")
+        second = own_photo("f2")
+        seen: dict[str, Any] = {"groups": set(), "extra": None, "origin": "unset"}
 
         async def fake_handler(proxy):
             key = chat._album_key(proxy.chat.id, proxy.media_group_id)
             seen["groups"].add(proxy.media_group_id)
             seen["extra"] = list(chat._album_images[key].get("extra_text", []))
+            seen["origin"] = proxy.forward_origin
 
         with (
             patch.object(
@@ -272,49 +314,56 @@ class ForwardedBurstTests(unittest.IsolatedAsyncioTestCase):
                 chat, "_handle_album_photo", AsyncMock(side_effect=fake_handler)
             ) as handler,
         ):
-            await chat._process_forwarded_burst([text, first, second])
+            await chat._process_message_batch([text, first, second])
 
         self.assertEqual(handler.await_count, 2)
         self.assertEqual(len(seen["groups"]), 1)
-        self.assertEqual(seen["extra"], ["Caption text", "Photo one"])
+        self.assertEqual(seen["extra"], ["Caption text\n\nPhoto one"])
+        self.assertIsNone(seen["origin"])
         self.assertEqual(chat._album_images, {})
         self.assertEqual(chat._album_total_bytes, {})
 
-    async def test_channel_forward_is_not_a_personal_batch(self):
-        message = forwarded_text("Channel text")
-        message.forward_origin = SimpleNamespace(
-            type="channel", sender_chat=SimpleNamespace(id=9, title="Channel")
-        )
+    async def test_forwarded_photo_taints_the_whole_batch(self):
+        own = own_text("My question")
+        photo = forwarded_photo("f1")
+        seen: dict[str, Any] = {}
 
-        self.assertFalse(await chat._queue_forwarded_burst(message))
-        self.assertEqual(chat._forward_bursts, {})
+        async def fake_handler(proxy):
+            seen["origin"] = proxy.forward_origin
 
-    async def test_own_message_is_not_a_personal_batch(self):
-        message = forwarded_text("My own text")
-        message.forward_origin = None
+        with (
+            patch.object(
+                chat, "_album_access_allowed", AsyncMock(return_value=(True, None))
+            ),
+            patch.object(
+                chat, "_handle_album_photo", AsyncMock(side_effect=fake_handler)
+            ),
+        ):
+            await chat._process_message_batch([own, photo])
 
-        self.assertFalse(await chat._queue_forwarded_burst(message))
+        self.assertEqual(seen["origin"].type, "user")
 
-    async def test_group_forward_is_not_a_personal_batch(self):
-        message = forwarded_text("Group text")
+    async def test_group_message_is_not_batched(self):
+        message = own_text("Group text")
         message.chat = SimpleNamespace(id=-100, type="supergroup")
 
-        self.assertFalse(await chat._queue_forwarded_burst(message))
+        self.assertFalse(await chat._queue_message_batch(message))
+        self.assertEqual(chat._message_batches, {})
 
-    async def test_reply_forwarded_message_is_not_batched(self):
-        message = forwarded_text("Reply text")
+    async def test_reply_message_is_not_batched(self):
+        message = own_text("Reply text")
         message.reply_to_message = SimpleNamespace(text="quoted")
 
-        self.assertFalse(await chat._queue_forwarded_burst(message))
+        self.assertFalse(await chat._queue_message_batch(message))
 
-    async def test_handle_text_queues_personal_forward(self):
-        message = forwarded_text("Only message")
+    async def test_handle_text_queues_message(self):
+        message = own_text("Only message")
 
         with patch.object(chat, "_open_registered", AsyncMock()) as register:
             await chat.handle_text(message)
 
         register.assert_not_awaited()
-        self.assertIn(chat._forward_burst_key(message), chat._forward_bursts)
+        self.assertIn(chat._batch_key(message), chat._message_batches)
 
 
 if __name__ == "__main__":

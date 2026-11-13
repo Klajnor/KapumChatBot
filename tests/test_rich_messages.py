@@ -174,6 +174,7 @@ class RichChatTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat, "maybe_timezone_dialog", AsyncMock(return_value=False)),
             patch.object(chat, "maybe_freeform_reminder", AsyncMock(return_value=False)),
             patch.object(chat, "maybe_status_request", AsyncMock(return_value=False)),
+            patch.object(chat, "_queue_message_batch", AsyncMock(return_value=False)),
             patch("bot.handlers.brain.maybe_remember", AsyncMock(return_value=False)),
             patch.object(config, "enable_link_analysis", False),
         ):

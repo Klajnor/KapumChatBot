@@ -291,28 +291,27 @@ def _album_key(chat_id: int, group_id: str) -> str:
 # альбом, чтобы пост был проанализирован один раз и целиком.
 _FORWARD_TEXT_MERGE_SECONDS = _ALBUM_COLLECT_SECONDS
 
-# Десяток сообщений, пересланных из личной переписки, тоже должен стать одним
-# запросом: пачка собирается, пока сообщения идут, и закрывается после
+# Пачка сообщений и картинок из личного чата — это один общий вопрос:
+# сообщения копятся, пока идут, и закрываются после
 # _FORWARD_TEXT_MERGE_SECONDS тишины.
-_forward_bursts: dict[str, dict[str, Any]] = {}
-_forward_burst_lock: asyncio.Lock = asyncio.Lock()
-_FORWARD_BURST_MAX_PARTS = 20
+_message_batches: dict[str, dict[str, Any]] = {}
+_message_batch_lock: asyncio.Lock = asyncio.Lock()
+_MESSAGE_BATCH_MAX_PARTS = 20
+# Весь общий вопрос уходит модели одним текстом: как и rich-сообщение,
+# ограничиваем его, чтобы пачка не вышла за контекст модели.
+_MESSAGE_BATCH_MAX_CHARS = 32000
 
 
-def _is_forwarded_personal(message: Message) -> bool:
-    """Пересылка из личной переписки: авторы — люди, а не канал."""
-    if not is_forwarded(message) or not _is_private(message):
+def _is_batchable_message(message: Message) -> bool:
+    """Личное сообщение, которое объединяется с соседними в один вопрос."""
+    chat = getattr(message, "chat", None)
+    if getattr(chat, "type", None) != ChatType.PRIVATE:
         return False
-    origin = getattr(message, "forward_origin", None)
-    kind = getattr(origin, "type", None)
-    if kind is None:
-        # Старые объекты Bot API не знают ``type``: автор-пользователь есть.
-        kind = "user" if getattr(origin, "sender_user", None) is not None else None
-    return kind in ("user", "hidden_user")
+    return getattr(message, "reply_to_message", None) is None and not has_quote(message)
 
 
-def _forward_burst_key(message: Message) -> str | None:
-    """Ключ пачки: чат и тот, кто пересылает сообщения."""
+def _batch_key(message: Message) -> str | None:
+    """Ключ пачки: личный чат и отправитель."""
     user = getattr(message, "from_user", None)
     chat = getattr(message, "chat", None)
     user_id = getattr(user, "id", 0) or 0
@@ -322,8 +321,15 @@ def _forward_burst_key(message: Message) -> str | None:
     return f"{chat_id}:{user_id}"
 
 
-def _forward_burst_message(message: Message, burst_id: str) -> Any:
-    """Копия пересланного фото с общим ``media_group_id`` для сбора альбома."""
+def _batch_message(
+    message: Message, burst_id: str, *, origin: Message | None = None
+) -> Any:
+    """Копия фото с общим ``media_group_id`` для сбора альбома пачки.
+
+    ``origin`` задаёт происхождение: если в пачке есть пересланное
+    сообщение, весь общий вопрос считается чужим и получает taint.
+    """
+    source = origin or message
     return SimpleNamespace(
         media_group_id=burst_id,
         chat=message.chat,
@@ -334,39 +340,38 @@ def _forward_burst_message(message: Message, burst_id: str) -> Any:
         answer=message.answer,
         message_id=getattr(message, "message_id", 0),
         message_thread_id=getattr(message, "message_thread_id", None),
-        forward_origin=getattr(message, "forward_origin", None),
-        forward_date=getattr(message, "forward_date", None),
+        forward_origin=getattr(source, "forward_origin", None),
+        forward_date=getattr(source, "forward_date", None),
         reply_to_message=None,
         external_reply=None,
         quote=None,
     )
 
 
-async def _queue_forwarded_burst(message: Message) -> bool:
-    """Собрать пересланные из личной переписки сообщения в одну пачку.
+async def _queue_message_batch(message: Message) -> bool:
+    """Собрать соседние личные сообщения в одну пачку.
 
     Возвращает True, если сообщение принято в пачку и отвечать на него
-    отдельно не нужно. Пачка закрывается после паузы ``_FORWARD_TEXT_MERGE_SECONDS``
-    и обрабатывается одним запросом: весь текст и все картинки вместе.
+    отдельно не нужно. Пачка закрывается после паузы
+    ``_FORWARD_TEXT_MERGE_SECONDS`` и обрабатывается одним запросом: весь
+    текст и все картинки вместе, как один общий вопрос.
     """
-    if not _is_forwarded_personal(message):
+    if not _is_batchable_message(message):
         return False
-    if getattr(message, "reply_to_message", None) is not None or has_quote(message):
-        return False
-    key = _forward_burst_key(message)
+    key = _batch_key(message)
     if key is None:
         return False
-    async with _forward_burst_lock:
-        entry = _forward_bursts.get(key)
+    async with _message_batch_lock:
+        entry = _message_batches.get(key)
         if entry is None:
-            entry = _forward_bursts[key] = {"parts": [], "task": None}
+            entry = _message_batches[key] = {"parts": [], "task": None}
         previous = entry.get("task")
         if previous is not None and previous is not asyncio.current_task():
             previous.cancel()
-        if len(entry["parts"]) < _FORWARD_BURST_MAX_PARTS:
+        if len(entry["parts"]) < _MESSAGE_BATCH_MAX_PARTS:
             entry["parts"].append(message)
             logger.info(
-                "Forwarded burst queued: chat=%s user=%s message=%s part=%d "
+                "Message batch queued: chat=%s user=%s message=%s part=%d "
                 "media_group=%s",
                 getattr(getattr(message, "chat", None), "id", None),
                 getattr(getattr(message, "from_user", None), "id", 0),
@@ -376,34 +381,34 @@ async def _queue_forwarded_burst(message: Message) -> bool:
             )
         else:
             logger.warning(
-                "Forwarded burst %s exceeded %d messages; extra one skipped",
+                "Message batch %s exceeded %d messages; extra one skipped",
                 key,
-                _FORWARD_BURST_MAX_PARTS,
+                _MESSAGE_BATCH_MAX_PARTS,
             )
-        entry["task"] = asyncio.create_task(_flush_forwarded_burst(key))
+        entry["task"] = asyncio.create_task(_flush_message_batch(key))
     return True
 
 
-async def _flush_forwarded_burst(key: str) -> None:
+async def _flush_message_batch(key: str) -> None:
     """Закрыть пачку после паузы и обработать её одним запросом."""
     try:
         await asyncio.sleep(_FORWARD_TEXT_MERGE_SECONDS)
-        async with _forward_burst_lock:
-            entry = _forward_bursts.get(key)
+        async with _message_batch_lock:
+            entry = _message_batches.get(key)
             if entry is None or entry.get("task") is not asyncio.current_task():
                 return
-            _forward_bursts.pop(key, None)
+            _message_batches.pop(key, None)
             parts = list(entry.get("parts", []))
         if parts:
-            await _process_forwarded_burst(parts)
+            await _process_message_batch(parts)
     except asyncio.CancelledError:
         return
     except Exception:  # noqa: BLE001 - фоновая пачка не должна падать молча
-        logger.exception("Forwarded burst processing failed")
+        logger.exception("Message batch processing failed")
 
 
-async def _process_forwarded_burst(parts: list[Message]) -> None:
-    """Ответить на пачку пересланных сообщений один раз, целиком."""
+async def _process_message_batch(parts: list[Message]) -> None:
+    """Ответить на пачку сообщений один раз, как на один общий вопрос."""
     texts: list[str] = []
     photos: list[Message] = []
     for part in parts:
@@ -412,14 +417,23 @@ async def _process_forwarded_burst(parts: list[Message]) -> None:
         text = message_text(part).strip()
         if text:
             texts.append(text)
+
+    # Чужой текст в пачке делает весь общий вопрос недоверенным, даже если
+    # остальные сообщения написал сам пользователь.
+    taint_source = next((part for part in parts if is_forwarded(part)), None)
+    merged_text = "\n\n".join(texts)
+    if len(merged_text) > _MESSAGE_BATCH_MAX_CHARS:
+        merged_text = merged_text[:_MESSAGE_BATCH_MAX_CHARS] + "…"
+
     if not photos:
         if texts:
             logger.info(
-                "Forwarded burst text: messages=%d text_chars=%d",
+                "Message batch text: messages=%d text_chars=%d untrusted=%s",
                 len(parts),
-                sum(len(text) for text in texts),
+                len(merged_text),
+                taint_source is not None,
             )
-            await handle_text(parts[0], merged_text="\n\n".join(texts))
+            await handle_text(taint_source or parts[0], merged_text=merged_text)
         return
 
     anchor = photos[0]
@@ -430,31 +444,35 @@ async def _process_forwarded_burst(parts: list[Message]) -> None:
             await safe_answer(anchor, denial)
         return
 
-    burst_id = f"forwarded-{time.monotonic_ns()}"
+    burst_id = f"batch-{time.monotonic_ns()}"
     key = _album_key(anchor.chat.id, burst_id)
     logger.info(
-        "Forwarded burst album: chat=%s user=%s photos=%d text_parts=%d",
+        "Message batch album: chat=%s user=%s photos=%d text_parts=%d "
+        "untrusted=%s",
         anchor.chat.id,
         sender_id,
         len(photos),
         len(texts),
+        taint_source is not None,
     )
     async with _album_lock:
         _album_images[key] = {
             "images": [],
-            "message": _forward_burst_message(anchor, burst_id),
+            "message": _batch_message(anchor, burst_id, origin=taint_source),
             "last": time.monotonic(),
             "user_id": sender_id,
             "pending": 0,
             # Весь текст пачки идёт в один запрос вместе со всеми фото.
-            "extra_text": list(texts),
+            "extra_text": [merged_text] if merged_text else [],
             "merged_text": True,
         }
         _album_total_bytes[key] = 0
     try:
         await asyncio.gather(
             *(
-                _handle_album_photo(_forward_burst_message(part, burst_id))
+                _handle_album_photo(
+                    _batch_message(part, burst_id, origin=taint_source)
+                )
                 for part in photos
             )
         )
@@ -2231,13 +2249,13 @@ async def handle_text(message: Message, merged_text: str | None = None) -> None:
     if not text:
         return
 
-    # Пересланные из личной переписки сообщения приходят по одному: копим их
-    # в пачку и отвечаем один раз, когда поток сообщений закончился.
-    if merged_text is None and await _queue_forwarded_burst(message):
+    # Пачка сообщений из личного чата — один общий вопрос: копим соседние
+    # сообщения и отвечаем один раз, когда поток закончился.
+    if merged_text is None and await _queue_message_batch(message):
         return
 
-    # Пересланный пост канала может прийти двумя сообщениями: текст и
-    # медиагруппа. Текст коротко ждёт альбом и анализируется вместе с ним
+    # Пересланный пост канала в группе может прийти двумя сообщениями: текст
+    # и медиагруппа. Текст коротко ждёт альбом и анализируется вместе с ним
     # один раз, а не отдельным ответом.
     if (
         not has_quote(message)
@@ -2447,8 +2465,8 @@ async def _handle_voice(message: Message) -> None:
 @router.message(F.photo)
 async def handle_photo(message: Message) -> None:
     """Photos: route to album (media group), vision analysis, or generation."""
-    # Пересланные из личной переписки фото копятся вместе с текстом пачки.
-    if await _queue_forwarded_burst(message):
+    # Пачка картинок и сообщений из личного чата анализируется один раз.
+    if await _queue_message_batch(message):
         return
     # Media groups (albums) are collected and processed together.
     if message.media_group_id:
@@ -3471,7 +3489,9 @@ async def _process_album(
             return
         settings = await service.get_user_settings(user.id)
         image_origin = _photo_provenance(message, None, user_id=user.id)
-        caption_tainted = is_forwarded(message) or bool(extra)
+        # Taint задаёт происхождение: пересланная часть пачки подставляет свой
+        # forward_origin в прокси, свой текст в пачке остаётся доверенным.
+        caption_tainted = is_forwarded(message)
 
         # Detect intent via AI before processing (safe: defaults to 'analyze').
         # Подпись пересланного альбома — чужой текст, классификатор не зовём.
