@@ -371,7 +371,7 @@ class BrainRichTests(unittest.IsolatedAsyncioTestCase):
 
     def _pending(self, origin: Message):
         brain._pending["key"] = brain.PendingForward(
-            message=origin, expires=time.monotonic() + 3600
+            parts=[origin], expires=time.monotonic() + 3600
         )
         self.addCleanup(lambda: brain._pending.pop("key", None))
 

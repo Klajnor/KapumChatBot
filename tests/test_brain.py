@@ -271,7 +271,7 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forward_choice_bound_to_owner_and_expires(self) -> None:
         origin = message("forwarded text")
-        brain._pending["token"] = brain.PendingForward(origin, 0)
+        brain._pending["token"] = brain.PendingForward([origin], 0)
         callback = CallbackQuery(id="c", from_user=origin.from_user,
                                  chat_instance="c", message=message(), data="brain:forward:token")
         with (
@@ -299,7 +299,7 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forward_save_uses_original_text_not_button_message(self) -> None:
         origin = message("original forwarded text")
-        brain._pending["token"] = brain.PendingForward(origin, time.monotonic() + 60)
+        brain._pending["token"] = brain.PendingForward([origin], time.monotonic() + 60)
         callback = CallbackQuery(id="c", from_user=origin.from_user, chat_instance="c",
                                  message=message("choice prompt"), data="brain:forward:token")
         with (
@@ -314,7 +314,7 @@ class BrainTests(unittest.IsolatedAsyncioTestCase):
         from bot.handlers import chat
 
         origin = message("original")
-        brain._pending["token"] = brain.PendingForward(origin, time.monotonic() + 60)
+        brain._pending["token"] = brain.PendingForward([origin], time.monotonic() + 60)
         callback = CallbackQuery(id="c", from_user=origin.from_user, chat_instance="c",
                                  message=message(), data="brain:analyze:token")
         with (

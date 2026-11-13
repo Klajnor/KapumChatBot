@@ -365,6 +365,15 @@ async def _queue_forwarded_burst(message: Message) -> bool:
             previous.cancel()
         if len(entry["parts"]) < _FORWARD_BURST_MAX_PARTS:
             entry["parts"].append(message)
+            logger.info(
+                "Forwarded burst queued: chat=%s user=%s message=%s part=%d "
+                "media_group=%s",
+                getattr(getattr(message, "chat", None), "id", None),
+                getattr(getattr(message, "from_user", None), "id", 0),
+                getattr(message, "message_id", 0),
+                len(entry["parts"]),
+                getattr(message, "media_group_id", None),
+            )
         else:
             logger.warning(
                 "Forwarded burst %s exceeded %d messages; extra one skipped",
@@ -405,6 +414,11 @@ async def _process_forwarded_burst(parts: list[Message]) -> None:
             texts.append(text)
     if not photos:
         if texts:
+            logger.info(
+                "Forwarded burst text: messages=%d text_chars=%d",
+                len(parts),
+                sum(len(text) for text in texts),
+            )
             await handle_text(parts[0], merged_text="\n\n".join(texts))
         return
 
@@ -418,6 +432,13 @@ async def _process_forwarded_burst(parts: list[Message]) -> None:
 
     burst_id = f"forwarded-{time.monotonic_ns()}"
     key = _album_key(anchor.chat.id, burst_id)
+    logger.info(
+        "Forwarded burst album: chat=%s user=%s photos=%d text_parts=%d",
+        anchor.chat.id,
+        sender_id,
+        len(photos),
+        len(texts),
+    )
     async with _album_lock:
         _album_images[key] = {
             "images": [],
