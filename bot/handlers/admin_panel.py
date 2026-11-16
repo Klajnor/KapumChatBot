@@ -7,6 +7,11 @@ demoted admin's old menu cannot change anything.
 Levels: guest < user (whitelisted) < admin < owner (``OWNER_IDS``). Admins manage
 guests and users; only owners promote/demote admins. Owners and other admins
 cannot be limited or blocked by an admin.
+
+No destructive action happens on a single tap: per-user settings (limit, usage,
+model) go through an Apply screen, while promoting/demoting admins, granting or
+revoking access, blocking and removing a digest channel require the typed
+``CONFIRM`` word.
 """
 
 from __future__ import annotations
@@ -65,7 +70,8 @@ _awaiting: dict[int, tuple[str, int | None]] = {}  # admin -> (kind, target id)
 # Digest test: admin -> messages collected so far and the status message to update.
 _test_state: dict[int, dict[str, Any]] = {}
 
-# Reset-to-default buttons apply only after this word is typed back (case-sensitive).
+# Reset-to-default and security-critical buttons apply only after this word is typed
+# back (case-sensitive): a single tap must never grant or revoke access.
 CONFIRM_WORD = "CONFIRM"
 
 
@@ -316,7 +322,7 @@ async def cb_admin(callback: CallbackQuery) -> None:
     try:
         target = (
             int(parts[2])
-            if len(parts) > 2 and action not in ("list", "ths")
+            if len(parts) > 2 and action not in ("list", "ths", "ok")
             else None
         )
     except ValueError:
@@ -358,6 +364,9 @@ async def cb_admin(callback: CallbackQuery) -> None:
     elif action.startswith("dg"):
         await _digest_action(callback, actor, action, parts)
         return
+    elif action == "ok":
+        await _confirmed_user_action(callback, actor, parts)
+        return
     elif target is not None:
         await _user_action(callback, actor, action, target, parts)
         return
@@ -368,6 +377,42 @@ def _cancel_markup(back: str = "adm:home") -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✖ Cancel", callback_data=back)
     return b.as_markup()
+
+
+async def _ask_confirm(
+    callback: CallbackQuery,
+    actor: int,
+    action: str,
+    target: int | None,
+    question: str,
+    back: str,
+) -> None:
+    """Ask for ``CONFIRM`` before a security-critical change.
+
+    A typed word cannot be produced by a stray tap, so granting access, blocking
+    an account or promoting an admin never happens from one accidental click.
+    """
+    _awaiting[actor] = (f"confirm:{action}", target)
+    await _show(
+        callback,
+        f"{question}\n\n"
+        f"Type <code>{CONFIRM_WORD}</code> (case-sensitive) to proceed. "
+        "Anything else cancels.",
+        _cancel_markup(back),
+    )
+
+
+async def _ask_apply(
+    callback: CallbackQuery, question: str, apply_data: str, back: str
+) -> None:
+    """Inline two-step confirmation for reversible per-user settings."""
+    b = InlineKeyboardBuilder()
+    b.row(_button("✅ Apply", apply_data), _button("✖ Cancel", back))
+    await _show(
+        callback,
+        f"{question}\n\n<i>Nothing changes until you press Apply.</i>",
+        b.as_markup(),
+    )
 
 
 async def _ask_reset(
@@ -428,7 +473,6 @@ async def _user_action(
         return
 
     arg = parts[3] if len(parts) > 3 else ""
-    notice = ""
 
     if action == "lim":
         if level != "user":
@@ -458,13 +502,26 @@ async def _user_action(
             return
         async with user_service() as service:
             current = await service.get_daily_limit(target)
-            new = max(0, min(MAX_LIMIT, current + delta))
-            await service.set_daily_limit(target, new)
-        notice = f"📊 Limit is now {new}."
+        new = max(0, min(MAX_LIMIT, current + delta))
+        await _ask_apply(
+            callback,
+            f"📊 <b>Change the daily limit for</b> <code>{target}</code>?\n\n"
+            f"{current} → <b>{new}</b>",
+            f"adm:ok:limv:{target}:{new}",
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "rst":
-        async with user_service() as service:
-            done = await service.reset_daily_usage(target)
-        notice = "🔄 Today's usage reset." if done else "ℹ️ No usage today."
+        await _ask_apply(
+            callback,
+            f"🔄 <b>Reset today's usage for</b> <code>{target}</code>?\n\n"
+            "The user gets the full daily limit again.",
+            f"adm:ok:rst:{target}",
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "rsp":
         await _ask_reset(
             callback, actor, "rsp", target, "the system prompt", f"adm:u:{target}"
@@ -472,43 +529,87 @@ async def _user_action(
         await safe_answer_callback(callback)
         return
     elif action == "grant":
-        profile = await _fetch_profile(target)
-        async with user_service() as service:
-            await service.add_allowed_user(target, added_by=actor, **profile)
-        notice = f"✅ Access granted ({config.daily_limit}/day by default)."
+        await _ask_confirm(
+            callback,
+            actor,
+            "grant",
+            target,
+            f"✅ <b>Grant access to</b> <code>{target}</code>?\n\n"
+            f"<i>The user gets {config.daily_limit} questions per day.</i>",
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "revoke":
-        async with user_service() as service:
-            await service.remove_allowed_user(target)
-        notice = "⬇️ Access revoked."
+        await _ask_confirm(
+            callback,
+            actor,
+            "revoke",
+            target,
+            f"⬇️ <b>Revoke access from</b> <code>{target}</code>?",
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "blk":
-        async with user_service() as service:
-            await service.set_blocked(target, level != "blocked")
-        notice = "🔓 Unblocked." if level == "blocked" else "🚫 Blocked."
+        blocking = level != "blocked"
+        await _ask_confirm(
+            callback,
+            actor,
+            "block_on" if blocking else "block_off",
+            target,
+            (
+                f"🚫 <b>Block</b> <code>{target}</code>?\n\n"
+                "<i>The account loses access until it is unblocked.</i>"
+                if blocking
+                else f"🔓 <b>Unblock</b> <code>{target}</code>?"
+            ),
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "adm":
         if not config.is_owner(actor):
             await safe_answer_callback(callback, "Owners only", show_alert=True)
             return
-        async with user_service() as service:
-            await service.set_admin(target, level != "admin")
-        notice = "⬇️ Admin rights removed." if level == "admin" else "🛡 Promoted to admin."
+        promoting = level != "admin"
+        await _ask_confirm(
+            callback,
+            actor,
+            "admin_on" if promoting else "admin_off",
+            target,
+            (
+                f"🛡 <b>Promote</b> <code>{target}</code> <b>to admin</b>?\n\n"
+                "<i>Admins can manage users, guests and the digest.</i>"
+                if promoting
+                else f"⬇️ <b>Remove admin rights from</b> <code>{target}</code>?"
+            ),
+            f"adm:u:{target}",
+        )
+        await safe_answer_callback(callback)
+        return
     elif action == "mdl":
         await _show_models(callback, target)
         await safe_answer_callback(callback)
         return
     elif action == "mset":
         try:
-            model = config.ai_models[int(arg)]["id"]
+            model = config.ai_models[int(arg)]
         except (ValueError, IndexError):
             await safe_answer_callback(callback)
             return
         async with user_service() as service:
-            await service.set_model(target, model)
-        notice = f"🤖 Model set: <code>{html.escape(model)}</code>"
-    else:
+            current = (await service.get_user_settings(target))["model"]
+        await _ask_apply(
+            callback,
+            f"🤖 <b>Change the model for</b> <code>{target}</code>?\n\n"
+            f"<code>{html.escape(current)}</code> → "
+            f"<code>{html.escape(model['id'])}</code>",
+            f"adm:ok:mset:{target}:{arg}",
+            f"adm:u:{target}",
+        )
         await safe_answer_callback(callback)
         return
-
-    await _refresh_card(callback, target, notice)
     await safe_answer_callback(callback)
 
 
@@ -526,6 +627,65 @@ async def _show_models(callback: CallbackQuery, target: int) -> None:
         f"🤖 <b>Model for</b> <code>{target}</code>",
         b.as_markup(),
     )
+
+
+async def _confirmed_user_action(
+    callback: CallbackQuery, actor: int, parts: list[str]
+) -> None:
+    """Apply a per-user setting after the inline Apply button was pressed.
+
+    Rights are re-checked here: the target may have been promoted or blocked
+    while the confirmation screen was open.
+    """
+    sub = parts[2] if len(parts) > 2 else ""
+    try:
+        target = int(parts[3])
+    except (IndexError, ValueError):
+        await safe_answer_callback(callback)
+        return
+    async with user_service() as service:
+        level = await service.get_level(target)
+    if not _can_manage(actor, level):
+        await safe_answer_callback(
+            callback, "You cannot change this account", show_alert=True
+        )
+        return
+
+    if sub == "limv":
+        if level != "user":
+            await safe_answer_callback(
+                callback, "Only for users with access", show_alert=True
+            )
+            return
+        try:
+            value = int(parts[4])
+            if not 0 <= value <= MAX_LIMIT:
+                raise ValueError
+        except (IndexError, ValueError):
+            await safe_answer_callback(callback)
+            return
+        async with user_service() as service:
+            await service.set_daily_limit(target, value)
+        notice = f"📊 Limit is now {value}."
+    elif sub == "rst":
+        async with user_service() as service:
+            done = await service.reset_daily_usage(target)
+        notice = "🔄 Today's usage reset." if done else "ℹ️ No usage today."
+    elif sub == "mset":
+        try:
+            model = config.ai_models[int(parts[4])]["id"]
+        except (IndexError, ValueError):
+            await safe_answer_callback(callback)
+            return
+        async with user_service() as service:
+            await service.set_model(target, model)
+        notice = f"🤖 Model set: <code>{html.escape(model)}</code>"
+    else:
+        await safe_answer_callback(callback)
+        return
+
+    await _refresh_card(callback, target, notice)
+    await safe_answer_callback(callback)
 
 
 # --- Typed input (add user / custom limit) -----------------------------------
@@ -551,6 +711,12 @@ async def on_admin_input(message: Message) -> None:
 
     if kind.startswith("reset:"):
         await _confirm_reset(message, actor, kind.removeprefix("reset:"), target, text)
+        return
+
+    if kind.startswith("confirm:"):
+        await _confirm_action(
+            message, actor, kind.removeprefix("confirm:"), target, text
+        )
         return
 
     if kind == "thbudget":
@@ -651,6 +817,79 @@ async def _confirm_reset(
             else:
                 await service.set_system_prompt(target, config.default_system_prompt)
                 notice = "🧹 System prompt reset to the default."
+    card, markup = await _render_card(actor, target, notice)
+    await message.answer(card, reply_markup=markup)
+
+
+async def _confirm_action(
+    message: Message, actor: int, action: str, target: int | None, text: str
+) -> None:
+    """Apply a security-critical change only after the exact ``CONFIRM`` word.
+
+    The current level is read again: the account may have been promoted,
+    blocked or removed while the confirmation was on screen.
+    """
+    confirmed = text == CONFIRM_WORD
+    cancelled = "✖ Not confirmed — nothing changed."
+
+    if action == "dgx":
+        chat_id = target
+        if confirmed and chat_id is not None:
+            removed = await digest.remove_channel(chat_id)
+            notice = "🗑 Channel removed." if removed else "ℹ️ Not found."
+        else:
+            notice = cancelled
+        screen, markup = await _digest_screen(notice)
+        await message.answer(screen, reply_markup=markup)
+        return
+
+    if target is None:
+        return
+
+    notice = cancelled
+    if confirmed:
+        async with user_service() as service:
+            level = await service.get_level(target)
+        if not _can_manage(actor, level):
+            notice = "⚠️ This account cannot be changed."
+        elif action in ("admin_on", "admin_off"):
+            if not config.is_owner(actor):
+                notice = "⚠️ Owners only."
+            elif level == "owner":
+                notice = "⚠️ Owners cannot be changed."
+            else:
+                async with user_service() as service:
+                    await service.set_admin(target, action == "admin_on")
+                notice = (
+                    "🛡 Promoted to admin."
+                    if action == "admin_on"
+                    else "⬇️ Admin rights removed."
+                )
+        elif action in ("block_on", "block_off"):
+            if level in ("owner", "admin"):
+                notice = "⚠️ Admins cannot be blocked."
+            else:
+                async with user_service() as service:
+                    await service.set_blocked(target, action == "block_on")
+                notice = "🚫 Blocked." if action == "block_on" else "🔓 Unblocked."
+        elif action == "grant":
+            if level != "guest":
+                notice = "ℹ️ This account already has access."
+            else:
+                profile = await _fetch_profile(target)
+                async with user_service() as service:
+                    await service.add_allowed_user(target, added_by=actor, **profile)
+                notice = f"✅ Access granted ({config.daily_limit}/day by default)."
+        elif action == "revoke":
+            if level != "user":
+                notice = "ℹ️ This account has no user access."
+            else:
+                async with user_service() as service:
+                    await service.remove_allowed_user(target)
+                notice = "⬇️ Access revoked."
+        else:
+            return
+
     card, markup = await _render_card(actor, target, notice)
     await message.answer(card, reply_markup=markup)
 
@@ -1036,11 +1275,23 @@ async def _digest_action(
         return
     elif action == "dgx":
         try:
-            removed = await digest.remove_channel(int(arg))
+            chat_id = int(arg)
         except ValueError:
             await safe_answer_callback(callback)
             return
-        await _digest_show(callback, "🗑 Channel removed." if removed else "ℹ️ Not found.")
+        title = dict(await digest.list_channels()).get(chat_id)
+        if title is None:
+            await _digest_show(callback, "ℹ️ Channel not found.")
+        else:
+            await _ask_confirm(
+                callback,
+                actor,
+                "dgx",
+                chat_id,
+                f"🗑 <b>Remove</b> <code>{html.escape(title or str(chat_id))}</code>?\n\n"
+                "<i>Its stored messages will also be deleted.</i>",
+                f"adm:dgc:{chat_id}",
+            )
     elif action == "dgm":
         current = await digest.get_model()
         b = InlineKeyboardBuilder()
