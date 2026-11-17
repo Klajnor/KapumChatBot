@@ -71,7 +71,11 @@ from bot.services.retrieval_answer import (
     is_retrieval_promise,
     retrieval_fallback,
 )
-from bot.services.retrieval_plan import apply_combined_hint, isolate_combined_history
+from bot.services.retrieval_plan import (
+    apply_combined_hint,
+    complete_combined_plan,
+    isolate_combined_history,
+)
 from bot.services.rich import RICH_LIMIT, adapt_markdown
 from bot.services.science import normalize_formulas
 from bot.services.search import (
@@ -670,14 +674,16 @@ async def _build_reply(
         # vision-пути выше). После вырезания истории тегов больше нет.
         remove_untrusted_hint(messages)
     tools: list[dict[str, Any]] = []
-    # Prefer the provider's built-in search for models that support it; the
-    # local search_web tool is the fallback for the others. Search is available
-    # in every guest request; external content still withholds MCP, image
-    # generation and file sending.
+    # A local search tool is preferred when private tools are available: its
+    # results are framed as untrusted. Otherwise models with built-in search use
+    # the provider's server-side search.
     builtin_search = config.builtin_web_search(settings["model"])
     explicit_web = bool(WEB_MARKER_RE.search(text))
     search_ready = search_configured() and (
-        not builtin_search or explicit_web
+        not builtin_search
+        or explicit_web
+        or mcp_ready
+        or config.enable_image_generation
     )
     if search_ready:
         tools.append(SEARCH_TOOL)
@@ -687,7 +693,15 @@ async def _build_reply(
     mcp_ready = mcp_ready and (not external or mcp_only)
     if mcp_ready:
         tools.extend(mcp_tools)
-    if combined:
+    request_route = route(text)
+    auto_candidate = (
+        not combined
+        and request_route == "general"
+        and mcp_ready
+        and (search_ready or builtin_search)
+        and not messages_have_untrusted_content(messages)
+    )
+    if combined or auto_candidate:
         apply_combined_hint(
             messages,
             web_available=search_ready or builtin_search,
@@ -697,6 +711,7 @@ async def _build_reply(
     budget = ToolBudget()
     search_rounds = 0
     mcp_rounds = 0
+    combined_planned = False
     result = ChatResult()
     metadata = AnswerMetadata()
     while True:
@@ -774,6 +789,20 @@ async def _build_reply(
                         build_tool_response(call.id, PROVIDER_SEARCH_TOOL_NOTICE)
                     )
                 continue
+        if auto_candidate and not combined_planned:
+            retrieval = any(
+                call.name == "search_web"
+                or mcp_manager.is_mcp_tool(call.name)
+                for call in result.tool_calls
+            )
+            side_effect = any(
+                call.name in _UNTRUSTED_SIDE_EFFECT_TOOLS
+                for call in result.tool_calls
+            )
+            if retrieval and not side_effect:
+                complete_combined_plan(result, offered_tools, text, force=True)
+                combined_planned = True
+                combined = True
         if mcp_rounds == 0:
             ensure_note_lookup(result, offered_tools, text)
 
@@ -848,6 +877,14 @@ async def _build_reply(
                     call.name, call.arguments, max_chars=budget.context_chars, read_budget=budget,
                 )
                 messages.append(build_tool_response(call.id, budget.clip(output)))
+            if combined:
+                # Both sources were planned before the results: the next and
+                # only round is the analysis without tools.
+                search_ready = False
+                mcp_ready = False
+                tools = []
+                offered_tools = []
+                messages[:] = final_answer_messages(messages)
             continue
         if (search_calls or mcp_calls) and not result.content and image_call is None:
             # Round/budget limit reached and the model only asked for tools:

@@ -93,8 +93,11 @@ class CombinedPlanTests(unittest.TestCase):
 class CombinedAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def run_chat(self, *, streaming=False, initial="both", web_ready=True,
                        notes_ready=True, query=QUESTION, context_chars=60_000,
-                       note=NOTE, page=PAGE, web_failure=False, hostile_final=False):
+                       note=NOTE, page=PAGE, web_failure=False, hostile_final=False,
+                       clean_history=False):
         manager, backend, service, message = fixtures(note)
+        if clean_history:
+            service.get_history.return_value = []
         seen = []
         web_results = SearchResults(error="timeout") if web_failure else [SearchResult(
             "Rust docs", "https://example.org/rust", "snippet", page_text=page,
@@ -178,6 +181,67 @@ class CombinedAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("Вывод", deliver.await_args.args[2])
                     self.assertFalse(deliver.await_args.kwargs["allow_telegraph"])
                     self.assertEqual(service.add_message.await_count, 2)
+
+    async def test_general_question_collects_both_sources_then_one_analysis(self):
+        general = "Расскажи про Rust и дай вывод"
+        backend, seen, web, deliver, service = await self.run_chat(
+            query=general, initial="web", clean_history=True,
+        )
+        self.assertEqual(len(seen), 2)
+        web.assert_awaited_once()
+        self.assertEqual(
+            [c.args[0] for c in backend.call_tool.await_args_list],
+            ["search_notes", "get_note"],
+        )
+        self.assertIn(NOTE, str(seen[1]["messages"]))
+        self.assertIn(PAGE, str(seen[1]["messages"]))
+        self.assertIsNone(seen[1]["tools"])
+        self.assertIn("Вывод", deliver.await_args.args[2])
+        self.assertEqual(service.add_message.await_count, 2)
+
+    async def test_guest_general_question_collects_both_sources_then_one_analysis(self):
+        manager, backend, service, message = fixtures(NOTE)
+        service.get_history.return_value = []
+        message.text = "Расскажи про Rust и дай вывод"
+        seen = []
+
+        async def answer(**kwargs):
+            seen.append(copy.deepcopy(kwargs))
+            if len(seen) == 1:
+                return ChatResult(
+                    tool_calls=[ToolCall("s1", "search_web", {"query": "Rust"})]
+                )
+            return ChatResult(content="Вывод по обоим источникам")
+
+        found = SearchResults([SearchResult(
+            "Rust docs", "https://example.org/rust", "snippet", page_text=PAGE,
+        )])
+        with (
+            patch.multiple(
+                config,
+                enable_image_generation=False,
+                enable_link_analysis=False,
+            ),
+            patch.object(guest, "check_access", AsyncMock(
+                return_value=AccessResult(True, "guest", consumed=True)
+            )),
+            patch.object(guest, "search_configured", return_value=True),
+            patch.object(config, "builtin_web_search", return_value=False),
+            patch.object(guest, "mcp_available", return_value=True),
+            patch.object(guest, "mcp_manager", manager),
+            patch.object(guest, "search_web", AsyncMock(return_value=found)),
+            patch.object(guest.ai_client, "chat_with_tools", side_effect=answer),
+            patch.object(guest.ai_client, "chat_completion_result", side_effect=answer),
+            patch.object(guest, "_maybe_telegraph_reply", AsyncMock(return_value=None)),
+        ):
+            reply = await guest._build_reply(message, service, message.from_user, 42)
+
+        self.assertEqual(backend.call_tool.await_count, 2)
+        self.assertIn("Вывод по обоим источникам", reply.text)
+        self.assertEqual(
+            {tool["function"]["name"] for tool in seen[0]["tools"]},
+            {"search_web", "mcp__brain__search_notes", "mcp__brain__get_note"},
+        )
 
     async def test_source_instructions_cannot_start_tools_in_final_synthesis(self):
         backend, _seen, web, _deliver, _service = await self.run_chat(hostile_final=True)

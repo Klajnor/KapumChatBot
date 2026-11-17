@@ -1908,15 +1908,30 @@ async def _answer_with_ai(
     # ones. MCP, generation and file sending keep their own taint gate below.
     builtin_search = config.builtin_web_search(model)
     explicit_web = bool(WEB_MARKER_RE.search(text))
-    # Provider search is preferred, but an explicit «найди в интернете»
-    # also offers the local tool as a fallback: some models/regions return
-    # no sources for a forced built-in search and otherwise answer that
-    # they have no internet access.
+    # Локальный поиск предлагается, когда в запросе есть приватные инструменты:
+    # его результаты получают <untrusted_content>. Иначе для моделей со
+    # встроенным поиском используется серверный enable_search.
     search_ready = search_configured() and (
-        not builtin_search or explicit_web
+        not builtin_search
+        or explicit_web
+        or mcp_ready
+        or config.enable_image_generation
+        or config.enable_sticker_generation
+        or config.enable_file_replies
+    )
+    # Общий вопрос с доступными заметками и вебом сначала собирает оба
+    # источника; поиск по истории не должен вырезать MCP до этого шага.
+    auto_candidate = (
+        not combined
+        and request_route == "general"
+        and mcp_ready
+        and (search_ready or builtin_search)
+        and not messages_have_untrusted_content(messages)
+        and (intent is None or intent is not Intent.IMAGE)
     )
     search_only = (
         not combined
+        and not auto_candidate
         and (search_ready or builtin_search)
         and isolate_search_history(messages)
     )
@@ -1939,7 +1954,13 @@ async def _answer_with_ai(
     mcp_ready = mcp_ready and not search_only
     if mcp_ready:
         tools.extend(mcp_tools)
-    if combined:
+    # A general question may still need both sources. When the model asks for
+    # either web search or MCP, the bot fixes the other source too and runs the
+    # collection before any result can taint the context; the next round is the
+    # single analysis. Explicit web/notes requests and image commands keep their
+    # normal flow.
+    auto_combined = auto_candidate and mcp_ready
+    if combined or auto_combined:
         apply_combined_hint(
             messages,
             web_available=search_ready or builtin_search,
@@ -2056,6 +2077,22 @@ async def _answer_with_ai(
                             )
                         )
                     continue
+            if auto_combined and not combined_planned:
+                retrieval = any(
+                    call.name == "search_web"
+                    or mcp_manager.is_mcp_tool(call.name)
+                    for call in result.tool_calls
+                )
+                side_effect = any(
+                    call.name in _UNTRUSTED_SIDE_EFFECT_TOOLS
+                    for call in result.tool_calls
+                )
+                if retrieval and not side_effect:
+                    complete_combined_plan(
+                        result, tools_arg, text, force=True
+                    )
+                    combined_planned = True
+                    combined = True
             if mcp_rounds == 0:
                 ensure_note_lookup(result, tools_arg, text)
             if combined and not combined_planned:

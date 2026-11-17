@@ -2303,7 +2303,15 @@ class AIClient:
         }
         if public:
             payload.update(thinking.payload_fields())
-            if config.builtin_web_search(model):
+            # Локальный search_web уже предложен (его результаты получают
+            # <untrusted_content>): встроенный поиск в этом же запросе выполнил
+            # бы поиск без taint-маркера. Оставляем его для запросов без
+            # инструментов или без локального поиска.
+            local_search_offered = any(
+                str((tool.get("function") or {}).get("name", "")) == "search_web"
+                for tool in (tools or [])
+            )
+            if config.builtin_web_search(model) and not local_search_offered:
                 payload["enable_search"] = True
                 # Запрос переписывает сама модель в рамках того же обращения:
                 # не заменяем исходный текст/историю и не переводим MCP-вызовы.

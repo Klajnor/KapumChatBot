@@ -63,14 +63,19 @@ def apply_combined_hint(
 
 def complete_combined_plan(
     result: ChatResult, tools: list[dict[str, Any]] | None, text: str,
+    *, force: bool = False,
 ) -> None:
     """Зафиксировать оба поиска ДО результатов, даже если модель пропустила один.
 
     Резервные аргументы берутся только из текущего собственного текста, не из
     истории, текстовых псевдовызовов, заметок или страниц. Вызовы после этого
     выполняются без участия модели; результат одного не меняет другой запрос.
+    ``force`` используется автоматическим смешанным режимом для обычного
+    запроса, в котором модель уже запросила хотя бы один источник.
     """
-    if route(text) != "combined" or messages_have_untrusted_content([
+    if not force and route(text) != "combined":
+        return
+    if messages_have_untrusted_content([
         {"role": "user", "content": text},
     ]):
         return

@@ -248,7 +248,7 @@ reverse proxy с auth/allowlist; не добавлять в payload версии
 
 ## Проверки
 
-- `pytest tests/ -q`: **1130 passed, 3 skipped, 270 subtests passed**.
+- `pytest tests/ -q`: **1132 passed, 3 skipped, 270 subtests passed**.
   Пять падений локального окружения не связаны с аудитом: устаревшая
   сигнатура `_process_album` в `tests/test_album_memory.py` и запрет записи в
   `models/rembg` на Windows (4 теста стикеров); `PROJECT_STATS.md`

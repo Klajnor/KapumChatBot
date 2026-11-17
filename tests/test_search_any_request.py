@@ -100,7 +100,15 @@ class GuestSearchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BuiltinSearchPreferenceTests(unittest.IsolatedAsyncioTestCase):
-    def test_provider_search_payload_is_enabled_for_builtin_models(self):
+    def test_local_search_tool_disables_provider_search_in_the_same_request(self):
+        mcp_tool = {
+            "type": "function",
+            "function": {
+                "name": "mcp__brain__get_note",
+                "description": "",
+                "parameters": {},
+            },
+        }
         with (
             patch.object(config, "builtin_web_search", return_value=True),
             patch.object(
@@ -109,7 +117,7 @@ class BuiltinSearchPreferenceTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"id": "m", "model": "m"},
             ),
         ):
-            payload = guest.ai_client._chat_payload(
+            local_payload = guest.ai_client._chat_payload(
                 [{"role": "user", "content": "hi"}],
                 "m",
                 0.5,
@@ -117,7 +125,16 @@ class BuiltinSearchPreferenceTests(unittest.IsolatedAsyncioTestCase):
                 public=True,
                 tools=[SEARCH_TOOL],
             )
-        self.assertTrue(payload.get("enable_search"))
+            private_payload = guest.ai_client._chat_payload(
+                [{"role": "user", "content": "hi"}],
+                "m",
+                0.5,
+                100,
+                public=True,
+                tools=[mcp_tool],
+            )
+        self.assertNotIn("enable_search", local_payload)
+        self.assertTrue(private_payload.get("enable_search"))
 
     async def test_guest_refuses_mcp_when_provider_search_may_have_run(self):
         svc = _guest_service()
