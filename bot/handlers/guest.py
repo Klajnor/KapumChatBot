@@ -56,6 +56,7 @@ from bot.services.mcp import (
 )
 from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
+from bot.services.personal_address import system_prompt_for
 from bot.services.request_scope import WEB_MARKER_RE, route
 from bot.services.response_metadata import AnswerMetadata, metadata_for_result
 from bot.services.retrieval_answer import (
@@ -487,7 +488,7 @@ async def _build_reply(
     settings = await service.get_user_settings(caller_id)
     history = await service.get_history(chat_id, user_id=caller_id)
     base_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": settings["system_prompt"]},
+        {"role": "system", "content": system_prompt_for(settings)},
         *history,
     ]
 

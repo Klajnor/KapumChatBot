@@ -46,12 +46,15 @@ class UserService:
     async def get_user_settings(self, telegram_id: int) -> dict:
         """Get user settings as a dictionary (falls back to defaults)."""
         settings = await self.user_repo.get_user_settings(telegram_id)
+        # Личное обращение живёт в user_settings; владелец задаёт его в /admin.
+        address = settings.personal_address if settings is not None else None
         if settings is None:
             return {
                 "model": config.default_model,
                 "system_prompt": config.default_system_prompt,
                 "temperature": config.default_temperature,
                 "max_tokens": config.default_max_tokens,
+                "address": address,
             }
         return {
             "model": settings.selected_model,
@@ -60,6 +63,7 @@ class UserService:
             # No per-user token-limit control is exposed. Apply the configured
             # limit to existing users too, rather than freezing their signup value.
             "max_tokens": config.default_max_tokens,
+            "address": address,
         }
 
     async def set_model(self, telegram_id: int, model: str) -> None:
@@ -79,6 +83,17 @@ class UserService:
     async def set_reminder_timezone(self, telegram_id: int, name: str | None) -> None:
         """Persist (or reset with ``None``) the personal reminders zone."""
         await self.user_repo.set_reminder_timezone(telegram_id, name)
+        await self.session.commit()
+
+    async def get_personal_address(self, telegram_id: int) -> str | None:
+        """Личное обращение пользователя (задаёт владелец в /admin)."""
+        return (await self.get_user_settings(telegram_id))["address"]
+
+    async def set_personal_address(
+        self, telegram_id: int, value: str | None
+    ) -> None:
+        """Сохранить (или сбросить с ``None``) личное обращение."""
+        await self.user_repo.update_personal_address(telegram_id, value)
         await self.session.commit()
 
     # --- History -----------------------------------------------------------

@@ -49,6 +49,7 @@ from bot.services.access import check_access, refund_access
 from bot.services.ai_client import ChatResult, ai_client
 from bot.services.markdown import render, split_chunks
 from bot.services.operations import stage, tracked
+from bot.services.personal_address import system_prompt_for
 from bot.services.request_scope import WEB_MARKER_RE
 from bot.services.response_metadata import AnswerMetadata, metadata_for_result
 from bot.services.rich import send_rich_to
@@ -528,7 +529,7 @@ async def _run_ai_prompt(
     the admin's private notes. Returns the final result and the total time
     spent over all rounds.
     """
-    system = f"{settings['system_prompt']}\n\n{current_time_hint(get_timezone())}"
+    system = f"{system_prompt_for(settings)}\n\n{current_time_hint(get_timezone())}"
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         *(history or []),

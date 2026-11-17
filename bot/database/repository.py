@@ -214,6 +214,14 @@ class UserRepository:
         settings.system_prompt = prompt
         await self.session.flush()
 
+    async def update_personal_address(
+        self, telegram_id: int, value: str | None
+    ) -> None:
+        """Store (or clear with ``None``) the owner-set personal address."""
+        settings = await self._ensure_settings(telegram_id)
+        settings.personal_address = value
+        await self.session.flush()
+
     async def update_settings(
         self,
         telegram_id: int,

@@ -151,7 +151,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         service = UserService(MagicMock())
         saved = SimpleNamespace(
             selected_model="custom-model", system_prompt="Custom prompt",
-            temperature=0.4, max_tokens=2048,
+            temperature=0.4, max_tokens=2048, personal_address=None,
         )
         with (
             patch.object(service.user_repo, "get_user_settings", AsyncMock(return_value=saved)),

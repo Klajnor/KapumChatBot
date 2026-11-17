@@ -67,6 +67,9 @@ class UserSettings(Base):
     )
     temperature: Mapped[float] = mapped_column(default=0.7)
     max_tokens: Mapped[int] = mapped_column(default=2048)
+    # How the owner wants the bot to address this user: one name or several
+    # variants separated by «;». Occasionally added to the system prompt.
+    personal_address: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Relationships
     user: Mapped[User] = relationship("User", back_populates="settings")

@@ -38,6 +38,7 @@ from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
 from bot.handlers.tasks import cb_tasks
 from bot.services import digest, thinking
 from bot.services.documents import decode_text_bytes, detect_file_type
+from bot.services.personal_address import normalize_personal_address
 from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
 from bot.services.user_service import user_service
 
@@ -219,12 +220,15 @@ async def _render_card(
         used = await service.get_daily_usage_used(telegram_id)
         guest_left = await service.get_guest_messages_remaining(telegram_id)
         personal = (await service.user_repo.get_daily_limit_override(telegram_id)) is not None
+        address = settings["address"]
 
     lines = [
         f"{_LEVEL_ICON[level]} <b>{_LEVEL_TITLE[level]}</b>  <code>{telegram_id}</code>",
         f"🏷 {_label(row)}",
         f"🤖 Model: <code>{html.escape(settings['model'])}</code>",
     ]
+    if address:
+        lines.append(f"🗣 Address: <code>{html.escape(address)}</code>")
     if level in ("owner", "admin"):
         lines.append("📊 Requests: <b>unlimited</b>")
     elif level == "user":
@@ -271,6 +275,12 @@ async def _render_card(
                 b.row(_button("🛡 Make admin", f"adm:adm:{telegram_id}"))
     else:
         lines.append("\n<i>You cannot change this account.</i>")
+    # How the bot addresses this person is an owner-only setting and works for
+    # every level, including other owners whose card has no manage buttons.
+    if config.is_owner(actor_id):
+        b.row(_button("🗣 Address", f"adm:nm:{telegram_id}"))
+        if address:
+            b.row(_button("♻️ Reset address", f"adm:nmr:{telegram_id}"))
     flt, page = _view.get(actor_id, ("a", 0))
     b.row(
         _button("◀ List", f"adm:list:{flt}:{page}"), _button("🏠 Menu", "adm:home")
@@ -465,6 +475,29 @@ async def _user_action(
 
     if action == "u":
         await _refresh_card(callback, target)
+        await safe_answer_callback(callback)
+        return
+
+    if action in ("nm", "nmr"):
+        if not config.is_owner(actor):
+            await safe_answer_callback(callback, "Owners only", show_alert=True)
+            return
+        if action == "nm":
+            _awaiting[actor] = ("address", target)
+            await _show(
+                callback,
+                f"🗣 <b>Personal address for</b> <code>{target}</code>\n\n"
+                "Send a name, or several variants separated by "
+                "<code>;</code> (for example <code>Alexander; Sasha</code>). "
+                "Send <code>-</code> to remove it.\n\n"
+                "<i>The bot will occasionally address the user by this name.</i>",
+                _cancel_markup(f"adm:u:{target}"),
+            )
+        else:
+            await _ask_reset(
+                callback, actor, "nm", target, "the personal address",
+                f"adm:u:{target}",
+            )
         await safe_answer_callback(callback)
         return
 
@@ -688,7 +721,7 @@ async def _confirmed_user_action(
     await safe_answer_callback(callback)
 
 
-# --- Typed input (add user / custom limit) -----------------------------------
+# --- Typed input (add user / custom limit / personal address) -----------------
 
 
 def _expecting_input(message: Message) -> bool:
@@ -725,6 +758,10 @@ async def on_admin_input(message: Message) -> None:
 
     if kind in ("dgadd", "dgprompt", "dgtime", "dgmod", "dgtemp"):
         await _digest_input(message, actor, kind, text)
+        return
+
+    if kind == "address" and target is not None:
+        await _address_input(message, actor, target, text)
         return
 
     if kind == "add":
@@ -770,6 +807,38 @@ async def on_admin_input(message: Message) -> None:
     await message.answer(card, reply_markup=markup)
 
 
+async def _address_input(
+    message: Message, actor: int, target: int, text: str
+) -> None:
+    """Save or clear the personal address typed by the owner.
+
+    ``-`` clears it; otherwise the value is split into ``;``-separated variants
+    and stored in a canonical form.
+    """
+    if not config.is_owner(actor):
+        await message.answer("⚠️ Only the owner can set a personal address.")
+        return
+    raw = text.strip()
+    clearing = raw in {"-", "—"}
+    address = None if clearing else normalize_personal_address(raw)
+    if not clearing and address is None:
+        _awaiting[actor] = ("address", target)
+        await message.answer(
+            "❌ Send at least one name, or - to remove the address.",
+            reply_markup=_cancel_markup(f"adm:u:{target}"),
+        )
+        return
+    async with user_service() as service:
+        await service.set_personal_address(target, address)
+    notice = (
+        f"🗣 Address saved: <code>{html.escape(address)}</code>"
+        if address
+        else "🗣 Address removed."
+    )
+    card, markup = await _render_card(actor, target, notice)
+    await message.answer(card, reply_markup=markup)
+
+
 async def _confirm_reset(
     message: Message, actor: int, key: str, target: int | None, text: str
 ) -> None:
@@ -801,7 +870,7 @@ async def _confirm_reset(
         screen, markup = await _digest_screen(done if confirmed else cancelled)
         await message.answer(screen, reply_markup=markup)
         return
-    if key not in ("lim", "rsp") or target is None:
+    if key not in ("lim", "rsp", "nm") or target is None:
         return
 
     notice = cancelled
@@ -809,7 +878,13 @@ async def _confirm_reset(
         # Rights are re-checked: the target's level may have changed meanwhile.
         async with user_service() as service:
             level = await service.get_level(target)
-            if not _can_manage(actor, level) or (key == "lim" and level != "user"):
+            if key == "nm":
+                if not config.is_owner(actor):
+                    notice = "⚠️ Only the owner can change this."
+                else:
+                    await service.set_personal_address(target, None)
+                    notice = "🗣 Personal address removed."
+            elif not _can_manage(actor, level) or (key == "lim" and level != "user"):
                 notice = "⚠️ This account cannot be changed."
             elif key == "lim":
                 await service.set_daily_limit(target, None)

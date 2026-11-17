@@ -72,6 +72,7 @@ from bot.services.operations import stage, tracked
 from bot.services.outgoing_files import files_tool, prepare_files
 from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.pdf_ocr import ocr_pdf
+from bot.services.personal_address import system_prompt_for
 from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
@@ -1868,7 +1869,7 @@ async def _answer_with_ai(
         )
     history = await service.get_history(message.chat.id, user_id=user.id)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": f"{settings['system_prompt']}\n\n{current_time_hint(get_timezone())}"},
+        {"role": "system", "content": f"{system_prompt_for(settings)}\n\n{current_time_hint(get_timezone())}"},
         *history,
         {"role": "user", "content": text},
     ]
@@ -2807,7 +2808,7 @@ async def _handle_photo(
 
         history = await service.get_history(message.chat.id, user_id=user.id)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": settings["system_prompt"]},
+            {"role": "system", "content": system_prompt_for(settings)},
             *history,
         ]
         if caption_tainted or messages_have_untrusted_content([
@@ -2994,7 +2995,7 @@ async def _handle_vision_and_generate(
 
         history = await service.get_history(message.chat.id, user_id=user.id)
         base_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": settings["system_prompt"]},
+            {"role": "system", "content": system_prompt_for(settings)},
             *history,
         ]
 
@@ -3538,7 +3539,7 @@ async def _process_album(
 
             history = await service.get_history(message.chat.id, user_id=user.id)
             base_messages: list[dict[str, Any]] = [
-                {"role": "system", "content": settings["system_prompt"]},
+                {"role": "system", "content": system_prompt_for(settings)},
                 *history,
             ]
 
@@ -3694,7 +3695,7 @@ async def _process_album(
 
             history = await service.get_history(message.chat.id, user_id=user.id)
             base_messages = [
-                {"role": "system", "content": settings["system_prompt"]},
+                {"role": "system", "content": system_prompt_for(settings)},
                 *history,
             ]
 
