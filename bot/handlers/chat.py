@@ -77,7 +77,12 @@ from bot.services.progress import waiting
 from bot.services.reminders import get_timezone
 from bot.services.request_intent import Intent, classify_request
 from bot.services.request_scope import WEB_MARKER_RE, route
-from bot.services.response_metadata import AnswerMetadata, metadata_for_result
+from bot.services.response_metadata import (
+    PROVIDER_SEARCH_TOOL_NOTICE,
+    AnswerMetadata,
+    metadata_for_result,
+    provider_search_may_have_run,
+)
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -614,7 +619,9 @@ _MAX_QUOTED_CHARS = MAX_QUOTE_CHARS
 _MAX_DISPLAY_NAME_CHARS = 64
 # Имена Telegram вводит пользователь и они вставляются в текст запроса вне
 # untrusted-рамки: переносы строк и угловые скобки могли бы ломать её разметку.
-_UNSAFE_DISPLAY_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029<>]")
+_UNSAFE_DISPLAY_NAME_CHARS = re.compile(
+    r"[\x00-\x1f\x7f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069<>\[\]]"
+)
 
 
 def _safe_display_name(value: str | None, fallback: str) -> str:
@@ -2013,6 +2020,42 @@ async def _answer_with_ai(
             result.tool_calls = [
                 call for call in result.tool_calls if call.name in offered
             ]
+            # Provider-side search happens inside the API call and leaves no
+            # local <untrusted_content> block. If it ran (or the provider did
+            # not prove it did not), a page could have steered this turn into
+            # private tools. Refuse those calls and drop them for later rounds.
+            provider_search = builtin_search and not search_ready
+            if provider_search and provider_search_may_have_run(result):
+                mcp_ready = False
+                remove_mcp_hint(messages)
+                tools = _without_mcp_tools(
+                    _without_untrusted_side_effects(tools)
+                )
+                tools_arg = tools or None
+                blocked = [
+                    call
+                    for call in result.tool_calls
+                    if call.name in _UNTRUSTED_SIDE_EFFECT_TOOLS
+                    or mcp_manager.is_mcp_tool(call.name)
+                ]
+                if blocked:
+                    logger.warning(
+                        "Provider web search used or unconfirmed; refusing "
+                        "MCP/generation/file tools for this request"
+                    )
+                    result.tool_calls = [
+                        call for call in result.tool_calls if call not in blocked
+                    ]
+                    messages.append(
+                        build_assistant_tool_message(result.content, blocked)
+                    )
+                    for call in blocked:
+                        messages.append(
+                            build_tool_response(
+                                call.id, PROVIDER_SEARCH_TOOL_NOTICE
+                            )
+                        )
+                    continue
             if mcp_rounds == 0:
                 ensure_note_lookup(result, tools_arg, text)
             if combined and not combined_planned:
@@ -2540,7 +2583,7 @@ async def _handle_document(message: Message) -> None:
             buffer = await message.bot.download_file(file.file_path)
             data = buffer.read()
         except Exception as exc:  # noqa: BLE001 - any download failure is final
-            logger.warning("Document download failed: %s", exc)
+            logger.warning("Document download failed (%s)", type(exc).__name__)
             await refund_access(service, user.id, access)
             await safe_answer(
                 message,
@@ -2645,6 +2688,10 @@ async def _handle_document(message: Message) -> None:
                 )
             if link_blocks:
                 caption = remainder
+        # A forwarded document's caption is somebody else's words too; it must
+        # not sit outside the untrusted frame as a free-form instruction.
+        if is_forwarded(message) and caption.strip():
+            caption = wrap_untrusted("forward", caption)
         combined = _compose_document_context(
             doc.file_name or "document",
             ocr_note + extracted,
@@ -3150,8 +3197,10 @@ async def _handle_enhance_photo(
         file = await message.bot.get_file(photo.file_id)
         buffer = await message.bot.download_file(file.file_path)
         image_bytes = buffer.read()
-    except Exception:
-        logger.warning("Could not download photo to enhance", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - download failure is final
+        logger.warning(
+            "Could not download photo to enhance (%s)", type(exc).__name__
+        )
         await safe_answer(
             message, "❌ <b>Could not download the photo.</b> Please try again."
         )
@@ -3408,8 +3457,12 @@ async def _handle_album_photo(message: Message) -> None:
                 message,
                 "⚠️ <b>Image size exceeds the reserved limit.</b> Please send the photo again.",
             )
-        except Exception:
-            logger.warning("Could not download album photo %s", photo.file_id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - download failure is final
+            logger.warning(
+                "Could not download album photo %s (%s)",
+                photo.file_id,
+                type(exc).__name__,
+            )
         finally:
             # Буфер уже закрыт. Отмена тоже возвращает резерв, но только после
             # освобождения памяти загрузки; cleanup не удаляет pending-записи.
@@ -3846,9 +3899,11 @@ async def cb_enhance_choice(callback: CallbackQuery) -> None:
                 file = await origin.bot.get_file(file_id)
                 buffer = await origin.bot.download_file(file.file_path)
                 items.append((str(file_id), buffer.read()))
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - download failure is final
                 logger.warning(
-                    "Could not re-download pending photo %s", file_id, exc_info=True
+                    "Could not re-download pending photo %s (%s)",
+                    file_id,
+                    type(exc).__name__,
                 )
         if not items:
             await safe_answer(

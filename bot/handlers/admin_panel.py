@@ -33,7 +33,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.bot import bot, get_bot_id
 from bot.config import config
-from bot.handlers.admin import _fetch_profile, _name_html, _resolve_target
+from bot.handlers.admin import (
+    _clean_display_name,
+    _fetch_profile,
+    _name_html,
+    _resolve_target,
+)
 from bot.handlers.tasks import cb_tasks
 from bot.services import digest, thinking
 from bot.services.documents import decode_text_bytes, detect_file_type
@@ -88,6 +93,13 @@ def _is_admin_cb(callback: CallbackQuery) -> bool:
     return callback.from_user is not None and config.is_admin(callback.from_user.id)
 
 
+def _is_private_cb(callback: CallbackQuery) -> bool:
+    """Admin screens live in a DM; a callback from a group is refused."""
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    return getattr(chat, "type", None) == "private"
+
+
 def _can_manage(actor_id: int, level: str) -> bool:
     """May ``actor_id`` change a user who currently has ``level``?"""
     if level == "owner":
@@ -103,9 +115,17 @@ def _label(row: dict[str, Any]) -> str:
 
 
 def _plain_label(row: dict[str, Any]) -> str:
-    name = " ".join(p for p in (row["first_name"], row["last_name"]) if p)
-    if row["username"]:
-        name = f"{name} @{row['username']}".strip()
+    name = " ".join(
+        part
+        for part in (
+            _clean_display_name(row["first_name"], limit=24),
+            _clean_display_name(row["last_name"], limit=24),
+        )
+        if part
+    )
+    username = _clean_display_name(row["username"], limit=24)
+    if username:
+        name = f"{name} @{username}".strip()
     return (name or "unknown")[:24]
 
 
@@ -232,7 +252,7 @@ async def _render_card(
         f"🏷 {_label(row)}",
         f"🤖 Model: <code>{html.escape(settings['model'])}</code>",
     ]
-    if address:
+    if address and config.is_owner(actor_id):
         lines.append(f"🗣 Name: <code>{html.escape(address)}</code>")
     if level in ("owner", "admin"):
         lines.append("📊 Requests: <b>unlimited</b>")
@@ -324,6 +344,11 @@ async def cb_admin(callback: CallbackQuery) -> None:
     """Single dispatcher for the whole menu."""
     if not _is_admin_cb(callback):
         await safe_answer_callback(callback, "Admins only", show_alert=True)
+        return
+    if not _is_private_cb(callback):
+        await safe_answer_callback(
+            callback, "Open the admin menu in a private chat.", show_alert=True
+        )
         return
 
     actor = callback.from_user.id

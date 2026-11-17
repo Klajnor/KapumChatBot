@@ -12,7 +12,8 @@ from bot.handlers import guest
 from bot.services import reminders
 from bot.services.access import AccessResult
 from bot.services.ai_client import ChatResult, ToolCall
-from bot.services.search import SearchResult, SearchResults
+from bot.services.response_metadata import ResponseMetadata
+from bot.services.search import SEARCH_TOOL, SearchResult, SearchResults
 from bot.services.untrusted import wrap_untrusted
 
 
@@ -99,6 +100,91 @@ class GuestSearchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BuiltinSearchPreferenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_search_payload_is_enabled_for_builtin_models(self):
+        with (
+            patch.object(config, "builtin_web_search", return_value=True),
+            patch.object(
+                config,
+                "resolve_model",
+                return_value={"id": "m", "model": "m"},
+            ),
+        ):
+            payload = guest.ai_client._chat_payload(
+                [{"role": "user", "content": "hi"}],
+                "m",
+                0.5,
+                100,
+                public=True,
+                tools=[SEARCH_TOOL],
+            )
+        self.assertTrue(payload.get("enable_search"))
+
+    async def test_guest_refuses_mcp_when_provider_search_may_have_run(self):
+        svc = _guest_service()
+        caller = SimpleNamespace(id=1, username="u", first_name="U", last_name=None)
+        message = SimpleNamespace(
+            text="@bot what is new today?",
+            caption=None,
+            photo=[],
+            voice=None,
+            document=None,
+            reply_to_message=None,
+            forward_date=None,
+            forward_origin=None,
+            from_user=caller,
+        )
+        mcp_tool = {
+            "type": "function",
+            "function": {
+                "name": "mcp__brain__get_note",
+                "description": "notes",
+                "parameters": {},
+            },
+        }
+        first = ChatResult(
+            tool_calls=[
+                ToolCall(
+                    id="m1",
+                    name="mcp__brain__get_note",
+                    arguments={"path": "private.md"},
+                )
+            ],
+            metadata=ResponseMetadata(model_search_used=True),
+            provider_search_enabled=True,
+        )
+        final = ChatResult(content="Safe answer", elapsed=0.1)
+        call_tool = AsyncMock()
+        with (
+            patch.multiple(
+                config,
+                enable_image_generation=False,
+                enable_link_analysis=False,
+            ),
+            patch.object(guest, "check_access", AsyncMock(
+                return_value=AccessResult(True, "guest", consumed=True)
+            )),
+            patch.object(guest, "search_configured", return_value=False),
+            patch.object(config, "builtin_web_search", return_value=True),
+            patch.object(guest, "mcp_available", return_value=True),
+            patch.object(guest.mcp_manager, "openai_tools", AsyncMock(return_value=[mcp_tool])),
+            patch.object(
+                guest.mcp_manager,
+                "is_mcp_tool",
+                side_effect=lambda name: name.startswith("mcp__"),
+            ),
+            patch.object(guest.mcp_manager, "call_tool", call_tool),
+            patch.object(
+                guest.ai_client, "chat_with_tools", AsyncMock(return_value=first)
+            ),
+            patch.object(
+                guest.ai_client, "chat_completion_result", AsyncMock(return_value=final)
+            ),
+            patch.object(guest, "_maybe_telegraph_reply", AsyncMock(return_value=None)),
+        ):
+            reply = await guest._build_reply(message, svc, caller, 42)
+
+        self.assertIn("Safe answer", reply.text)
+        call_tool.assert_not_awaited()
     async def test_guest_uses_builtin_search_without_local_tool(self):
         svc = _guest_service()
         caller = SimpleNamespace(id=1, username="u", first_name="U", last_name=None)

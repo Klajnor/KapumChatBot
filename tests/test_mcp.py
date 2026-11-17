@@ -404,6 +404,7 @@ class MCPEnvironmentTests(unittest.TestCase):
                 "SAMO_HELPER_REDMINE_API_KEY": "redmine-secret",
                 "SAMO_HELPER_LLM_API_KEY": "llm-secret",
                 "SAMO_HELPER_KNOWLEDGE_API_KEY": "knowledge-secret",
+                "SAMO_HELPER_YOUGILE_KEY": "yougile-secret",
                 "CUSTOM_ACCESS_TOKEN": "token-secret",
             },
         ):
@@ -411,6 +412,7 @@ class MCPEnvironmentTests(unittest.TestCase):
                 "SAMO_HELPER_REDMINE_API_KEY",
                 "SAMO_HELPER_LLM_API_KEY",
                 "SAMO_HELPER_KNOWLEDGE_API_KEY",
+                "SAMO_HELPER_YOUGILE_KEY",
                 "CUSTOM_ACCESS_TOKEN",
             ):
                 with self.assertLogs("bot.services.mcp", level="WARNING"):

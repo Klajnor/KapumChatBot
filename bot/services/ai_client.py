@@ -24,7 +24,12 @@ from bot.config import (
     config,
 )
 from bot.services import thinking
-from bot.services.ai_errors import AIRequestError, provider_error, request_error
+from bot.services.ai_errors import (
+    AIRequestError,
+    provider_error,
+    redact_text,
+    request_error,
+)
 from bot.services.http_body import read_bounded
 from bot.services.http_redirect import warn_redirect_blocked
 from bot.services.image_tools import canonical_operations
@@ -510,6 +515,10 @@ class ChatResult:
     # Только ошибки этого вызова; общего last_error у клиента нет.
     errors: list[AIRequestError] = field(default_factory=list)
     metadata: ResponseMetadata | None = None
+    # Был ли в этом запросе включён серверный поиск провайдера. Нужен, чтобы
+    # отличить «поиска не было» от «провайдер не сообщил usage»: в обоих
+    # случаях model_search_used может быть None/False.
+    provider_search_enabled: bool = False
 
     @property
     def reasoning_tokens(self) -> int | None:
@@ -854,12 +863,12 @@ class AIClient:
                     logger.warning(
                         "Model list unavailable (status %s): %s",
                         resp.status,
-                        body[:200],
+                        redact_text(body, self._error_secrets(), 200),
                     )
                     return None
                 data = json.loads(body)
         except (TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as exc:
-            logger.warning("Model list request failed: %s", exc)
+            logger.warning("Model list request failed (%s)", type(exc).__name__)
             return None
 
         ids = {
@@ -1562,6 +1571,7 @@ class AIClient:
             elapsed=time.monotonic() - started,
             usage=usage,
             metadata=ResponseMetadata(model_search_used=search_used, reasoning_tokens=reasoning_tokens(usage)),
+            provider_search_enabled=bool(payload.get("enable_search")),
         )
 
     async def _stream_lines(
@@ -1599,7 +1609,9 @@ class AIClient:
                     if 300 <= resp.status < 400:
                         warn_redirect_blocked("AI stream", resp.status, target)
                     logger.error(
-                        "AI stream error (status %s): %s", resp.status, body[:500]
+                        "AI stream error (status %s): %s",
+                        resp.status,
+                        redact_text(body, self._error_secrets(), 500),
                     )
                     raise AIStreamError(f"HTTP {resp.status}", status=resp.status, errors=[
                         provider_error(str(payload["model"]), resp.status, body, secrets=self._error_secrets()),
@@ -2465,7 +2477,10 @@ class AIClient:
                         try:
                             data = json.loads(body)
                         except json.JSONDecodeError:
-                            logger.error("AI API returned invalid JSON: %s", body[:300])
+                            logger.error(
+                            "AI API returned invalid JSON: %s",
+                            redact_text(body, self._error_secrets(), 300),
+                        )
                             if errors is not None:
                                 errors.append(request_error(
                                     str(payload["model"]), "INVALID_RESPONSE", "HTTP 200: invalid JSON",
@@ -2511,7 +2526,7 @@ class AIClient:
                             "AI API quota or rate limit reached (status %s); "
                             "switching models: %s",
                             resp.status,
-                            body[:200],
+                            redact_text(body, self._error_secrets(), 200),
                         )
                         return resp.status, None, _elapsed()
 
@@ -2524,7 +2539,7 @@ class AIClient:
                             attempt,
                             retries,
                             delay,
-                            body[:200],
+                            redact_text(body, self._error_secrets(), 200),
                         )
                         await asyncio.sleep(delay)
                         continue
@@ -2533,7 +2548,7 @@ class AIClient:
                         "AI API error (status %s %s): %s | request-id=%s content-type=%s",
                         resp.status,
                         resp.reason,
-                        body[:500],
+                        redact_text(body, self._error_secrets(), 500),
                         resp.headers.get("x-request-id") or resp.headers.get("x-dashscope-request-id"),
                         resp.headers.get("content-type"),
                     )
@@ -2646,7 +2661,11 @@ class AIClient:
     ) -> ChatResult:
         choices = data.get("choices") or []
         if not choices:
-            return ChatResult(usage=_extract_usage(data), metadata=response_metadata(data, search_enabled=search_enabled))
+            return ChatResult(
+                usage=_extract_usage(data),
+                metadata=response_metadata(data, search_enabled=search_enabled),
+                provider_search_enabled=bool(search_enabled),
+            )
         message = choices[0].get("message") or {}
 
         calls: list[ToolCall] = []
@@ -2679,6 +2698,7 @@ class AIClient:
             elapsed=elapsed,
             usage=_extract_usage(data),
             metadata=response_metadata(data, search_enabled=search_enabled),
+            provider_search_enabled=bool(search_enabled),
         )
 
 

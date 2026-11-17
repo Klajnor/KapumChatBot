@@ -19,6 +19,7 @@ from bot.services.ai_errors import (
     AIRequestError,
     format_request_errors,
     provider_error,
+    redact_text,
     request_error,
 )
 
@@ -96,6 +97,16 @@ class ErrorFormattingTests(unittest.TestCase):
                 self.assertNotIn("unknown-private-key", error.message)
                 self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ", error.message)
                 self.assertNotIn("proxy.test", error.message)
+
+    def test_redact_text_for_logs_hides_secrets_and_urls(self):
+        text = redact_text(
+            "Authorization: Bearer my-secret-token https://api.test/bot123:abc",
+            ["my-secret-token"],
+            500,
+        )
+        self.assertNotIn("my-secret-token", text)
+        self.assertNotIn("api.test", text)
+        self.assertIn("[URL hidden]", text)
 
     def test_semicolon_separator_order_and_repeat_count(self):
         first = request_error("a", "429", "Quota exhausted")

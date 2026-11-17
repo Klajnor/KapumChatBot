@@ -4,6 +4,8 @@ import asyncio
 import functools
 import html
 import logging
+import re
+import unicodedata
 from typing import Any
 
 from aiogram import F, Router
@@ -68,6 +70,20 @@ def _parse_target(raw: str) -> tuple[int | None, str | None]:
     return None, value or None
 
 
+_UNSAFE_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]")
+
+
+def _clean_display_name(value: str | None, *, limit: int = 64) -> str:
+    """Очистить имя Telegram от Cf/управляющих символов для админских экранов."""
+    if not value:
+        return ""
+    text = "".join(
+        char for char in str(value) if unicodedata.category(char) != "Cf"
+    )
+    text = " ".join(_UNSAFE_NAME_CHARS.sub(" ", text).split())
+    return text[:limit].rstrip()
+
+
 def _name_html(
     first_name: str | None,
     last_name: str | None,
@@ -76,8 +92,14 @@ def _name_html(
 ) -> str:
     """Human-readable, HTML-escaped name with the ``@username`` in brackets."""
     full_name = " ".join(
-        html.escape(part) for part in (first_name, last_name) if part
+        html.escape(part)
+        for part in (
+            _clean_display_name(first_name),
+            _clean_display_name(last_name),
+        )
+        if part
     )
+    username = _clean_display_name(username)
     handle = f"@{html.escape(username)}" if username else ""
     if full_name and handle:
         return f"{full_name} ({handle})"

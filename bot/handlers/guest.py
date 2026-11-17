@@ -19,6 +19,7 @@ from aiogram.types import (
 from bot.config import config
 from bot.database.session import async_session_factory
 from bot.handlers.chat import (
+    _UNTRUSTED_SIDE_EFFECT_TOOLS,
     DEFAULT_LINK_PROMPT,
     DEFAULT_VIDEO_PROMPT,
     _compose_document_context,
@@ -58,7 +59,12 @@ from bot.services.operations import stage, tracked
 from bot.services.pdf_limits import PdfResourceLimit
 from bot.services.personal_address import system_prompt_for
 from bot.services.request_scope import WEB_MARKER_RE, route
-from bot.services.response_metadata import AnswerMetadata, metadata_for_result
+from bot.services.response_metadata import (
+    PROVIDER_SEARCH_TOOL_NOTICE,
+    AnswerMetadata,
+    metadata_for_result,
+    provider_search_may_have_run,
+)
 from bot.services.retrieval_answer import (
     ensure_note_lookup,
     final_answer_messages,
@@ -225,7 +231,7 @@ async def _download(message: Message, file_id: str) -> bytes | None:
         buffer = await message.bot.download_file(file.file_path)
         return buffer.read()
     except Exception as exc:  # noqa: BLE001 - guest file access may be denied
-        logger.warning("Could not download guest file: %s", exc)
+        logger.warning("Could not download guest file (%s)", type(exc).__name__)
         return None
 
 
@@ -737,6 +743,37 @@ async def _build_reply(
         result.tool_calls = [
             call for call in result.tool_calls if call.name in offered_names
         ]
+        # Provider-side search is invisible to messages_have_untrusted_content;
+        # if it ran (or cannot be ruled out), no private/generation tool may act
+        # on a possibly steering page.
+        provider_search = builtin_search and not search_ready
+        if provider_search and provider_search_may_have_run(result):
+            mcp_ready = False
+            remove_mcp_hint(messages)
+            tools = _without_mcp_tools(_without_untrusted_side_effects(tools))
+            offered_tools = tools
+            blocked = [
+                call
+                for call in result.tool_calls
+                if call.name in _UNTRUSTED_SIDE_EFFECT_TOOLS
+                or mcp_manager.is_mcp_tool(call.name)
+            ]
+            if blocked:
+                logger.warning(
+                    "Provider web search used or unconfirmed; refusing guest "
+                    "MCP/generation tools for this request"
+                )
+                result.tool_calls = [
+                    call for call in result.tool_calls if call not in blocked
+                ]
+                messages.append(
+                    build_assistant_tool_message(result.content, blocked)
+                )
+                for call in blocked:
+                    messages.append(
+                        build_tool_response(call.id, PROVIDER_SEARCH_TOOL_NOTICE)
+                    )
+                continue
         if mcp_rounds == 0:
             ensure_note_lookup(result, offered_tools, text)
 

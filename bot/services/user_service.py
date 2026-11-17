@@ -49,7 +49,7 @@ class UserService:
         """Get user settings as a dictionary (falls back to defaults)."""
         settings = await self.user_repo.get_user_settings(telegram_id)
         # Личное имя живёт в user_settings; владелец задаёт его в /admin.
-        address = settings.personal_address if settings is not None else None
+        address = (settings.personal_address if settings is not None else None) or None
         # Без личного имени бот может обратиться по имени из профиля.
         name = None
         if address is None:

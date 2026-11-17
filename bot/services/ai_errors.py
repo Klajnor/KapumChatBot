@@ -37,6 +37,17 @@ def _safe_text(value: str, secrets: Iterable[str], limit: int) -> str:
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+def redact_text(
+    value: str, secrets: Iterable[str] = (), limit: int = 500
+) -> str:
+    """Безопасный фрагмент внешнего текста для журнала.
+
+    Провайдер или прокси может отразить в теле ответа заголовок
+    ``Authorization``; в лог такой текст попадать не должен.
+    """
+    return _safe_text(value or "", secrets, limit)
+
+
 def request_error(
     model: str, code: str, message: str = "", *, secrets: Iterable[str] = (),
 ) -> AIRequestError:

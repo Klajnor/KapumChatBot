@@ -53,6 +53,30 @@ def model_search_used(data: dict[str, Any], *, enabled: bool | None = None) -> b
     return False if enabled is False else None
 
 
+def provider_search_may_have_run(result: Any) -> bool:
+    """Whether provider-side web search was used, or cannot be ruled out.
+
+    ``model_search_used`` is ``None`` when the provider did not report its
+    search usage. Before executing private tools (MCP, generation, files) in a
+    request where the provider could search internally, only an explicit
+    ``False`` proves that no external page was involved. A missing metadata
+    object after an enabled provider search is treated as unconfirmed.
+    """
+    if not getattr(result, "provider_search_enabled", False):
+        return False
+    metadata = getattr(result, "metadata", None)
+    if metadata is None:
+        return True
+    return getattr(metadata, "model_search_used", None) is not False
+
+
+PROVIDER_SEARCH_TOOL_NOTICE = (
+    "Unavailable: the provider's built-in web search may have used external "
+    "pages while producing this response. Private notes, paid generation and "
+    "file sending are disabled for this request."
+)
+
+
 def merge_usage(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
     """Обновить накопительный SSE usage, не суммируя повторные снимки токенов."""
     merged = dict(previous or {})

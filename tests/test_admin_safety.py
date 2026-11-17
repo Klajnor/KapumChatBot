@@ -207,6 +207,16 @@ class TestAdminSafety(DBTest):
 
         self._run(go)
 
+    def test_admin_callbacks_are_refused_outside_a_private_chat(self):
+        async def go() -> None:
+            await self._register()
+            callback = _callback(f"adm:nm:{USER}")
+            callback.message.chat.type = "group"
+            await panel.cb_admin(callback)
+            self.assertNotIn(OWNER, panel._awaiting)
+
+        self._run(go)
+
     def test_digest_channel_removal_requires_the_exact_confirm_word(self):
         async def go() -> None:
             await digest.add_channel(CHANNEL, "Test channel", OWNER)

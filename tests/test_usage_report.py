@@ -73,14 +73,51 @@ class TestUsageNames(TestCase):
         self.assertEqual(rows[1]["days"], 2)
 
     def test_markdown_table_has_header_and_escapes_pipes(self):
-        rows = [{"name": "A | B", "today": 1, "total": 2, "days": 1}]
+        rows = [
+            {"name": "A | B", "telegram_id": 7, "today": 1, "total": 2, "days": 1}
+        ]
         markdown = table_markdown(rows)
         self.assertIn("| # | User | Today | 14 days | Days |", markdown)
         self.assertIn(r"A \| B", markdown)
+        self.assertIn("· 7", markdown)
+
+    def test_markdown_table_neutralizes_links_and_formatting(self):
+        rows = [
+            {
+                "name": "[Click](https://evil.example) *bold*",
+                "telegram_id": 7,
+                "today": 1,
+                "total": 2,
+                "days": 1,
+            }
+        ]
+        markdown = table_markdown(rows)
+        self.assertNotIn("](https://evil.example)", markdown)
+        self.assertIn(r"\[Click\]\(https\:\/\/evil.example\)", markdown)
+        self.assertIn(r"\*bold\*", markdown)
+
+    def test_control_and_bidi_chars_are_removed_from_names(self):
+        self.assertEqual(
+            usage_name({"first_name": "Иван\u202e\u200b"}, 1), "Иван"
+        )
+
+    def test_markdown_table_neutralizes_mentions_and_markup(self):
+        rows = [
+            {
+                "name": "@TelegramSupport ==Admin==",
+                "telegram_id": 7,
+                "today": 0,
+                "total": 1,
+                "days": 1,
+            }
+        ]
+        markdown = table_markdown(rows)
+        self.assertIn(r"\@TelegramSupport", markdown)
+        self.assertIn(r"\=\=Admin\=\=", markdown)
 
     def test_markdown_limit_mentions_hidden_users(self):
         rows = [
-            {"name": f"User {i}", "today": 0, "total": i, "days": 1}
+            {"name": f"User {i}", "telegram_id": i, "today": 0, "total": i, "days": 1}
             for i in range(3)
         ]
         markdown = table_markdown(rows, limit=1)
@@ -88,11 +125,12 @@ class TestUsageNames(TestCase):
 
     def test_html_fallback_escapes_and_limits(self):
         rows = [
-            {"name": "<b>x</b>", "today": 1, "total": 2, "days": 1},
-            {"name": "Second", "today": 0, "total": 1, "days": 1},
+            {"name": "<b>x</b>", "telegram_id": 1, "today": 1, "total": 2, "days": 1},
+            {"name": "Second", "telegram_id": 2, "today": 0, "total": 1, "days": 1},
         ]
         rendered = table_html(rows, limit=1)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", rendered)
+        self.assertIn("<code>1</code>", rendered)
         self.assertIn("... and 1 more users.", rendered)
 
 
@@ -174,6 +212,7 @@ class TestUsageScreens(DBTest):
             markdown = rich.await_args.args[1]
             self.assertIn("| # | User |", markdown)
             self.assertIn("Анна Петрова", markdown)
+            self.assertIn("· 100", markdown)
             self.assertIn("Today: **2**", markdown)
             answer.assert_not_awaited()
 
@@ -222,6 +261,7 @@ class TestUsageScreens(DBTest):
             markdown = rich.await_args.args[1]
             self.assertIn("| # | User |", markdown)
             self.assertIn("Анна Петрова", markdown)
+            self.assertIn("· 100", markdown)
             self.assertIn("reply_markup", rich.await_args.kwargs)
             show.assert_not_awaited()
 

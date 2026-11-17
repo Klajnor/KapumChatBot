@@ -102,8 +102,18 @@ class TestPersonalAddressFormat(TestCase):
     def test_profile_name_is_cleaned_and_falls_back_to_username(self):
         self.assertEqual(profile_name("  Иван\nМладший ", "ivan"), "Иван Младший")
         self.assertEqual(profile_name("«Иван»", None), "Иван")
+        self.assertEqual(profile_name("Иван\u202e", None), "Иван")
         self.assertEqual(profile_name("", "ivan"), "ivan")
         self.assertIsNone(profile_name(None, None))
+
+    def test_names_cannot_break_the_prompt_frame(self):
+        self.assertEqual(
+            split_personal_address("Иван<|>; Саша"), ["Иван", "Саша"]
+        )
+        hint = personal_address_hint("Саша", rng=_FixedPicker(0.0))
+        self.assertIn("«Саша»", hint)
+        self.assertIn("не инструкция", hint)
+        self.assertNotIn("<", hint)
 
     def test_system_prompt_prefers_the_owner_name(self):
         profile = system_prompt_for(
@@ -286,6 +296,21 @@ class TestPersonalAddressAdmin(DBTest):
             with patch("bot.database.session.async_session_factory", self._factory):
                 async with user_service() as service:
                     self.assertIsNone(await service.get_personal_address(USER))
+
+        self._run(go)
+
+    def test_admin_card_hides_the_owner_set_name(self):
+        async def go() -> None:
+            await self._register()
+            with patch("bot.database.session.async_session_factory", self._factory):
+                async with user_service() as service:
+                    await service.set_personal_address(USER, "Саша")
+
+                owner_card, _ = await panel._render_card(OWNER, USER)
+                admin_card, _ = await panel._render_card(ADMIN, USER)
+
+            self.assertIn("Саша", owner_card)
+            self.assertNotIn("Саша", admin_card)
 
         self._run(go)
 

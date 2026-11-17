@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime
 import html
+import re
+import unicodedata
 from typing import Any
 
 # Сколько строк показывать без прокрутки: rich-таблица на весь экран уже
@@ -18,9 +20,27 @@ MAX_REPORT_ROWS = 50
 MAX_PANEL_ROWS = 10
 MAX_NAME_LENGTH = 32
 
+# Управляющие символы и Unicode-разделители; остальные невидимые Cf-символы
+# (bidi, zero-width, Unicode-теги) удаляет _clean ниже: имя задаёт пользователь,
+# поэтому оно не должно spoof-ить таблицу (RTL override) или прятать текст.
+_UNSAFE_DISPLAY_CHARS = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]")
+# GFM-разметка в ячейке: имя вида «[Click](https://evil)» не должно стать
+# кликабельной ссылкой в отчёте владельцу.
+_MARKDOWN_SPECIALS = re.compile(r"([\\`*_\[\]()<>~#|=$@:/])")
+
+
+def _clean(value: Any) -> str:
+    text = "".join(
+        char
+        for char in str(value)
+        if unicodedata.category(char) != "Cf"
+    )
+    text = _UNSAFE_DISPLAY_CHARS.sub(" ", text)
+    return " ".join(text.split())
+
 
 def _clip(name: str) -> str:
-    name = " ".join(name.split())
+    name = _clean(name)
     if len(name) <= MAX_NAME_LENGTH:
         return name
     return f"{name[: MAX_NAME_LENGTH - 1]}…"
@@ -80,9 +100,8 @@ def aggregate_usage(
 
 
 def _cell(value: str) -> str:
-    """Убрать из ячейки всё, что ломает GFM-таблицу."""
-    text = str(value).replace("\\", "\\\\").replace("|", "\\|")
-    return " ".join(text.split())
+    """Экранировать всё, что ломает GFM-таблицу или создаёт разметку."""
+    return _MARKDOWN_SPECIALS.sub(r"\\\1", _clean(value))
 
 
 def table_markdown(
@@ -95,8 +114,8 @@ def table_markdown(
     ]
     for index, row in enumerate(rows[:limit], start=1):
         lines.append(
-            f"| {index} | {_cell(row['name'])} | {row['today']} | "
-            f"{row['total']} | {row['days']} |"
+            f"| {index} | {_cell(row['name'])} · {row['telegram_id']} | "
+            f"{row['today']} | {row['total']} | {row['days']} |"
         )
     if len(rows) > limit:
         lines.append(f"\n_{len(rows) - limit} more users not shown._")
@@ -108,7 +127,8 @@ def table_html(
 ) -> str:
     """Запасной HTML-вариант для сообщений без rich-рендеринга."""
     lines = [
-        f"{index}. <b>{html.escape(row['name'])}</b> — {row['total']} "
+        f"{index}. <b><code>{html.escape(row['name'])}</code></b> · "
+        f"<code>{row['telegram_id']}</code> — {row['total']} "
         f"(today {row['today']}, days {row['days']})"
         for index, row in enumerate(rows[:limit], start=1)
     ]

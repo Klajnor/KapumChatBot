@@ -14,6 +14,7 @@ from bot.services.response_metadata import (
     ResponseMetadata,
     combine_metadata,
     model_search_used,
+    provider_search_may_have_run,
     reasoning_tokens,
 )
 from bot.services.search import SEARCH_TOOL
@@ -21,6 +22,33 @@ from bot.services.telegram_utils import format_timing
 
 
 class ResponseCountersTests(unittest.TestCase):
+    def test_provider_search_gate_is_fail_closed(self):
+        self.assertFalse(provider_search_may_have_run(ChatResult()))
+        self.assertTrue(
+            provider_search_may_have_run(
+                ChatResult(
+                    metadata=ResponseMetadata(model_search_used=None),
+                    provider_search_enabled=True,
+                )
+            )
+        )
+        self.assertTrue(
+            provider_search_may_have_run(
+                ChatResult(
+                    metadata=ResponseMetadata(model_search_used=True),
+                    provider_search_enabled=True,
+                )
+            )
+        )
+        self.assertFalse(
+            provider_search_may_have_run(
+                ChatResult(
+                    metadata=ResponseMetadata(model_search_used=False),
+                    provider_search_enabled=True,
+                )
+            )
+        )
+
     def test_reasoning_formats_and_explicit_zero(self):
         for usage, expected in (
             ({"completion_tokens_details": {"reasoning_tokens": 15}}, 15),
