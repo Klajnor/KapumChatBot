@@ -280,8 +280,9 @@ class AlbumMemoryTests(unittest.IsolatedAsyncioTestCase):
         async def guarded(message, inner):
             await inner(message)
 
-        async def process(message, images):
+        async def process(message, images, extra_text=None):
             received.extend(images)
+            self.assertEqual(extra_text, [])
             self.assertEqual(chat._album_bytes_in_flight(), 4)
 
         self.guarded.side_effect = guarded
