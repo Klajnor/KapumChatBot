@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
 import functools
 import html
 import logging
@@ -21,11 +20,13 @@ from bot.bot import bot
 from bot.config import config
 from bot.services.mcp import mcp_manager
 from bot.services.operations import set_stage, tracked
+from bot.services.rich import send_rich
 from bot.services.telegram_utils import (
     require_private_chat,
     safe_answer_callback,
     safe_edit_text,
 )
+from bot.services.usage_report import MAX_REPORT_ROWS, table_html, table_markdown
 from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
@@ -307,52 +308,44 @@ async def cmd_list_users(message: Message) -> None:
 @router.message(Command("admin_stats"))
 @_admin_required
 async def cmd_admin_stats(message: Message) -> None:
-    """Handle /admin_stats — show usage statistics for last 14 days."""
+    """Handle /admin_stats — usage statistics for last 14 days.
+
+    Users are shown by Telegram name (or ``@username`` when the name is not
+    visible) instead of bare IDs; the table is a native rich message when
+    available, with an HTML list as the fallback.
+    """
     if not await require_private_chat(message, what="/admin_stats"):
         return
     async with user_service() as service:
-        stats_data = await service.get_usage_stats_last_14_days()
+        rows = await service.get_usage_report()
 
-    if not stats_data:
+    if not rows:
         await message.answer(
             "📊 <b>Usage Statistics (last 14 days)</b>\n\n"
             "No usage data available yet."
         )
         return
 
-    # Aggregate by user
-    user_stats: dict[int, dict] = {}
-    for entry in stats_data:
-        tid = entry["telegram_id"]
-        if tid not in user_stats:
-            user_stats[tid] = {
-                "telegram_id": tid,
-                "total": 0,
-                "dates": {},
-            }
-        user_stats[tid]["total"] += entry["query_count"]
-        date_str = entry["date"].strftime("%Y-%m-%d") if isinstance(entry["date"], (datetime.date, datetime.datetime)) else str(entry["date"])
-        user_stats[tid]["dates"][date_str] = entry["query_count"]
+    today_total = sum(row["today"] for row in rows)
+    total = sum(row["total"] for row in rows)
+    summary = (
+        f"Today: **{today_total}** queries\n"
+        f"14 days: **{total}** queries, **{len(rows)}** active users"
+    )
+    if config.rich_messages and await send_rich(
+        message,
+        "### 📊 Usage Statistics (last 14 days)\n\n"
+        f"{summary}\n\n"
+        f"{table_markdown(rows, limit=MAX_REPORT_ROWS)}",
+    ):
+        return
 
-    # Build response
-    lines = ["📊 <b>Usage Statistics (last 14 days)</b>\n"]
-    sorted_users = sorted(user_stats.values(), key=lambda x: x["total"], reverse=True)
-
-    for i, us in enumerate(sorted_users, 1):
-        lines.append(
-            f"{i}. <code>{us['telegram_id']}</code> — <b>{us['total']}</b> queries"
-        )
-        # Show daily breakdown for top users (up to 15)
-        if i <= 15:
-            date_lines = []
-            for date_str in sorted(us["dates"].keys()):
-                date_lines.append(f"{date_str}: {us['dates'][date_str]}")
-            if date_lines:
-                lines.append("   " + " | ".join(date_lines))
-
-    lines.append(f"\n👥 <b>Total active users:</b> {len(sorted_users)}")
-    lines.append(f"📝 <b>Total queries:</b> {sum(us['total'] for us in sorted_users)}")
-
+    lines = [
+        "📊 <b>Usage Statistics (last 14 days)</b>\n",
+        f"Today: <b>{today_total}</b> queries",
+        f"14 days: <b>{total}</b> queries, <b>{len(rows)}</b> active users\n",
+        table_html(rows, limit=MAX_REPORT_ROWS),
+    ]
     await message.answer("\n".join(lines))
 
 

@@ -1,9 +1,10 @@
 """Личное обращение к пользователю в системном промпте.
 
-Владелец задаёт в карточке ``/admin`` одно или несколько обращений через точку
-с запятой (например, «Александр; Саша»). В системный промпт такое указание
-попадает не в каждом ответе: примерно в половине случаев и со случайно
-выбранным вариантом имени, чтобы бот не начинал каждую реплику одинаково.
+Владелец задаёт в карточке ``/admin`` одно или несколько имён через точку с
+запятой (например, «Александр; Саша»). Если личное имя не задано, бот может
+использовать имя из профиля Telegram (или ник). В системный промпт такое
+указание попадает не в каждом ответе: примерно в половине случаев и со
+случайно выбранным вариантом, чтобы бот не начинал каждую реплику одинаково.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ _HINT_TEMPLATES = (
 )
 
 _SPACES = re.compile(r"\s+")
+# Символы, которые нельзя пропускать в имя из профиля: ими можно закрыть
+# кавычки-обёртку или подмешать разметку в системный промпт.
+_UNSAFE_PROFILE_CHARS = str.maketrans({char: " " for char in "«»<>`"})
 
 
 def split_personal_address(value: str | None) -> list[str]:
@@ -57,6 +61,24 @@ def normalize_personal_address(value: str | None) -> str | None:
     return "; ".join(variants)[:MAX_ADDRESS_LENGTH]
 
 
+def profile_name(first_name: str | None, username: str | None) -> str | None:
+    """Имя из профиля Telegram: сначала имя, затем ник без ``@``.
+
+    Профиль задаёт сам пользователь, поэтому значение очищается: переводы
+    строк схлопываются, опасные для промпта символы заменяются пробелами,
+    длина ограничена.
+    """
+    for value in (first_name, username):
+        if not value:
+            continue
+        name = _SPACES.sub(
+            " ", str(value).translate(_UNSAFE_PROFILE_CHARS)
+        ).strip()[:MAX_VARIANT_LENGTH].strip()
+        if name:
+            return name
+    return None
+
+
 def personal_address_hint(
     value: str | None, *, rng: random.Random | None = None
 ) -> str:
@@ -80,7 +102,9 @@ def with_personal_address(
 
 
 def system_prompt_for(settings: dict, *, rng: random.Random | None = None) -> str:
-    """Системный промпт пользователя с возможным обращением по имени."""
-    return with_personal_address(
-        settings["system_prompt"], settings.get("address"), rng=rng
-    )
+    """Системный промпт пользователя с возможным обращением по имени.
+
+    Приоритет: имя, заданное владельцем, затем имя/ник из профиля Telegram.
+    """
+    name = settings.get("address") or settings.get("name")
+    return with_personal_address(settings["system_prompt"], name, rng=rng)

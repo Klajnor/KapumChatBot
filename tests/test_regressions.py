@@ -155,6 +155,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(service.user_repo, "get_user_settings", AsyncMock(return_value=saved)),
+            patch.object(service.user_repo, "get_user", AsyncMock(return_value=None)),
             patch.object(config, "default_max_tokens", 16384),
         ):
             settings = await service.get_user_settings(1)

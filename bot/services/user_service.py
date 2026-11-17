@@ -13,6 +13,8 @@ from bot.database.repository import (
     ReminderRepository,
     UserRepository,
 )
+from bot.services.personal_address import profile_name
+from bot.services.usage_report import aggregate_usage
 
 
 class UserService:
@@ -46,8 +48,14 @@ class UserService:
     async def get_user_settings(self, telegram_id: int) -> dict:
         """Get user settings as a dictionary (falls back to defaults)."""
         settings = await self.user_repo.get_user_settings(telegram_id)
-        # Личное обращение живёт в user_settings; владелец задаёт его в /admin.
+        # Личное имя живёт в user_settings; владелец задаёт его в /admin.
         address = settings.personal_address if settings is not None else None
+        # Без личного имени бот может обратиться по имени из профиля.
+        name = None
+        if address is None:
+            profile = await self.user_repo.get_user(telegram_id)
+            if profile is not None:
+                name = profile_name(profile.first_name, profile.username)
         if settings is None:
             return {
                 "model": config.default_model,
@@ -55,6 +63,7 @@ class UserService:
                 "temperature": config.default_temperature,
                 "max_tokens": config.default_max_tokens,
                 "address": address,
+                "name": name,
             }
         return {
             "model": settings.selected_model,
@@ -64,6 +73,7 @@ class UserService:
             # limit to existing users too, rather than freezing their signup value.
             "max_tokens": config.default_max_tokens,
             "address": address,
+            "name": name,
         }
 
     async def set_model(self, telegram_id: int, model: str) -> None:
@@ -552,6 +562,18 @@ class UserService:
     async def get_usage_stats_last_14_days(self) -> list[dict]:
         """Get usage statistics for all users over the last 14 days."""
         return await self.user_repo.get_usage_stats_last_14_days()
+
+    async def get_usage_report(self) -> list[dict]:
+        """Per-user 14-day usage with display names, highest total first.
+
+        A user is labelled by the Telegram profile name, then ``@username``,
+        then the numeric ID. Days without queries (for example after a reset)
+        are not counted.
+        """
+        entries = await self.user_repo.get_usage_stats_last_14_days()
+        if not entries:
+            return []
+        return aggregate_usage(entries, await self.list_known_users())
 
     async def get_user_total_usage_last_14_days(self, telegram_id: int) -> int:
         """Get total usage for a specific user over the last 14 days."""

@@ -16,7 +16,6 @@ revoking access, blocking and removing a digest channel require the typed
 
 from __future__ import annotations
 
-import datetime
 import html
 import logging
 from types import SimpleNamespace
@@ -39,7 +38,13 @@ from bot.handlers.tasks import cb_tasks
 from bot.services import digest, thinking
 from bot.services.documents import decode_text_bytes, detect_file_type
 from bot.services.personal_address import normalize_personal_address
-from bot.services.telegram_utils import safe_answer_callback, safe_edit_text
+from bot.services.rich import send_rich
+from bot.services.telegram_utils import (
+    safe_answer_callback,
+    safe_delete,
+    safe_edit_text,
+)
+from bot.services.usage_report import MAX_PANEL_ROWS, table_html, table_markdown
 from bot.services.user_service import user_service
 
 logger = logging.getLogger(__name__)
@@ -228,7 +233,7 @@ async def _render_card(
         f"🤖 Model: <code>{html.escape(settings['model'])}</code>",
     ]
     if address:
-        lines.append(f"🗣 Address: <code>{html.escape(address)}</code>")
+        lines.append(f"🗣 Name: <code>{html.escape(address)}</code>")
     if level in ("owner", "admin"):
         lines.append("📊 Requests: <b>unlimited</b>")
     elif level == "user":
@@ -278,9 +283,9 @@ async def _render_card(
     # How the bot addresses this person is an owner-only setting and works for
     # every level, including other owners whose card has no manage buttons.
     if config.is_owner(actor_id):
-        b.row(_button("🗣 Address", f"adm:nm:{telegram_id}"))
+        b.row(_button("🗣 Name", f"adm:nm:{telegram_id}"))
         if address:
-            b.row(_button("♻️ Reset address", f"adm:nmr:{telegram_id}"))
+            b.row(_button("♻️ Reset name", f"adm:nmr:{telegram_id}"))
     flt, page = _view.get(actor_id, ("a", 0))
     b.row(
         _button("◀ List", f"adm:list:{flt}:{page}"), _button("🏠 Menu", "adm:home")
@@ -441,27 +446,41 @@ async def _ask_reset(
 
 async def _show_stats(callback: CallbackQuery) -> None:
     async with user_service() as service:
-        data = await service.get_usage_stats_last_14_days()
-    today = datetime.date.today()
-    totals: dict[int, int] = {}
-    today_total = 0
-    for entry in data:
-        totals[entry["telegram_id"]] = totals.get(entry["telegram_id"], 0) + entry["query_count"]
-        if entry["date"] == today:
-            today_total += entry["query_count"]
+        rows = await service.get_usage_report()
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🏠 Menu", callback_data="adm:home")
+    markup = b.as_markup()
+
+    if not rows:
+        await _show(
+            callback,
+            "📊 <b>Statistics</b>\n\n<i>No usage data in the last 14 days.</i>",
+            markup,
+        )
+        return
+
+    today_total = sum(row["today"] for row in rows)
+    total = sum(row["total"] for row in rows)
+    if config.rich_messages and await send_rich(
+        callback.message,
+        "### 📊 Statistics\n\n"
+        f"Today: **{today_total}** queries\n"
+        f"14 days: **{total}** queries, **{len(rows)}** active users\n\n"
+        f"{table_markdown(rows, limit=MAX_PANEL_ROWS)}",
+        reply_markup=markup,
+    ):
+        # Rich-сообщение не редактируется через edit_text: заменяем экран.
+        await safe_delete(callback.message)
+        return
+
     lines = [
         "📊 <b>Statistics</b>\n",
         f"Today: <b>{today_total}</b> queries",
-        (f"14 days: <b>{sum(totals.values())}</b> queries, "
-        f"<b>{len(totals)}</b> active users\n"),
+        f"14 days: <b>{total}</b> queries, <b>{len(rows)}</b> active users\n",
+        table_html(rows, limit=MAX_PANEL_ROWS),
     ]
-    for i, (tid, total) in enumerate(
-        sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:10], 1
-    ):
-        lines.append(f"{i}. <code>{tid}</code> — {total}")
-    b = InlineKeyboardBuilder()
-    b.button(text="🏠 Menu", callback_data="adm:home")
-    await _show(callback, "\n".join(lines), b.as_markup())
+    await _show(callback, "\n".join(lines), markup)
 
 
 # --- Per-user actions --------------------------------------------------------
@@ -486,7 +505,7 @@ async def _user_action(
             _awaiting[actor] = ("address", target)
             await _show(
                 callback,
-                f"🗣 <b>Personal address for</b> <code>{target}</code>\n\n"
+                f"🗣 <b>Personal name for</b> <code>{target}</code>\n\n"
                 "Send a name, or several variants separated by "
                 "<code>;</code> (for example <code>Alexander; Sasha</code>). "
                 "Send <code>-</code> to remove it.\n\n"
@@ -495,7 +514,7 @@ async def _user_action(
             )
         else:
             await _ask_reset(
-                callback, actor, "nm", target, "the personal address",
+                callback, actor, "nm", target, "the personal name",
                 f"adm:u:{target}",
             )
         await safe_answer_callback(callback)
@@ -810,13 +829,13 @@ async def on_admin_input(message: Message) -> None:
 async def _address_input(
     message: Message, actor: int, target: int, text: str
 ) -> None:
-    """Save or clear the personal address typed by the owner.
+    """Save or clear the personal name typed by the owner.
 
     ``-`` clears it; otherwise the value is split into ``;``-separated variants
     and stored in a canonical form.
     """
     if not config.is_owner(actor):
-        await message.answer("⚠️ Only the owner can set a personal address.")
+        await message.answer("⚠️ Only the owner can set a personal name.")
         return
     raw = text.strip()
     clearing = raw in {"-", "—"}
@@ -824,16 +843,16 @@ async def _address_input(
     if not clearing and address is None:
         _awaiting[actor] = ("address", target)
         await message.answer(
-            "❌ Send at least one name, or - to remove the address.",
+            "❌ Send at least one name, or - to remove the name.",
             reply_markup=_cancel_markup(f"adm:u:{target}"),
         )
         return
     async with user_service() as service:
         await service.set_personal_address(target, address)
     notice = (
-        f"🗣 Address saved: <code>{html.escape(address)}</code>"
+        f"🗣 Name saved: <code>{html.escape(address)}</code>"
         if address
-        else "🗣 Address removed."
+        else "🗣 Name removed."
     )
     card, markup = await _render_card(actor, target, notice)
     await message.answer(card, reply_markup=markup)
@@ -883,7 +902,7 @@ async def _confirm_reset(
                     notice = "⚠️ Only the owner can change this."
                 else:
                     await service.set_personal_address(target, None)
-                    notice = "🗣 Personal address removed."
+                    notice = "🗣 Personal name removed."
             elif not _can_manage(actor, level) or (key == "lim" and level != "user"):
                 notice = "⚠️ This account cannot be changed."
             elif key == "lim":

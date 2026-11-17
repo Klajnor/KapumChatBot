@@ -19,6 +19,7 @@ from bot.services.personal_address import (
     MAX_VARIANTS,
     normalize_personal_address,
     personal_address_hint,
+    profile_name,
     split_personal_address,
     system_prompt_for,
     with_personal_address,
@@ -98,6 +99,25 @@ class TestPersonalAddressFormat(TestCase):
         self.assertTrue(prompt.startswith("Базовый промпт\n\n"))
         self.assertIn("«Саша»", prompt)
 
+    def test_profile_name_is_cleaned_and_falls_back_to_username(self):
+        self.assertEqual(profile_name("  Иван\nМладший ", "ivan"), "Иван Младший")
+        self.assertEqual(profile_name("«Иван»", None), "Иван")
+        self.assertEqual(profile_name("", "ivan"), "ivan")
+        self.assertIsNone(profile_name(None, None))
+
+    def test_system_prompt_prefers_the_owner_name(self):
+        profile = system_prompt_for(
+            {"system_prompt": "Промпт", "name": "Иван"}, rng=_FixedPicker(0.0)
+        )
+        self.assertIn("«Иван»", profile)
+
+        personal = system_prompt_for(
+            {"system_prompt": "Промпт", "address": "Саша", "name": "Иван"},
+            rng=_FixedPicker(0.0),
+        )
+        self.assertIn("«Саша»", personal)
+        self.assertNotIn("«Иван»", personal)
+
 
 def _dm(text: str, user_id: int = OWNER) -> Message:
     return Message(
@@ -149,6 +169,29 @@ class TestPersonalAddressStorage(DBTest):
                     self.assertEqual(
                         (await service.get_user_settings(999))["address"], "Иван"
                     )
+
+        self._loop.run_until_complete(go())
+
+    def test_settings_expose_profile_name_only_without_personal_name(self):
+        async def go() -> None:
+            with patch("bot.database.session.async_session_factory", self._factory):
+                async with user_service() as service:
+                    await service.register_user(
+                        USER, first_name="Иван", username="ivan"
+                    )
+
+                    settings = await service.get_user_settings(USER)
+                    self.assertEqual(settings["name"], "Иван")
+                    self.assertIsNone(settings["address"])
+
+                    await service.set_personal_address(USER, "Саша")
+                    settings = await service.get_user_settings(USER)
+                    self.assertIsNone(settings["name"])
+                    self.assertEqual(settings["address"], "Саша")
+
+                    await service.set_personal_address(USER, None)
+                    settings = await service.get_user_settings(USER)
+                    self.assertEqual(settings["name"], "Иван")
 
         self._loop.run_until_complete(go())
 
