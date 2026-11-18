@@ -40,7 +40,7 @@ from bot.handlers.admin import (
     _resolve_target,
 )
 from bot.handlers.tasks import cb_tasks
-from bot.services import digest, thinking
+from bot.services import db_stats, digest, thinking
 from bot.services.documents import decode_text_bytes, detect_file_type
 from bot.services.personal_address import normalize_personal_address
 from bot.services.rich import send_rich
@@ -160,10 +160,11 @@ def _home_markup(actor_id: int | None = None) -> InlineKeyboardMarkup:
     owner = actor_id is not None and config.is_owner(actor_id)
     if owner:
         b.button(text="🧠 Thinking", callback_data="adm:th")
+        b.button(text="🗄 Database", callback_data="adm:db")
     b.button(text="🔄 Tasks", callback_data="adm:tasks")
     b.button(text="✖ Close", callback_data="adm:close")
     if owner:
-        b.adjust(2, 2, 1, 1, 1)
+        b.adjust(2, 2, 2, 1, 1)
     else:
         b.adjust(2, 2, 1, 1)
     return b.as_markup()
@@ -387,6 +388,9 @@ async def cb_admin(callback: CallbackQuery) -> None:
         await _show(callback, text, markup)
     elif action == "stats":
         await _show_stats(callback)
+    elif action == "db":
+        await _show_database(callback)
+        return
     elif action == "tasks":
         await cb_tasks(callback)
         return
@@ -509,6 +513,42 @@ async def _show_stats(callback: CallbackQuery) -> None:
 
 
 # --- Per-user actions --------------------------------------------------------
+
+
+async def _show_database(callback: CallbackQuery) -> None:
+    """Owner-only card: size and row counts of the SQLite database.
+
+    Read-only: the module opens its own connection and never writes. Rich
+    rendering replaces the screen like the Statistics card; without rich the
+    panel message is edited in place.
+    """
+    actor = callback.from_user.id if callback.from_user else 0
+    if not config.is_owner(actor):
+        await safe_answer_callback(callback, "Owners only", show_alert=True)
+        return
+
+    stats = await db_stats.collect()
+
+    b = InlineKeyboardBuilder()
+    b.button(text="♻ Refresh", callback_data="adm:db")
+    b.button(text="🏠 Menu", callback_data="adm:home")
+    b.adjust(2)
+    markup = b.as_markup()
+
+    if config.rich_messages and await send_rich(
+        callback.message,
+        "### 🗄 Database\n\n" + db_stats.markdown_report(stats),
+        reply_markup=markup,
+    ):
+        # Rich-сообщение не редактируется через edit_text: заменяем экран.
+        await safe_delete(callback.message)
+        return
+
+    await _show(
+        callback,
+        "🗄 <b>Database</b>\n\n" + db_stats.html_report(stats),
+        markup,
+    )
 
 
 async def _user_action(
