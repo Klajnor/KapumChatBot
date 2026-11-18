@@ -44,12 +44,6 @@ from bot.services.response_metadata import (
     response_metadata,
 )
 from bot.services.science import normalize_formulas
-from bot.services.stickers import (  # noqa: F401 - совместимость публичного API
-    STICKER_MAX_BYTES,
-    STICKER_SIZE,
-    prepare_sticker_result,
-    to_sticker_webp,
-)
 from bot.services.tool_markup import (
     TOOL_CALLS_HINT,
     TOOL_CALLS_RETRY_HINT,
@@ -426,42 +420,7 @@ IMAGE_TOOL: dict[str, Any] = {
     },
 }
 
-# Tool exposed to the chat model so it can answer with a Telegram sticker.
-STICKER_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "generate_sticker",
-        "description": (
-            "Generate a Telegram sticker (a 512x512 die-cut sticker image) from "
-            "a short description and send it to the user. Use this ONLY when "
-            "the user explicitly asks for a STICKER (for example 'make a "
-            "sticker of a cat', 'sticker with a thumbs up', 'стикер с котом'). "
-            "For ordinary pictures/images use generate_image instead."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": (
-                        "A short description of the sticker subject and mood, "
-                        "e.g. 'a smiling cartoon cat giving a thumbs up'."
-                    ),
-                }
-            },
-            "required": ["prompt"],
-        },
-    },
-}
 
-# Простой фон облегчает сегментацию; объект должен целиком помещаться в кадр.
-_STICKER_PROMPT_SUFFIX = (
-    ", die-cut sticker style, single centered subject, bold clean outlines, "
-    "vibrant flat colors, thick white border around the subject, isolated on "
-    "a plain solid light gray background, no background patterns, no cast shadow, "
-    "entire subject visible with space around it, "
-    "no text, no watermark"
-)
 
 # Turns the text-to-image endpoint into a faithful photo restorer: the image
 # is re-rendered by the network, but the instruction pins the content down.
@@ -2101,27 +2060,6 @@ class AIClient:
             prompt, model=model, size=size, reference_images=reference_images,
         )
         return result.data
-
-    async def generate_sticker(
-        self,
-        prompt: str,
-        *,
-        model: str | None = None,
-        size: str | None = None,
-    ) -> ImageResult:
-        """Сгенерировать изображение, удалить фон и вписать в прозрачный WebP 512×512."""
-        full_prompt = prompt.strip() + _STICKER_PROMPT_SUFFIX
-        result = await self.generate_image_result(
-            full_prompt, model=model, size=size, download=True,
-        )
-        if result.data is None:
-            if result.error is None:
-                result.error = "image_download_failed" if result.url else "generation_failed"
-            return result
-        started = time.monotonic()
-        processed = await prepare_sticker_result(result.data)
-        elapsed = (result.elapsed or 0) + time.monotonic() - started
-        return ImageResult(url=result.url, data=processed.data, elapsed=elapsed, error=processed.error)
 
     async def generate_image_with_references(
         self,

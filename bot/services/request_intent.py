@@ -42,8 +42,8 @@ class Intent(enum.StrEnum):
 
 _IMAGE_WORDS = re.compile(
     r"нарису|рису[йюе]|рисунок|сгенер|картинк|изображени|иллюстраци|логотип"
-    r"|стикер|постер|обои|аватар|портрет|как\s+выгляд"
-    r"|\bdraw|paint|image|picture|generate|sticker|logo|illustrat|wallpaper",
+    r"|постер|обои|аватар|портрет|как\s+выгляд"
+    r"|\bdraw|paint|image|picture|generate|logo|illustrat|wallpaper",
     re.IGNORECASE,
 )
 
@@ -65,7 +65,7 @@ _IMAGE_SYSTEM_PROMPT = (
     "You classify a user message for a chat bot. Answer with EXACTLY ONE "
     "word:\n"
     "- 'image' — the user asks to DRAW / GENERATE / CREATE a picture, "
-    "illustration, logo, wallpaper, avatar or sticker;\n"
+    "illustration, logo, wallpaper or avatar;\n"
     "- 'chat' — anything else: a question about images, a description, "
     "advice, ordinary conversation.\n"
     "Nothing else."

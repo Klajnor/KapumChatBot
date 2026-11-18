@@ -374,7 +374,6 @@ class ChatErrorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat, "mcp_available", return_value=False),
             patch.object(config, "stream_responses", False),
             patch.object(config, "enable_image_generation", False),
-            patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
         ]
         for item in patches:

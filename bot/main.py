@@ -38,7 +38,6 @@ from bot.handlers import (
     reminders,
     start,
     stats,
-    sticker_sets,
     tasks,
 )
 from bot.handlers import (
@@ -97,7 +96,6 @@ dp.include_router(start.router)
 dp.include_router(help.router)
 dp.include_router(models.router)
 dp.include_router(image.router)
-dp.include_router(sticker_sets.router)
 dp.include_router(prompt.router)
 dp.include_router(reminders.router)
 dp.include_router(export.router)

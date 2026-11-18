@@ -98,7 +98,7 @@ rich-таблица `/admin_stats`, имена в цитатах/форвард�
 
 **Где:** `chat_bot.service:39-51` (нет `MemoryMax`, `TasksMax`, `SystemCallFilter`),
 `bot/services/documents.py:143-186` (2 потока, которые нельзя убить),
-`bot/services/image_tools.py`, `bot/services/stickers.py`, `bot/services/ai_client.py`
+`bot/services/image_tools.py`, `bot/services/ai_client.py`
 (ffmpeg), `bot/services/pdf_pages.py`/`pdf_ocr.py` (PDFium).
 
 **Суть.** `MemoryMax`/`TasksMax` не заданы; PDFium, Pillow, ONNX Runtime, ffmpeg и
@@ -113,17 +113,16 @@ matplotlib работают в процессе бота. H-1/H-2/H-3 огран
 
 **Что сделать.**
 - Добавить в юнит `MemoryMax=…`, `MemoryHigh=…`, `TasksMax=…`, `LimitNOFILE=…`;
-  проверить на стенде, что matplotlib/rembg укладываются.
+  проверить на стенде, что matplotlib/Pillow укладываются.
 - Вынести PDF/OCR/ffmpeg в отдельный процесс с `RLIMIT_AS` и убийством по таймауту
   (`ProtectSystem=strict` + `ReadWritePaths=` после переноса данных).
 - Для Pillow явно ограничивать `Image.MAX_IMAGE_PIXELS`/размер декодирования во всех
-  путях, включая стикеры.
+  путях.
 
 ### 3. Supply chain: нижние границы версий, нет lock/hash и аудита в CI
 
 **Где:** `requirements.txt:1-2` («Minimum versions only … no exact pins»), отсутствие
-lock-файла/хешей и каталога CI (`.github/` нет), `rembg[cpu]` (модель u2net ~176 МБ
-скачивается при первом использовании).
+lock-файла/хешей и каталога CI (`.github/` нет).
 
 **Суть.** `pip install -r requirements.txt` на уже установленном окружении не обновляет
 пакеты; нижние границы (`Pillow>=10.0`, `aiohttp>=3.11`, `yt-dlp>=2025.1.1` и т. д.)
@@ -131,13 +130,13 @@ lock-файла/хешей и каталога CI (`.github/` нет), `rembg[cp
 воспроизводимой установки; `yt-dlp` быстро устаревает и тянет внешние данные.
 
 **Влияние.** Воспроизводимость и аудит зависимостей зависят от дисциплины оператора;
-скомпрометированный/устаревший пакет или модель rembg получает доступ к процессу бота.
+скомпрометированный/устаревший пакет получает доступ к процессу бота.
 Текущее окружение проверено: 91 установленный пакет без совпадений в OSV, `pip check`
 чист — это не гарантирует будущие установки.
 
 **Что сделать.** `pip-compile --generate-hashes` (или uv lock) с фиксацией версий;
 `pip-audit`/OSV в CI на каждый PR; Dependabot/Renovate для `yt-dlp`, `aiohttp`, Pillow;
-проверка контрольной суммы модели u2net; ставить пакеты в venv, принадлежащий root.
+ставить пакеты в venv, принадлежащий root.
 
 ### 4. Одна единица квоты по-прежнему запускает много платных вызовов
 
@@ -238,7 +237,7 @@ reverse proxy с auth/allowlist; не добавлять в payload версии
   запрет `${BOT_TOKEN}`/`${AI_API_KEY}`/`${DATABASE_URL}`, allowlist окружения,
   внешний конфиг только с пин-хешем. Это ограничения, а не песочница (см. п. 1).
 - **История и callback-и:** выборка по `chat_id`+`user_id`, owner-check в экспорте/
-  стикерах/напоминаниях, проверка `from_user.id` в callback-ах, live-access перед
+  экспорте/напоминаниях, проверка `from_user.id` в callback-ах, live-access перед
   доставкой напоминаний и Pause/Resume.
 - **Форматирование:** MarkdownV2/HTML/plain с экранированием, фильтр схем ссылок
   (`https?`, `tg`, `mailto`), запрет опасных расширений в `send_files`, CSV-injection
@@ -248,10 +247,8 @@ reverse proxy с auth/allowlist; не добавлять в payload версии
 
 ## Проверки
 
-- `pytest tests/ -q`: **1136 passed, 3 skipped, 270 subtests passed**.
-  Четыре падения локального окружения не связаны с аудитом: запрет записи в
-  `models/rembg` на Windows (4 теста стикеров); `PROJECT_STATS.md`
-  пересчитывается отдельно.
+- `pytest tests/ -q`: **1100 passed, 3 skipped, 270 subtests passed**.
+  Падений, связанных с аудитом, нет; `PROJECT_STATS.md` пересчитывается отдельно.
 - `ruff check bot/ tests/`: новых ошибок нет (остаются прежние RUF100 в
   `chat.py`/`brain.py` и SIM117 в `tests/test_brain_forward_batch.py`).
 - `ruff --select S,B` по `bot/`: прежние `assert` в `repository.py`, SHA-1 для

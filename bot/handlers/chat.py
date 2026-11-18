@@ -34,7 +34,6 @@ from bot.services import limits
 from bot.services.access import AccessResult, check_access, guest_hint, refund_access
 from bot.services.ai_client import (
     IMAGE_TOOL,
-    STICKER_TOOL,
     AIClient,
     AIStreamError,
     ChatResult,
@@ -44,6 +43,7 @@ from bot.services.ai_client import (
     is_vision_model,
 )
 from bot.services.ai_errors import AIRequestError, format_request_errors
+from bot.services.artist_persona import with_artist_persona
 from bot.services.documents import (
     DocumentParseTimeout,
     FetchedPage,
@@ -112,8 +112,6 @@ from bot.services.search import (
     search_configured,
     search_web,
 )
-from bot.services.sticker_sets import add_keyboard, save_sticker
-from bot.services.stickers import sticker_error_message
 from bot.services.telegram_quotes import (
     DEFAULT_QUOTE_QUESTION,
     MAX_QUOTE_CHARS,
@@ -1226,14 +1224,21 @@ async def generate_and_send_image(
     service: UserService | None = None,
     user_id: int | None = None,
     model: str | None = None,
+    persona: str | None = None,
 ) -> bool:
-    """Generate an image from ``prompt`` and send it. Returns True on success."""
+    """Generate an image from ``prompt`` and send it. Returns True on success.
+
+    ``persona`` — выбранная пользователем личность (системный промпт). Она
+    уходит в модель генерации как личность художника, но подпись и запись в
+    историю сохраняют исходную формулировку пользователя.
+    """
     await message.bot.send_chat_action(
         chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO
     )
+    artist_prompt = with_artist_persona(prompt, persona)
     # Image synthesis is slow: show a live "waiting" notice after the delay.
     async with waiting(message):
-        result = await ai_client.generate_image_result(prompt)
+        result = await ai_client.generate_image_result(artist_prompt)
     image, image_url = result.data, result.url
 
     caption = f"🎨 <i>{html.escape(prompt[:900])}</i>"
@@ -1265,97 +1270,6 @@ async def generate_and_send_image(
             user_id=user_id,
             role="assistant",
             content=f"[Generated image] {prompt}",
-            model=model,
-        )
-    return True
-
-
-@stage("Generating sticker")
-async def generate_and_send_sticker(
-    message: Message,
-    prompt: str,
-    *,
-    service: UserService | None = None,
-    user_id: int | None = None,
-    model: str | None = None,
-) -> bool:
-    """Generate a sticker from ``prompt`` and send it. Returns True on success.
-
-    The image is produced by the model, then converted to a 512×512 WebP and
-    sent as a real Telegram sticker (``answer_sticker``), so the user can save
-    it or add it to a sticker set. Stickers carry no caption, so the timing
-    footer (when enabled) is sent as a short follow-up reply.
-    """
-    await message.bot.send_chat_action(
-        chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO
-    )
-    async with waiting(message):
-        result = await ai_client.generate_sticker(prompt)
-    sticker = result.data
-
-    if sticker is None:
-        await safe_answer(
-            message,
-            "❌ <b>Could not generate the sticker.</b>\n\n"
-            f"{html.escape(sticker_error_message(result.error))}\n\n"
-            "No question quota is charged.",
-        )
-        return False
-
-    sent = False
-    for attempt in range(2):
-        try:
-            await throttle.wait(message.chat.id)
-            sticker_message = await message.answer_sticker(
-                BufferedInputFile(sticker, filename="sticker.webp")
-            )
-            sent = True
-            break
-        except TelegramRetryAfter as exc:
-            if attempt >= 1:
-                break
-            await asyncio.sleep(float(exc.retry_after) + 0.1)
-        except TelegramAPIError as exc:
-            logger.error("Sending the sticker failed: %s", exc)
-            break
-
-    if not sent:
-        await safe_answer(
-            message,
-            "⚠️ <b>The sticker was generated but could not be sent.</b> "
-            "Please try again in a moment.",
-        )
-        return False
-
-    footer = format_timing(result.elapsed, model=config.image_model)
-    owner_id = user_id or (message.from_user.id if getattr(message, "from_user", None) else None)
-    keyboard = None
-    if owner_id is not None:
-        try:
-            token = await save_sticker(
-                owner_id, message.bot.id,
-                sticker_message.sticker.file_id, sticker_message.sticker.file_unique_id,
-            )
-            keyboard = add_keyboard(token)
-        except Exception as exc:  # noqa: BLE001 - стикер уже доставлен, квоту не возвращаем
-            logger.warning("Could not save sticker set button: %s", exc)
-            await safe_answer(message, "The sticker was sent, but the set button is unavailable. Please try again later.")
-    if footer or keyboard:
-        text = f"🎨 <i>{html.escape(prompt[:300])}</i>"
-        if footer:
-            text += f"\n\n{html.escape(footer)}"
-        await safe_answer(
-            message,
-            text,
-            reply_markup=keyboard,
-        )
-
-    if service is not None and user_id is not None:
-        await service.add_message(
-            chat_id=message.chat.id,
-            user_id=user_id,
-            role="assistant",
-            content=f"[Generated sticker] {prompt}",
             model=model,
         )
     return True
@@ -1832,9 +1746,7 @@ def _without_search_tool(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # Tools that spend money or send content out of the bot. Untrusted text must
 # not be able to trigger them (the same gate guest-mode already applies).
-_UNTRUSTED_SIDE_EFFECT_TOOLS = frozenset(
-    {"generate_image", "generate_sticker", "send_files"}
-)
+_UNTRUSTED_SIDE_EFFECT_TOOLS = frozenset({"generate_image", "send_files"})
 
 
 def _without_untrusted_side_effects(
@@ -1868,7 +1780,7 @@ async def _answer_with_ai(
     user explicitly (a bot message's ``from_user`` is the bot itself).
     ``intent_text`` is the user's own words (without quoted/fetched context):
     when given and ``REQUEST_INTENT`` is on, the request is classified and the
-    image/sticker tools are offered only for an image intent.
+    image tools are offered only for an image intent.
     """
     user = user or message.from_user
     if user is None:
@@ -1931,7 +1843,6 @@ async def _answer_with_ai(
         or explicit_web
         or mcp_ready
         or config.enable_image_generation
-        or config.enable_sticker_generation
         or config.enable_file_replies
     )
     # Общий вопрос с доступными заметками и вебом сначала собирает оба
@@ -1964,8 +1875,6 @@ async def _answer_with_ai(
     allow_images = not isolated and (intent is None or intent is Intent.IMAGE)
     if config.enable_image_generation and allow_images:
         tools.append(IMAGE_TOOL)
-    if config.enable_sticker_generation and allow_images:
-        tools.append(STICKER_TOOL)
     if config.enable_file_replies and not isolated:
         tools.append(files_tool())
     if search_ready:
@@ -2125,10 +2034,6 @@ async def _answer_with_ai(
                 (call for call in result.tool_calls if call.name == "generate_image"),
                 None,
             )
-            sticker_call = next(
-                (call for call in result.tool_calls if call.name == "generate_sticker"),
-                None,
-            )
             file_call = next(
                 (
                     call for call in result.tool_calls
@@ -2161,12 +2066,11 @@ async def _answer_with_ai(
                 and budget.mcp_left
             )
             # Search and MCP are multi-round tool loops: run the calls and ask
-            # again — unless the same turn also asked for an image/sticker
+            # again — unless the same turn also asked for an image
             # (those win) or every requested tool type spent its budget.
             if (
                 handled_calls
                 and image_call is None
-                and sticker_call is None
                 and file_call is None
                 and (can_search or can_mcp)
             ):
@@ -2271,7 +2175,6 @@ async def _answer_with_ai(
         )
     elif (
         image_call is None
-        and sticker_call is None
         and file_call is None
         and printer is not None
     ):
@@ -2286,16 +2189,6 @@ async def _answer_with_ai(
             model=model,
         ) and not result.content:
             await refund_access(service, user.id, access)
-    elif sticker_call is not None:
-        prompt = str(sticker_call.arguments.get("prompt") or text).strip() or text
-        if not await generate_and_send_sticker(
-            message,
-            prompt,
-            service=service,
-            user_id=user.id,
-            model=model,
-        ):
-            await refund_access(service, user.id, access)
     elif image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
         if not await generate_and_send_image(
@@ -2304,6 +2197,7 @@ async def _answer_with_ai(
             service=service,
             user_id=user.id,
             model=model,
+            persona=settings["system_prompt"],
         ) and not result.content:
             await refund_access(service, user.id, access)
     elif not result.content:
@@ -3147,7 +3041,7 @@ async def _handle_vision_and_generate(
 
         async with waiting(message):
             result = await ai_client.generate_image_with_references(
-                prompt=gen_prompt,
+                prompt=with_artist_persona(gen_prompt, settings["system_prompt"]),
                 reference_images=[image_bytes],
             )
         gen_image, gen_url = result.data, result.url
@@ -3698,7 +3592,7 @@ async def _process_album(
             )
             async with waiting(message):
                 result = await ai_client.generate_image_with_references(
-                    prompt=gen_prompt,
+                    prompt=with_artist_persona(gen_prompt, settings["system_prompt"]),
                     reference_images=valid_images,
                 )
             gen_image, gen_url = result.data, result.url

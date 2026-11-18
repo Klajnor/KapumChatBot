@@ -139,11 +139,10 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                 "model": "m", "system_prompt": "sys", "temperature": 0.5, "max_tokens": 100,
             }), get_history=AsyncMock(return_value=[]), add_message=AsyncMock(),
         )
-        for name in ("generate_image", "generate_sticker", "send_files"):
+        for name in ("generate_image", "send_files"):
             with (
                 patch.object(config, "stream_responses", False),
                 patch.object(config, "enable_image_generation", False),
-                patch.object(config, "enable_sticker_generation", False),
                 patch.object(config, "enable_file_replies", False),
                 patch.object(chat, "search_configured", return_value=False),
                 patch.object(chat, "mcp_available", return_value=False),
@@ -154,12 +153,10 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(chat, "deliver_answer", AsyncMock()),
                 patch.object(chat, "_retry_markup", return_value=None),
                 patch.object(chat, "generate_and_send_image", AsyncMock()) as image,
-                patch.object(chat, "generate_and_send_sticker", AsyncMock()) as sticker,
                 patch.object(chat, "send_reply_files", AsyncMock()) as files,
             ):
                 await chat._answer_with_ai(
                     message, service, "hello", AccessResult(allowed=True, role="admin"),
                 )
                 image.assert_not_awaited()
-                sticker.assert_not_awaited()
                 files.assert_not_awaited()

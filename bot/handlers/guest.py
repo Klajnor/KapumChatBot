@@ -37,6 +37,7 @@ from bot.services.ai_client import (
     ai_client,
     is_vision_model,
 )
+from bot.services.artist_persona import with_artist_persona
 from bot.services.documents import (
     DocumentParseTimeout,
     detect_file_type,
@@ -600,7 +601,9 @@ async def _build_reply(
             description = (vision.content or "").strip() if vision else ""
             gen_prompt = generation_prompt(text, description or None)
             image = await ai_client.generate_image_result(
-                gen_prompt, download=False, reference_images=[photo_bytes]
+                with_artist_persona(gen_prompt, settings["system_prompt"]),
+                download=False,
+                reference_images=[photo_bytes],
             )
             if image.url:
                 await _save(f"[Generated image] {gen_prompt}")
@@ -939,7 +942,10 @@ async def _build_reply(
         break
     if image_call is not None:
         prompt = str(image_call.arguments.get("prompt") or text).strip() or text
-        image = await ai_client.generate_image_result(prompt, download=False)
+        image = await ai_client.generate_image_result(
+            with_artist_persona(prompt, settings["system_prompt"]),
+            download=False,
+        )
         image_url = image.url if image else None
         if image_url:
             await _save(f"[Generated image] {prompt}")

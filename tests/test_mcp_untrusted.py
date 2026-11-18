@@ -100,7 +100,6 @@ class MCPRoundTaintTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(config, "stream_responses", False),
             patch.object(config, "enable_image_generation", False),
-            patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
             patch.object(config, "mcp_max_rounds", 2),
             patch.object(chat, "search_configured", return_value=False),

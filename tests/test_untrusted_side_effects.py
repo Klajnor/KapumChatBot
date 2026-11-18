@@ -40,7 +40,6 @@ class UntrustedSideEffectFilterTests(unittest.TestCase):
             for name in (
                 "search_web",
                 "generate_image",
-                "generate_sticker",
                 "send_files",
                 "mcp__brain__search_notes",
             )
@@ -143,7 +142,6 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
             patch.object(config, "stream_responses", False),
             patch.object(config, "request_intent", False),
             patch.object(config, "enable_image_generation", True),
-            patch.object(config, "enable_sticker_generation", True),
             patch.object(config, "enable_file_replies", True),
             patch.object(config, "enable_web_search", search),
             patch.object(config, "search_provider", "tavily"),
@@ -208,7 +206,7 @@ class AnswerToolsGateTests(unittest.IsolatedAsyncioTestCase):
             "draw a cat and send it as a file", search=False
         )
         self.assertEqual(
-            names, {"generate_image", "generate_sticker", "send_files"}
+            names, {"generate_image", "send_files"}
         )
 
     async def test_untrusted_request_disables_telegraph(self):

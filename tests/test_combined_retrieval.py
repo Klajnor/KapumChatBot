@@ -146,7 +146,7 @@ class CombinedAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.multiple(config, stream_responses=streaming, request_intent=False,
-                           enable_image_generation=True, enable_sticker_generation=True,
+                           enable_image_generation=True,
                            enable_file_replies=True, mcp_max_calls=4, search_max_calls=3,
                            tool_max_context_chars=context_chars),
             patch.object(chat, "mcp_available", return_value=notes_ready),

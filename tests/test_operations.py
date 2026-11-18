@@ -270,7 +270,7 @@ class OperationIntegrationTests(IsolatedAsyncioTestCase):
         with patch.object(image, "_generate", side_effect=self.pause):
             await self.check_running(
                 image._run_generation(message(), AsyncMock(), "SECRET"),
-                "Image / sticker generation", 7, 7,
+                "Image generation", 7, 7,
             )
 
     async def test_real_digest_test_entry_and_stage(self):

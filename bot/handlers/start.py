@@ -24,7 +24,6 @@ _BASE_COMMANDS = (
     "↩️ <b>Reply to a message</b> — I'll answer about the quoted text or photo\n"
     "🤖 /models — choose an AI model\n"
     "🎨 /image &lt;prompt&gt; — generate an image\n"
-    "🩹 /sticker &lt;prompt&gt; — generate a Telegram sticker\n"
     "⏰ /remind &lt;when&gt; &lt;text&gt; — reminder or scheduled AI request\n"
     "🎭 /persona — choose an AI personality\n"
     "📤 /export — save the conversation (MD/PDF, sent to DM)\n"

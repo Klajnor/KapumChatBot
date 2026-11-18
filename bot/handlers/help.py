@@ -27,7 +27,6 @@ _CHAT_SECTION = (
     "• /models — select an AI model\n"
     "• /model — show your current model (private chat only)\n"
     "• /image &lt;prompt&gt; — generate an image\n"
-    "• /sticker &lt;prompt&gt; — generate a Telegram sticker\n"
     "• /remind &lt;when&gt; &lt;text&gt; — reminder or scheduled AI request\n"
     "• /reminders — list your reminders\n"
     "• /delreminder &lt;N|all&gt; — delete a reminder\n"

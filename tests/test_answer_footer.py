@@ -46,7 +46,7 @@ class ChatFooterTests(unittest.IsolatedAsyncioTestCase):
                 _settings, service, message, responses = setup()
                 with (
                     patch.multiple(config, stream_responses=streaming, request_intent=False, show_timing=True,
-                                   enable_image_generation=False, enable_sticker_generation=False,
+                                   enable_image_generation=False,
                                    enable_file_replies=False, timing_format_tokens="{model}"),
                     patch.object(config, "builtin_web_search", return_value=False),
                     patch.object(chat, "mcp_available", return_value=False),

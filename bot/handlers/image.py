@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.config import config
-from bot.handlers.chat import generate_and_send_image, generate_and_send_sticker
+from bot.handlers.chat import generate_and_send_image
 from bot.services import limits
 from bot.services.access import check_access, guest_hint, refund_access
 from bot.services.operations import tracked
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-# A sender produces the media from a prompt and sends it, returning True on
-# success. Both image and sticker generators share this shape.
+# A sender produces the image from a prompt and sends it, returning True on
+# success.
 Sender = Callable[..., Awaitable[bool]]
 
 
@@ -41,29 +41,10 @@ async def cmd_image(message: Message) -> None:
     )
 
 
-@router.message(Command("sticker"))
-async def cmd_sticker(message: Message) -> None:
-    """Handle /sticker <prompt> — generate a Telegram sticker and send it."""
-    if not config.enable_sticker_generation:
-        await message.answer("🚫 <b>Sticker generation is disabled.</b>")
-        return
-    await _handle_generation_command(
-        message,
-        generate_and_send_sticker,
-        usage=(
-            "🎨 <b>Generate a sticker</b>\n\n"
-            "Usage: <code>/sticker &lt;description&gt;</code>\n"
-            "Example: <code>/sticker a smiling cat giving a thumbs up</code>\n\n"
-            "The result is a transparent 512×512 Telegram sticker. Use the button "
-            "below the result to create a set or add it to one of your sets."
-        ),
-    )
-
-
 async def _handle_generation_command(
     message: Message, sender: Sender, *, usage: str
 ) -> None:
-    """Shared body of /image and /sticker: validate, then generate under a slot."""
+    """Shared body of generation commands: validate, then generate under a slot."""
     user = message.from_user
     if user is None:
         return
@@ -84,7 +65,7 @@ async def generate_image_from_prompt(message: Message, prompt: str) -> None:
     await _run_generation(message, generate_and_send_image, prompt.strip())
 
 
-@tracked("Image / sticker generation")
+@tracked("Image generation")
 async def _run_generation(message: Message, sender: Sender, prompt: str) -> None:
     """Take the user's concurrency slot and generate under it."""
     user = message.from_user
@@ -119,6 +100,8 @@ async def _generate(message: Message, user, prompt: str, sender: Sender) -> None
             service=service,
             user_id=user.id,
             model=settings["model"],
+            # Выбранная персона становится личностью художника.
+            persona=settings["system_prompt"],
         )
 
         if not sent:

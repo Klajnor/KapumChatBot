@@ -87,7 +87,7 @@ class MCPHistoryTests(unittest.IsolatedAsyncioTestCase):
         printer = SimpleNamespace(on_delta=AsyncMock(), discard=AsyncMock())
         with (
             patch.multiple(config, stream_responses=streaming, request_intent=False,
-                           enable_image_generation=True, enable_sticker_generation=True,
+                           enable_image_generation=True,
                            enable_file_replies=True),
             patch.object(chat, "search_configured", return_value=True),
             patch.object(config, "builtin_web_search", return_value=False),

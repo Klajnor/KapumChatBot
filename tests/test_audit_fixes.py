@@ -374,7 +374,6 @@ class RenamedEnvTests(unittest.TestCase):
                 "DATABASE_URL": (
                     f"sqlite+aiosqlite:///{(absolute / 'chat_bot-test.db').as_posix()}"
                 ),
-                "STICKER_MODEL_DIR": str(absolute / "rembg-test"),
                 "TELEGRAPH_ACCOUNT_FILE": str(absolute / "telegraph-test.json"),
                 "MCP_CONFIG_FILE": "",
             },

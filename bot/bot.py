@@ -46,7 +46,6 @@ _COMMANDS = [
     BotCommand(command="models", description="Choose an AI model"),
     BotCommand(command="model", description="Show the current model"),
     BotCommand(command="image", description="Generate an image from a prompt"),
-    BotCommand(command="sticker", description="Generate a Telegram sticker"),
     BotCommand(command="remind", description="Set a reminder or scheduled AI request"),
     BotCommand(command="reminders", description="List your reminders"),
     BotCommand(command="delreminder", description="Delete a reminder"),

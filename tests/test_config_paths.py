@@ -32,7 +32,6 @@ class ConfigAbsolutePathTests(unittest.TestCase):
             "AI_BASE_URL": "https://example.invalid/v1",
             "OWNER_IDS": "1",
             "DATABASE_URL": _sqlite_url(self.temp / "chat_bot.db"),
-            "STICKER_MODEL_DIR": str(self.temp / "rembg"),
             "TELEGRAPH_ACCOUNT_FILE": str(self.temp / "telegraph_account.json"),
             "MCP_CONFIG_FILE": "",
             "MCP_SERVERS": "",
@@ -94,11 +93,6 @@ class ConfigAbsolutePathTests(unittest.TestCase):
             self._validate(DATABASE_URL="sqlite+aiosqlite:///chat_bot.db")
         self.assertIn("DATABASE_URL", str(caught.exception))
 
-    def test_relative_sticker_directory_is_rejected(self):
-        with self.assertRaises(ValueError) as caught:
-            self._validate(STICKER_MODEL_DIR="models/rembg")
-        self.assertIn("STICKER_MODEL_DIR", str(caught.exception))
-
     def test_relative_telegraph_file_is_rejected(self):
         with self.assertRaises(ValueError) as caught:
             self._validate(TELEGRAPH_ACCOUNT_FILE="telegraph_account.json")
@@ -111,7 +105,6 @@ class ConfigAbsolutePathTests(unittest.TestCase):
 
     def test_home_relative_paths_are_expanded_and_accepted(self):
         self._validate(
-            STICKER_MODEL_DIR="~/rembg",
             TELEGRAPH_ACCOUNT_FILE="~/telegraph_account.json",
             MCP_CONFIG_FILE="~/.mcp.json",
         )
@@ -120,14 +113,12 @@ class ConfigAbsolutePathTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self._validate(
                 DATABASE_URL="sqlite+aiosqlite:///chat_bot.db",
-                STICKER_MODEL_DIR="models/rembg",
                 TELEGRAPH_ACCOUNT_FILE="telegraph_account.json",
                 MCP_CONFIG_FILE=".mcp.json",
             )
         message = str(caught.exception)
         for name in (
             "DATABASE_URL",
-            "STICKER_MODEL_DIR",
             "TELEGRAPH_ACCOUNT_FILE",
             "MCP_CONFIG_FILE",
         ):

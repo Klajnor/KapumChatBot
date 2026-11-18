@@ -93,7 +93,7 @@ class NoteAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.multiple(config, stream_responses=streaming, request_intent=False,
-                           enable_image_generation=False, enable_sticker_generation=False,
+                           enable_image_generation=False,
                            enable_file_replies=False, mcp_max_calls=4),
             patch.object(chat, "mcp_available", return_value=True),
             patch.object(chat, "mcp_manager", manager),

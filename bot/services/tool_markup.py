@@ -49,7 +49,6 @@ _TOOL_NAMES = (
     "get_note",
     "list_notes",
     "generate_image",
-    "generate_sticker",
     "send_files",
 )
 

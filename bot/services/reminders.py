@@ -524,7 +524,7 @@ async def _run_ai_prompt(
     The history is read-only context: the scheduled prompt and its answer are
     not written back to it.
 
-    Intended behaviour (not a gap): images, stickers and MCP are never offered
+    Intended behaviour (not a gap): images and MCP are never offered
     to a scheduled run — nobody is watching an unattended run, and MCP exposes
     the admin's private notes. Returns the final result and the total time
     spent over all rounds.

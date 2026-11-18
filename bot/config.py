@@ -876,19 +876,6 @@ class Config:
     enable_image_generation: bool = field(
         default_factory=lambda: _env_bool("ENABLE_IMAGE_GENERATION", True)
     )
-    # Let the AI answer with a generated Telegram sticker (512×512 WebP) when
-    # the user asks for one; also powers the /sticker command.
-    enable_sticker_generation: bool = field(
-        default_factory=lambda: _env_bool("ENABLE_STICKER_GENERATION", True)
-    )
-    # Таймаут локального удаления фона, включая первую загрузку модели rembg.
-    sticker_processing_timeout: int = field(
-        default_factory=lambda: max(10, min(600, _env_int("STICKER_PROCESSING_TIMEOUT", 120)))
-    )
-    # Каталог моделей относительно корня проекта; U2NET_HOME — совместимый алиас rembg.
-    sticker_model_dir: str = field(
-        default_factory=lambda: _env("STICKER_MODEL_DIR") or _env("U2NET_HOME") or "models/rembg"
-    )
     # Let the AI answer with text files (json, xml, txt, md, ...) as Telegram
     # documents. Only a fixed allowlist of non-executable text formats.
     enable_file_replies: bool = field(
@@ -1722,7 +1709,7 @@ class Config:
         """Validate required config values and absolute filesystem paths.
 
         Every configurable path must be absolute: the service runs from a
-        read-only code tree, so a relative SQLite/Telegraph/rembg path would
+        read-only code tree, so a relative SQLite/Telegraph path would
         resolve inside ``/opt/...`` and fail (or write data next to the code).
         Relative values are rejected at startup instead of being silently
         resolved against the current working directory.
@@ -1781,7 +1768,6 @@ class Config:
                         "sqlite+aiosqlite:////var/lib/kapum-chatbot/chat_bot.db"
                     )
         for name, value in (
-            ("STICKER_MODEL_DIR", self.sticker_model_dir),
             ("TELEGRAPH_ACCOUNT_FILE", self.telegraph_account_file),
             ("MCP_CONFIG_FILE", self.mcp_config_file),
         ):

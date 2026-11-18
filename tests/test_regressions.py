@@ -1518,135 +1518,6 @@ class PersonaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ans.call_args.kwargs.get("show_alert"))
 
 
-class StickerTests(unittest.IsolatedAsyncioTestCase):
-    """Sticker generation: WebP conversion, the client method and the sender."""
-
-    @staticmethod
-    def _png_bytes(width: int, height: int) -> bytes:
-        """A real RGBA PNG of the given size (Pillow is a declared dependency)."""
-        import io
-
-        from PIL import Image
-
-        image = Image.new("RGBA", (width, height), (255, 0, 0, 255))
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        return buffer.getvalue()
-
-    @staticmethod
-    def _open(data: bytes):
-        import io
-
-        from PIL import Image
-
-        return Image.open(io.BytesIO(data))
-
-    def test_sticker_tool_definition(self):
-        from bot.services.ai_client import STICKER_TOOL
-
-        self.assertEqual(STICKER_TOOL["function"]["name"], "generate_sticker")
-        props = STICKER_TOOL["function"]["parameters"]["properties"]
-        self.assertIn("prompt", props)
-
-    def test_to_sticker_webp_square(self):
-        from bot.services.ai_client import (
-            STICKER_MAX_BYTES,
-            STICKER_SIZE,
-            to_sticker_webp,
-        )
-
-        webp = to_sticker_webp(self._png_bytes(1024, 1024))
-        self.assertIsNotNone(webp)
-        self.assertLessEqual(len(webp), STICKER_MAX_BYTES)
-        image = self._open(webp)
-        self.assertEqual(image.format, "WEBP")
-        self.assertEqual(image.size, (STICKER_SIZE, STICKER_SIZE))
-
-    def test_to_sticker_webp_fits_nonsquare(self):
-        from bot.services.ai_client import to_sticker_webp
-
-        webp = to_sticker_webp(self._png_bytes(800, 400))
-        self.assertIsNotNone(webp)
-        self.assertEqual(self._open(webp).size, (512, 512))
-
-    def test_to_sticker_webp_invalid_returns_none(self):
-        from bot.services.ai_client import to_sticker_webp
-
-        self.assertIsNone(to_sticker_webp(b"definitely not an image"))
-
-    async def test_generate_sticker_converts_to_webp(self):
-        from bot.services.ai_client import AIClient, ImageResult
-        from bot.services.stickers import StickerResult, to_sticker_webp
-
-        client = AIClient(api_key="test-key")
-        png = self._png_bytes(768, 768)
-        source = ImageResult(url="http://x/img.png", data=png, elapsed=1.0)
-        with (
-            patch.object(client, "generate_image_result", AsyncMock(return_value=source)),
-            patch("bot.services.ai_client.prepare_sticker_result", AsyncMock(return_value=StickerResult(data=to_sticker_webp(png)))) as prepare,
-        ):
-            result = await client.generate_sticker("a cat")
-        prepare.assert_awaited_once_with(png)
-        self.assertIsNotNone(result.data)
-        image = self._open(result.data)
-        self.assertEqual(image.format, "WEBP")
-        self.assertEqual(image.size, (512, 512))
-
-    async def test_generate_sticker_none_when_generation_fails(self):
-        from bot.services.ai_client import AIClient, ImageResult
-
-        client = AIClient(api_key="test-key")
-        empty = ImageResult(url=None, data=None, elapsed=0.5)
-        with patch.object(
-            client, "generate_image_result", AsyncMock(return_value=empty)
-        ):
-            result = await client.generate_sticker("a cat")
-        self.assertIsNone(result.data)
-
-    async def test_generate_and_send_sticker_sends_webp(self):
-        from bot.services.ai_client import ImageResult
-
-        message = SimpleNamespace(
-            chat=SimpleNamespace(id=1),
-            bot=SimpleNamespace(send_chat_action=AsyncMock()),
-            answer_sticker=AsyncMock(),
-            answer=AsyncMock(),
-        )
-        webp = ImageResult(url="u", data=b"RIFF\x00\x00\x00\x00WEBP", elapsed=1.0)
-        with (
-            patch.object(chat, "waiting", no_wait),
-            patch.object(chat, "throttle", SimpleNamespace(wait=AsyncMock())),
-            patch.object(
-                chat.ai_client, "generate_sticker", AsyncMock(return_value=webp)
-            ),
-        ):
-            ok = await chat.generate_and_send_sticker(message, "a cat")
-        self.assertTrue(ok)
-        message.answer_sticker.assert_awaited_once()
-
-    async def test_generate_and_send_sticker_failure_message(self):
-        from bot.services.ai_client import ImageResult
-
-        message = SimpleNamespace(
-            chat=SimpleNamespace(id=1),
-            bot=SimpleNamespace(send_chat_action=AsyncMock()),
-            answer_sticker=AsyncMock(),
-            answer=AsyncMock(),
-        )
-        failed = ImageResult(url=None, data=None, elapsed=0.5)
-        with (
-            patch.object(chat, "waiting", no_wait),
-            patch.object(chat, "throttle", SimpleNamespace(wait=AsyncMock())),
-            patch.object(
-                chat.ai_client, "generate_sticker", AsyncMock(return_value=failed)
-            ),
-            patch.object(chat, "safe_answer", AsyncMock()) as answer,
-        ):
-            ok = await chat.generate_and_send_sticker(message, "a cat")
-        self.assertFalse(ok)
-        message.answer_sticker.assert_not_awaited()
-        answer.assert_awaited_once()
-
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):
     """Web search (RAG): provider parsing, tool exchange and the round loop."""
@@ -2260,7 +2131,6 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(config, "stream_responses", False),
             patch.object(config, "enable_image_generation", False),
-            patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
@@ -2321,7 +2191,6 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(config, "stream_responses", False),
             patch.object(config, "enable_image_generation", False),
-            patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
@@ -2385,7 +2254,6 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(config, "stream_responses", False),
             patch.object(config, "enable_image_generation", False),
-            patch.object(config, "enable_sticker_generation", False),
             patch.object(config, "enable_file_replies", False),
             patch.object(config, "enable_web_search", True),
             patch.object(config, "search_provider", "tavily"),
@@ -2402,7 +2270,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
 
         single.assert_awaited_once()
         tools_arg = single.call_args.args[3]
-        # No tools at all when image/sticker off and search unconfigured.
+        # No tools at all when image generation is off and search unconfigured.
         self.assertIsNone(tools_arg)
 
 
