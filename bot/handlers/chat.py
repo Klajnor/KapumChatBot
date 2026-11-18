@@ -407,7 +407,7 @@ async def _flush_message_batch(key: str) -> None:
             await _process_message_batch(parts)
     except asyncio.CancelledError:
         return
-    except Exception:  # noqa: BLE001 - фоновая пачка не должна падать молча
+    except Exception:  # фоновая пачка не должна падать молча
         logger.exception("Message batch processing failed")
 
 

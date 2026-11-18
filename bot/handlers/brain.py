@@ -204,7 +204,7 @@ async def _flush_forward_batch(key: str) -> None:
             await _prompt_forward_choice(parts)
     except asyncio.CancelledError:
         return
-    except Exception:  # noqa: BLE001 - фоновая пачка не должна падать молча
+    except Exception:  # фоновая пачка не должна падать молча
         logger.exception("Forwarded batch prompt failed")
 
 

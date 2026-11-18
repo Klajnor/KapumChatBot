@@ -247,10 +247,9 @@ reverse proxy с auth/allowlist; не добавлять в payload версии
 
 ## Проверки
 
-- `pytest tests/ -q`: **1100 passed, 3 skipped, 270 subtests passed**.
+- `pytest tests/ -q`: **1101 passed, 3 skipped, 270 subtests passed**.
   Падений, связанных с аудитом, нет; `PROJECT_STATS.md` пересчитывается отдельно.
-- `ruff check bot/ tests/`: новых ошибок нет (остаются прежние RUF100 в
-  `chat.py`/`brain.py` и SIM117 в `tests/test_brain_forward_batch.py`).
+- `ruff check bot/ tests/`: без ошибок.
 - `ruff --select S,B` по `bot/`: прежние `assert` в `repository.py`, SHA-1 для
   имён MCP (не криптография) и `random` для тематических ответов; новых
   опасных sink-ов нет.

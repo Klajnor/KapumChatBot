@@ -140,9 +140,11 @@ class OwnerForwardBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending.parts, [part])
 
     async def test_non_owner_forward_is_skipped(self):
-        with patch.object(brain, "_owner_dm", return_value=False):
-            with self.assertRaises(SkipHandler):
-                await brain.choose_forward(forwarded(text="Not mine"))
+        with (
+            patch.object(brain, "_owner_dm", return_value=False),
+            self.assertRaises(SkipHandler),
+        ):
+            await brain.choose_forward(forwarded(text="Not mine"))
 
     async def test_analyze_dispatches_every_part_once(self):
         first = forwarded(photo="f1")
