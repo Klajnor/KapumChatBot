@@ -96,6 +96,7 @@ class ResponseMetadata:
     api_search_used: bool = False
     reasoning_tokens: int | None = None
     reasoning_partial: bool = False
+    mcp_used: bool = False
 
 
 def response_metadata(data: dict[str, Any], *, search_enabled: bool | None = None) -> ResponseMetadata:
@@ -127,6 +128,7 @@ def combine_metadata(responses: list[ResponseMetadata]) -> ResponseMetadata:
         reasoning_partial=bool(reported) and any(
             m.reasoning_tokens is None or m.reasoning_partial for m in responses
         ),
+        mcp_used=any(m.mcp_used for m in responses),
     )
 
 
@@ -136,6 +138,7 @@ class AnswerMetadata:
 
     responses: list[ResponseMetadata] = field(default_factory=list)
     api_search_used: bool = False
+    mcp_used: bool = False
 
     def add(self, result: Any) -> None:
         """Учесть очередной результат модели ровно один раз."""
@@ -149,4 +152,5 @@ class AnswerMetadata:
             api_search_used=self.api_search_used or combined.api_search_used,
             reasoning_tokens=combined.reasoning_tokens,
             reasoning_partial=combined.reasoning_partial,
+            mcp_used=self.mcp_used or combined.mcp_used,
         )

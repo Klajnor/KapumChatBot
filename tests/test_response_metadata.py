@@ -18,10 +18,30 @@ from bot.services.response_metadata import (
     reasoning_tokens,
 )
 from bot.services.search import SEARCH_TOOL
-from bot.services.telegram_utils import format_timing
+from bot.services.telegram_utils import _search_label, format_timing
 
 
 class ResponseCountersTests(unittest.TestCase):
+    def test_search_label_reports_brain_usage(self):
+        self.assertEqual(
+            _search_label(ResponseMetadata(
+                model_search_used=False, api_search_used=True, mcp_used=True
+            )),
+            "API + brain",
+        )
+        self.assertEqual(
+            _search_label(ResponseMetadata(
+                model_search_used=False, api_search_used=False, mcp_used=True
+            )),
+            "brain",
+        )
+        self.assertEqual(
+            _search_label(ResponseMetadata(
+                model_search_used=True, api_search_used=True, mcp_used=True
+            )),
+            "model + API + brain",
+        )
+
     def test_provider_search_gate_is_fail_closed(self):
         self.assertFalse(provider_search_may_have_run(ChatResult()))
         self.assertTrue(

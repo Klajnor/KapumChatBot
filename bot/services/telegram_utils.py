@@ -167,10 +167,14 @@ def _search_label(metadata: ResponseMetadata | None) -> str:
     if metadata is None:
         return "unknown"
     if metadata.model_search_used is True:
-        return "model + API" if metadata.api_search_used else "model"
-    if metadata.model_search_used is None:
-        return "API; model unknown" if metadata.api_search_used else "unknown"
-    return "API" if metadata.api_search_used else "none"
+        label = "model + API" if metadata.api_search_used else "model"
+    elif metadata.model_search_used is None:
+        label = "API; model unknown" if metadata.api_search_used else "unknown"
+    else:
+        label = "API" if metadata.api_search_used else "none"
+    if metadata.mcp_used:
+        return "brain" if label == "none" else f"{label} + brain"
+    return label
 
 
 def with_timing(text: str, footer: str) -> str:

@@ -1788,6 +1788,8 @@ async def _resolve_tool_round(
         output = await mcp_manager.call_tool(
             call.name, call.arguments, max_chars=available_chars, read_budget=budget,
         )
+        if metadata is not None:
+            metadata.mcp_used = True
         output = budget.clip(clip_tool_text(output, available_chars))
         messages.append(build_tool_response(call.id, output))
         if source_context is not None:
@@ -1926,9 +1928,13 @@ async def _answer_with_ai(
         and request_route == "general"
         and mcp_ready
         and (search_ready or builtin_search)
-        and not messages_have_untrusted_content(messages)
+        and not messages_have_untrusted_content([messages[-1]])
         and (intent is None or intent is not Intent.IMAGE)
     )
+    if auto_candidate and messages_have_untrusted_content(messages[:-1]):
+        # Старый документ/цитата не должен навсегда отключать второй мозг:
+        # планируем оба источника по чистой текущей просьбе.
+        isolate_combined_history(messages, force=True)
     search_only = (
         not combined
         and not auto_candidate

@@ -199,6 +199,21 @@ class CombinedAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Вывод", deliver.await_args.args[2])
         self.assertEqual(service.add_message.await_count, 2)
 
+    async def test_general_question_with_untrusted_history_still_uses_both_sources(self):
+        general = "Расскажи про Rust и дай вывод"
+        backend, seen, web, deliver, _service = await self.run_chat(
+            query=general, initial="web",
+        )
+        self.assertEqual(len(seen), 2)
+        web.assert_awaited_once()
+        self.assertEqual(
+            [c.args[0] for c in backend.call_tool.await_args_list],
+            ["search_notes", "get_note"],
+        )
+        self.assertNotIn("OLD_PRIVATE", str(seen[0]))
+        self.assertIsNone(seen[1]["tools"])
+        self.assertIn("Вывод", deliver.await_args.args[2])
+
     async def test_guest_general_question_collects_both_sources_then_one_analysis(self):
         manager, backend, service, message = fixtures(NOTE)
         service.get_history.return_value = []

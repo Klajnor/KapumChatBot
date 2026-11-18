@@ -699,8 +699,10 @@ async def _build_reply(
         and request_route == "general"
         and mcp_ready
         and (search_ready or builtin_search)
-        and not messages_have_untrusted_content(messages)
+        and not messages_have_untrusted_content([messages[-1]])
     )
+    if auto_candidate and messages_have_untrusted_content(messages[:-1]):
+        isolate_combined_history(messages, force=True)
     if combined or auto_candidate:
         apply_combined_hint(
             messages,
@@ -876,6 +878,7 @@ async def _build_reply(
                 output = await mcp_manager.call_tool(
                     call.name, call.arguments, max_chars=budget.context_chars, read_budget=budget,
                 )
+                metadata.mcp_used = True
                 messages.append(build_tool_response(call.id, budget.clip(output)))
             if combined:
                 # Both sources were planned before the results: the next and

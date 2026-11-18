@@ -27,19 +27,24 @@ COMBINED_SOURCES_HINT = (
 )
 
 
-def isolate_combined_history(messages: list[dict[str, Any]]) -> bool:
+def isolate_combined_history(
+    messages: list[dict[str, Any]], *, force: bool = False
+) -> bool:
     """Для явного смешанного запроса убрать историю до планирования инструментов.
 
     Даже чистая на вид история может пересказывать приватный текст без рамки.
     Веб-план получает только системный промпт и текущую самостоятельную просьбу.
     Вложение/цитата/форвард в ней не позволяют открыть инструменты.
+    ``force`` используется авто-режимом для общего вопроса, когда оба источника
+    доступны, но история содержит недоверенный материал.
     """
     if not messages or messages[-1].get("role") != "user":
         return False
     current = messages[-1]
     text = current.get("content")
     if (
-        not isinstance(text, str) or route(text) != "combined"
+        not isinstance(text, str)
+        or (not force and route(text) != "combined")
         or messages_have_untrusted_content([current])
     ):
         return False
