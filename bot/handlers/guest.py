@@ -674,6 +674,11 @@ async def _build_reply(
         # vision-пути выше). После вырезания истории тегов больше нет.
         remove_untrusted_hint(messages)
     tools: list[dict[str, Any]] = []
+    # ИНВАРИАНТ (не ломать): в guest общий свежий вопрос при доступных обоих
+    # источниках тоже не должен терять MCP из-за доступного локального поиска.
+    # Авто-режим ниже добавляет недостающий источник; недоверенная история
+    # изолируется, а не отключает второй мозг. Регрессия:
+    # test_guest_general_question_collects_both_sources_then_one_analysis.
     # A local search tool is preferred when private tools are available: its
     # results are framed as untrusted. Otherwise models with built-in search use
     # the provider's server-side search.

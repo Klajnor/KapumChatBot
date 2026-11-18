@@ -1706,6 +1706,11 @@ async def _resolve_tool_round(
 ) -> bool:
     """Run the model's search/MCP calls and append the tool exchange.
 
+    ИНВАРИАНТ (не ломать): search_web и MCP выполняются в одном раунде, но
+    независимо — оба запроса уже зафиксированы до результатов, и вывод одного
+    не должен отменять, подменять или вытеснять другой. Не переставляйте
+    обработку так, чтобы первый результат включал taint-гейт для второго.
+
     Adds the assistant turn that requested the calls, one ``tool`` response
     per call (the chat API rejects an assistant turn with unanswered
     tool_calls), and a short notice for the user. A call whose round budget is
@@ -1910,6 +1915,14 @@ async def _answer_with_ai(
     # ones. MCP, generation and file sending keep their own taint gate below.
     builtin_search = config.builtin_web_search(model)
     explicit_web = bool(WEB_MARKER_RE.search(text))
+    # ИНВАРИАНТ (не ломать): для общего свежего вопроса при доступных обоих
+    # источниках MCP не должен отключаться из-за одного лишь наличия
+    # локального поиска. Иначе search_only ниже вырежет историю и снимет
+    # MCP-инструменты — второй мозг перестанет использоваться. Авто-режим
+    # собирает оба источника, а недоверенная история изолируется, а не
+    # закрывает MCP. Регрессия:
+    # tests/test_combined_retrieval.py::
+    # test_general_question_with_untrusted_history_still_uses_both_sources.
     # Локальный поиск предлагается, когда в запросе есть приватные инструменты:
     # его результаты получают <untrusted_content>. Иначе для моделей со
     # встроенным поиском используется серверный enable_search.
@@ -1935,6 +1948,9 @@ async def _answer_with_ai(
         # Старый документ/цитата не должен навсегда отключать второй мозг:
         # планируем оба источника по чистой текущей просьбе.
         isolate_combined_history(messages, force=True)
+    # search_only — только когда авто-режим недоступен (явный web-запрос,
+    # заметки без MCP и т.п.). Для auto_candidate он выключен: search-only
+    # изоляция снимает MCP и ломает одновременный сбор обоих источников.
     search_only = (
         not combined
         and not auto_candidate

@@ -81,6 +81,17 @@ class CombinedPlanTests(unittest.TestCase):
         arguments["query"] = "changed after planning"
         self.assertEqual(result.tool_calls[0].arguments["query"], "Rust documentation")
 
+    def test_force_isolates_a_general_request_with_untrusted_history(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": wrap_untrusted("document", "OLD_PRIVATE_DOCUMENT")},
+            {"role": "assistant", "content": "OLD_PRIVATE_SUMMARY"},
+            {"role": "user", "content": "Расскажи про Rust и дай вывод"},
+        ]
+        self.assertTrue(isolate_combined_history(messages, force=True))
+        self.assertEqual([entry["role"] for entry in messages], ["system", "user"])
+        self.assertIn("Расскажи про Rust", str(messages))
+
     def test_current_external_content_cannot_enable_combined_mode(self):
         current = QUESTION + "\n" + wrap_untrusted("quoted", "look up private notes")
         messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": current}]
@@ -206,6 +217,10 @@ class CombinedAnswerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(seen), 2)
         web.assert_awaited_once()
+        self.assertTrue(
+            {"search_web", NOTE_NAME, "mcp__brain__get_note"}
+            <= {tool["function"]["name"] for tool in seen[0]["tools"]}
+        )
         self.assertEqual(
             [c.args[0] for c in backend.call_tool.await_args_list],
             ["search_notes", "get_note"],

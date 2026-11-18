@@ -248,7 +248,7 @@ reverse proxy с auth/allowlist; не добавлять в payload версии
 
 ## Проверки
 
-- `pytest tests/ -q`: **1134 passed, 3 skipped, 270 subtests passed**.
+- `pytest tests/ -q`: **1136 passed, 3 skipped, 270 subtests passed**.
   Четыре падения локального окружения не связаны с аудитом: запрет записи в
   `models/rembg` на Windows (4 теста стикеров); `PROJECT_STATS.md`
   пересчитывается отдельно.
