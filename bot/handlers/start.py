@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import logging
+import time
 
 from aiogram import Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.bot import get_bot_username
 from bot.config import config
@@ -13,7 +18,15 @@ from bot.keyboards.reply import menu_for_user
 from bot.services.themed_responses import get_random_themed_response
 from bot.services.user_service import user_service
 
+logger = logging.getLogger(__name__)
+
 router = Router()
+
+# Повторное нажатие /start зарегистрированным пользователем не дублирует заявку:
+# кроме проверки «первый раз ли» (строка в users), держим короткий guard на
+# случай гонки двух одновременных /start одного пользователя.
+_REQUEST_GUARD_SECONDS = 300
+_recent_requests: dict[int, float] = {}
 
 _BASE_COMMANDS = (
     "💬 <b>Send any text</b> — chat with the AI\n"
@@ -57,6 +70,90 @@ def _guest_hint() -> str:
     )
 
 
+def _request_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Approve", callback_data=f"appr:a:{user_id}")
+    b.button(text="🚫 Block", callback_data=f"appr:b:{user_id}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def _admin_recipients() -> list[int]:
+    """Owners plus promoted admins, deduplicated, in a stable order."""
+    return list(dict.fromkeys([*config.owner_ids, *config.extra_admin_ids]))
+
+
+def _request_text(user_id: int, name: str, username: str | None, when: str) -> str:
+    who = html.escape(name) if name else "—"
+    nick = f" · @{html.escape(username)}" if username else ""
+    return (
+        "🆕 <b>New user started the bot</b>\n\n"
+        f"👤 <b>{who}</b>{nick}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"🕐 First <code>/start</code>: {html.escape(when)}\n\n"
+        "Approve full access or block this user."
+    )
+
+
+async def _notify_admins_about_new_user(message: Message) -> None:
+    """Ask every admin to approve (or block) a first-time /start user.
+
+    The guard set suppresses duplicates when two /start updates of the same
+    user race; the DB existence check is the primary filter. Delivery errors
+    (admin blocked the bot, flood limits) are logged, never raised: the
+    welcome answer to the newcomer must go out regardless.
+    """
+    user = message.from_user
+    if user is None:
+        return
+    recipients = _admin_recipients()
+    if not recipients:
+        logger.warning("Access request: no admins configured (OWNER_IDS empty)")
+        return
+
+    now = time.monotonic()
+    if _recent_requests.get(user.id, 0.0) > now:
+        return
+    _recent_requests[user.id] = now + _REQUEST_GUARD_SECONDS
+    # Не копим записи вечно: подчищаем просроченные на каждом обходе.
+    for stale in [uid for uid, until in _recent_requests.items() if until <= now]:
+        _recent_requests.pop(stale, None)
+
+    username = user.username
+    name = " ".join(
+        part for part in (user.first_name, user.last_name) if part
+    ).strip()
+    when = getattr(message, "date", None)
+    when_text = when.strftime("%Y-%m-%d %H:%M UTC") if when else "—"
+    text = _request_text(user.id, name, username, when_text)
+    keyboard = _request_keyboard(user.id)
+
+    sent_any = False
+    for admin_id in recipients:
+        if admin_id == user.id:
+            continue
+        try:
+            await message.bot.send_message(admin_id, text, reply_markup=keyboard)
+            sent_any = True
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+            try:
+                await message.bot.send_message(admin_id, text, reply_markup=keyboard)
+                sent_any = True
+            except TelegramAPIError as retry_exc:
+                logger.warning(
+                    "Access request to admin %s failed after retry: %s",
+                    admin_id, retry_exc,
+                )
+        except TelegramAPIError as exc:
+            logger.warning("Access request to admin %s failed: %s", admin_id, exc)
+    if not sent_any:
+        logger.warning(
+            "Access request for user %s could not be delivered to any admin",
+            user.id,
+        )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     """Handle /start command — register user and show welcome message."""
@@ -65,6 +162,9 @@ async def cmd_start(message: Message) -> None:
         return
 
     async with user_service() as service:
+        # Заявка админам — только на самом первом /start (раньше строки в users
+        # не было): повторные /start известного пользователя ничего не рассылают.
+        first_time = not await service.is_known_user(user.id)
         await service.register_user(
             telegram_id=user.id,
             username=user.username,
@@ -73,6 +173,9 @@ async def cmd_start(message: Message) -> None:
         )
         is_allowed = await service.is_allowed_user(user.id)
         daily_limit = await service.get_daily_limit(user.id) if is_allowed else None
+
+    if first_time and not is_allowed and not config.is_admin(user.id):
+        await _notify_admins_about_new_user(message)
 
     safe_name = html.escape(user.first_name or "there")
     # Persistent button menu: private chats of admins / whitelisted users only.

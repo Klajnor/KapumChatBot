@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -14,6 +15,7 @@ from bot.services.user_service import user_service
 from tests.test_database import DBTest
 
 OWNER, ADMIN, USER, GUEST = 1, 2, 3, 4
+NOW = datetime.datetime(2026, 11, 19, 12, 0, tzinfo=datetime.UTC)
 
 
 def _message(user_id: int) -> SimpleNamespace:
@@ -22,7 +24,10 @@ def _message(user_id: int) -> SimpleNamespace:
             id=user_id, username="bob", first_name="Bob", last_name=None,
         ),
         chat=SimpleNamespace(type="private"),
+        date=NOW,
         answer=AsyncMock(),
+        # Заявка доступа админам (см. tests/test_access_requests.py).
+        bot=SimpleNamespace(send_message=AsyncMock()),
     )
 
 

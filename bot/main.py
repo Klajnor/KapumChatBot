@@ -23,6 +23,7 @@ from bot.database.session import engine, init_db
 
 # Import all handlers and register their routers with the dispatcher.
 from bot.handlers import (
+    access_requests,
     admin,
     admin_panel,
     brain,
@@ -109,6 +110,9 @@ dp.include_router(tasks.router)
 # Рабочий модуль — до admin_panel/guest/catch-all chat. При ошибке не мешает чату.
 samo_extension, samo_storage = _setup_samo_helper()
 dp.include_router(admin_panel.router)
+# Кнопки заявки доступа: префикс appr: не пересекается ни с чем, ставим
+# до guest/chat на всякий случай.
+dp.include_router(access_requests.router)
 if config.enable_guest_mode:
     dp.include_router(guest.router)
 dp.include_router(chat.router)

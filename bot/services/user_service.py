@@ -4,6 +4,7 @@ import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
@@ -44,6 +45,42 @@ class UserService:
             is_admin=config.is_owner(telegram_id),
         )
         await self.session.commit()
+
+    async def is_known_user(self, telegram_id: int) -> bool:
+        """True when the user row already exists (a previous /start or chat)."""
+        return await self.user_repo.get_user(telegram_id) is not None
+
+    async def approve_access_request(self, telegram_id: int, actor_id: int) -> str:
+        """Approve a /start access request; a stale decision changes nothing.
+
+        Returns ``approved``, ``already_allowed`` or ``already_blocked``:
+        another admin's earlier decision always wins, and a user who is
+        currently blocked is never re-enabled from this button.
+        """
+        if await self.is_allowed_user(telegram_id):
+            return "already_allowed"
+        if await self.is_blocked(telegram_id):
+            return "already_blocked"
+        try:
+            await self.add_allowed_user(telegram_id, added_by=actor_id)
+            return "approved"
+        except IntegrityError:
+            # Второй админ успел раньше: откатываем и отвечаем «уже обработано».
+            await self.session.rollback()
+            return "already_allowed"
+
+    async def block_access_request(self, telegram_id: int) -> str:
+        """Block a /start access request; a stale decision changes nothing.
+
+        Returns ``blocked``, ``already_blocked`` or ``already_allowed``: an
+        approval made by another admin is never overridden from this button.
+        """
+        if await self.is_blocked(telegram_id):
+            return "already_blocked"
+        if await self.is_allowed_user(telegram_id):
+            return "already_allowed"
+        await self.set_blocked(telegram_id, True)
+        return "blocked"
 
     async def get_user_settings(self, telegram_id: int) -> dict:
         """Get user settings as a dictionary (falls back to defaults)."""
